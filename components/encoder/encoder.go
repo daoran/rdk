@@ -1,4 +1,7 @@
-// Package encoder implements the encoder component
+// Package encoder implements the encoder component.
+// For more information, see the [encoder component docs].
+//
+// [encoder component docs]: https://docs.viam.com/components/encoder/
 package encoder
 
 import (
@@ -58,6 +61,44 @@ func (t PositionType) String() string {
 }
 
 // A Encoder turns a position into a signal.
+// For more information, see the [encoder component docs].
+//
+// Position example:
+//
+//	myEncoder, err := encoder.FromRobot(machine, "my_encoder")
+//	if err != nil {
+//	  logger.Fatalf("cannot get encoder: %v", err)
+//	}
+//
+//	// Get the position of the encoder in ticks
+//	position, posType, err := myEncoder.Position(context.Background(), encoder.PositionTypeTicks, nil)
+//
+// For more information, see the [Position method docs].
+//
+// ResetPosition example:
+//
+//	myEncoder, err := encoder.FromRobot(machine, "my_encoder")
+//	if err != nil {
+//	  logger.Fatalf("cannot get encoder: %v", err)
+//	}
+//
+//	err = myEncoder.ResetPosition(context.Background(), nil)
+//
+// For more information, see the [ResetPosition method docs].
+//
+// Properties example:
+//
+//	myEncoder, err := encoder.FromRobot(machine, "my_encoder")
+//
+//	// Get whether the encoder returns position in ticks or degrees.
+//	properties, err := myEncoder.Properties(context.Background(), nil)
+//
+// For more information, see the [Properties methods docs].
+//
+// [encoder component docs]: https://docs.viam.com/dev/reference/apis/components/encoder/
+// [Position method docs]: https://docs.viam.com/dev/reference/apis/components/encoder/#getposition
+// [ResetPosition method docs]: https://docs.viam.com/dev/reference/apis/components/encoder/#resetposition
+// [Properties methods docs]: https://docs.viam.com/dev/reference/apis/components/encoder/#getproperties
 type Encoder interface {
 	resource.Resource
 
@@ -67,7 +108,7 @@ type Encoder interface {
 	// ResetPosition sets the current position of the motor to be its new zero position.
 	ResetPosition(ctx context.Context, extra map[string]interface{}) error
 
-	// Properties returns a list of all the position types that are supported by a given encoder
+	// Properties returns a list of all the position types that are supported by a given encoder.
 	Properties(ctx context.Context, extra map[string]interface{}) (Properties, error)
 }
 

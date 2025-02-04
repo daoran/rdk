@@ -1,19 +1,17 @@
 package camera
 
 import (
-	"bytes"
 	"context"
+	"fmt"
 	"image"
 
-	"github.com/edaniels/golog"
 	"github.com/pkg/errors"
-	"github.com/viamrobotics/gostream"
 	"go.opencensus.io/trace"
 	commonpb "go.viam.com/api/common/v1"
 	pb "go.viam.com/api/component/camera/v1"
 	"google.golang.org/genproto/googleapis/api/httpbody"
 
-	"go.viam.com/rdk/data"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/pointcloud"
 	"go.viam.com/rdk/protoutils"
 	"go.viam.com/rdk/resource"
@@ -26,15 +24,19 @@ type serviceServer struct {
 	pb.UnimplementedCameraServiceServer
 	coll     resource.APIResourceCollection[Camera]
 	imgTypes map[string]ImageType
-	logger   golog.Logger
+	logger   logging.Logger
 }
 
 // NewRPCServiceServer constructs an camera gRPC service server.
 // It is intentionally untyped to prevent use outside of tests.
 func NewRPCServiceServer(coll resource.APIResourceCollection[Camera]) interface{} {
-	logger := golog.NewLogger("camserver")
+	logger := logging.NewLogger("camserver")
 	imgTypes := make(map[string]ImageType)
-	return &serviceServer{coll: coll, logger: logger, imgTypes: imgTypes}
+	return &serviceServer{
+		coll:     coll,
+		logger:   logger,
+		imgTypes: imgTypes,
+	}
 }
 
 // GetImage returns an image from a camera of the underlying robot. If a specific MIME type
@@ -55,7 +57,7 @@ func (s *serviceServer) GetImage(
 		if _, ok := s.imgTypes[req.Name]; !ok {
 			props, err := cam.Properties(ctx)
 			if err != nil {
-				s.logger.Warnf("camera properties not found for %s, assuming color images: %v", req.Name, err)
+				s.logger.CWarnf(ctx, "camera properties not found for %s, assuming color images: %v", req.Name, err)
 				s.imgTypes[req.Name] = ColorStream
 			} else {
 				s.imgTypes[req.Name] = props.ImageType
@@ -70,33 +72,17 @@ func (s *serviceServer) GetImage(
 			req.MimeType = utils.MimeTypeJPEG
 		}
 	}
-
 	req.MimeType = utils.WithLazyMIMEType(req.MimeType)
 
-	// Add 'fromDataManagement' to context to avoid threading extra through gostream API.
-	if req.Extra.AsMap()[data.FromDMString] == true {
-		ctx = context.WithValue(ctx, data.FromDMContextKey{}, true)
-	}
-
-	img, release, err := ReadImage(gostream.WithMIMETypeHint(ctx, req.MimeType), cam)
+	resBytes, resMetadata, err := cam.Image(ctx, req.MimeType, req.Extra.AsMap())
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		if release != nil {
-			release()
-		}
-	}()
-	actualMIME, _ := utils.CheckLazyMIMEType(req.MimeType)
-	resp := pb.GetImageResponse{
-		MimeType: actualMIME,
+	if len(resBytes) == 0 {
+		return nil, fmt.Errorf("received empty bytes from Image method of %s", req.Name)
 	}
-	outBytes, err := rimage.EncodeImage(ctx, img, req.MimeType)
-	if err != nil {
-		return nil, err
-	}
-	resp.Image = outBytes
-	return &resp, nil
+	actualMIME, _ := utils.CheckLazyMIMEType(resMetadata.MimeType)
+	return &pb.GetImageResponse{MimeType: actualMIME, Image: resBytes}, nil
 }
 
 // GetImages returns a list of images and metadata from a camera of the underlying robot.
@@ -218,18 +204,14 @@ func (s *serviceServer) GetPointCloud(
 		return nil, err
 	}
 
-	var buf bytes.Buffer
-	buf.Grow(200 + (pc.Size() * 4 * 4)) // 4 numbers per point, each 4 bytes
-	_, pcdSpan := trace.StartSpan(ctx, "camera::server::NextPointCloud::ToPCD")
-	err = pointcloud.ToPCD(pc, &buf, pointcloud.PCDBinary)
-	pcdSpan.End()
+	bytes, err := pointcloud.ToBytes(pc)
 	if err != nil {
 		return nil, err
 	}
 
 	return &pb.GetPointCloudResponse{
 		MimeType:   utils.MimeTypePCD,
-		PointCloud: buf.Bytes(),
+		PointCloud: bytes,
 	}, nil
 }
 
@@ -264,6 +246,12 @@ func (s *serviceServer) GetProperties(
 			Parameters: props.DistortionParams.Parameters(),
 		}
 	}
+
+	if props.FrameRate != 0 {
+		result.FrameRate = &props.FrameRate
+	}
+
+	result.MimeTypes = props.MimeTypes
 	return result, nil
 }
 

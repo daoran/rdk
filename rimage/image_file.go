@@ -7,6 +7,7 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
+	"image/jpeg"
 	"image/png"
 	"io"
 	"os"
@@ -15,7 +16,6 @@ import (
 
 	"github.com/lmittmann/ppm"
 	"github.com/pkg/errors"
-	libjpeg "github.com/viam-labs/go-libjpeg/jpeg"
 	"github.com/xfmoulet/qoi"
 	"go.opencensus.io/trace"
 	"go.uber.org/multierr"
@@ -34,8 +34,6 @@ var RGBABitmapMagicNumber = []byte("RGBA")
 // DepthMapMagicNumber represents the magic number for our custom header
 // for raw DEPTH data.
 var DepthMapMagicNumber = []byte("DEPTHMAP")
-
-var jpegEncoderOptions = &libjpeg.EncoderOptions{Quality: 75, DCTMethod: libjpeg.DCTIFast}
 
 // RawRGBAHeaderLength is the length of our custom header for raw RGBA data
 // in bytes. See above as to why.
@@ -169,7 +167,7 @@ func WriteImageToFile(path string, img image.Image) (err error) {
 	case ".png":
 		return png.Encode(f, img)
 	case ".jpg", ".jpeg":
-		return EncodeJPEG(f, img)
+		return jpeg.Encode(f, img, &jpeg.Options{Quality: 75})
 	case ".ppm":
 		return ppm.Encode(f, img)
 	case ".qoi":
@@ -181,6 +179,9 @@ func WriteImageToFile(path string, img image.Image) (err error) {
 
 // ConvertImage converts a go image into our Image type.
 func ConvertImage(img image.Image) *Image {
+	if lazyImg, ok := img.(*LazyEncodedImage); ok {
+		img = lazyImg.DecodedImage()
+	}
 	ii, ok := img.(*Image)
 	if ok {
 		return ii
@@ -237,28 +238,13 @@ func SaveImage(pic image.Image, loc string) error {
 			panic(err)
 		}
 	}()
-
-	if err = EncodeJPEG(f, pic); err != nil {
+	if lazyImg, ok := pic.(*LazyEncodedImage); ok {
+		pic = lazyImg.DecodedImage()
+	}
+	if err = jpeg.Encode(f, pic, &jpeg.Options{Quality: 75}); err != nil {
 		return errors.Wrapf(err, "the 'image' will not encode")
 	}
 	return nil
-}
-
-// EncodeJPEG encode an image.Image in JPEG using libjpeg.
-func EncodeJPEG(w io.Writer, src image.Image) error {
-	switch v := src.(type) {
-	case *Image:
-		imgRGBA := image.NewRGBA(src.Bounds())
-		ConvertToRGBA(imgRGBA, v)
-		return libjpeg.Encode(w, imgRGBA, jpegEncoderOptions)
-	default:
-		return libjpeg.Encode(w, src, jpegEncoderOptions)
-	}
-}
-
-// DecodeJPEG decode JPEG []bytes into an image.Image using libjpeg.
-func DecodeJPEG(r io.Reader) (img image.Image, err error) {
-	return libjpeg.Decode(r, &libjpeg.DecoderOptions{DCTMethod: libjpeg.DCTIFast})
 }
 
 // DecodeImage takes an image buffer and decodes it, using the mimeType
@@ -271,10 +257,13 @@ func DecodeImage(ctx context.Context, imgBytes []byte, mimeType string) (image.I
 		return NewLazyEncodedImage(imgBytes, mimeType), nil
 	}
 	switch mimeType {
-	case "", ut.MimeTypeJPEG:
-		img, err := DecodeJPEG(bytes.NewReader(imgBytes))
+	case "":
+		img, err := jpeg.Decode(bytes.NewReader(imgBytes))
 		if err != nil {
-			return nil, err
+			img, _, err = image.Decode(bytes.NewReader(imgBytes))
+			if err != nil {
+				return nil, err
+			}
 		}
 		return img, nil
 	default:
@@ -306,7 +295,6 @@ func EncodeImage(ctx context.Context, img image.Image, mimeType string) ([]byte,
 		return EncodeImage(ctx, lazy.decodedImage, actualOutMIME)
 	}
 	var buf bytes.Buffer
-	bounds := img.Bounds()
 	switch actualOutMIME {
 	case ut.MimeTypeRawDepth:
 		if _, err := WriteViamDepthMapTo(img, &buf); err != nil {
@@ -319,6 +307,7 @@ func EncodeImage(ctx context.Context, img image.Image, mimeType string) ([]byte,
 		buf.Write(RGBABitmapMagicNumber)
 		widthBytes := make([]byte, 4)
 		heightBytes := make([]byte, 4)
+		bounds := img.Bounds()
 		binary.BigEndian.PutUint32(widthBytes, uint32(bounds.Dx()))
 		binary.BigEndian.PutUint32(heightBytes, uint32(bounds.Dy()))
 		buf.Write(widthBytes)
@@ -331,13 +320,16 @@ func EncodeImage(ctx context.Context, img image.Image, mimeType string) ([]byte,
 			return nil, err
 		}
 	case ut.MimeTypeJPEG:
-		if err := EncodeJPEG(&buf, img); err != nil {
+		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 75}); err != nil {
 			return nil, err
 		}
 	case ut.MimeTypeQOI:
 		if err := qoi.Encode(&buf, img); err != nil {
 			return nil, err
 		}
+	case ut.MimeTypeH264:
+		frame := img.(H264)
+		buf.Write(frame.Bytes)
 	default:
 		return nil, errors.Errorf("do not know how to encode %q", actualOutMIME)
 	}
@@ -417,15 +409,22 @@ func IsImageFile(fn string) bool {
 
 // ImageToUInt8Buffer reads an image into a byte slice in the most common sense way.
 // Left to right like a book; R, then G, then B. No funny stuff. Assumes values should be between 0-255.
-func ImageToUInt8Buffer(img image.Image) []byte {
+// if  changeToBGR is true, then R and B get swapped.
+func ImageToUInt8Buffer(img image.Image, changeToBGR bool) []byte {
 	output := make([]byte, img.Bounds().Dx()*img.Bounds().Dy()*3)
 	for y := 0; y < img.Bounds().Dy(); y++ {
 		for x := 0; x < img.Bounds().Dx(); x++ {
 			r, g, b, a := img.At(x, y).RGBA()
 			rr, gg, bb, _ := rgbaTo8Bit(r, g, b, a)
-			output[(y*img.Bounds().Dx()+x)*3+0] = rr
-			output[(y*img.Bounds().Dx()+x)*3+1] = gg
-			output[(y*img.Bounds().Dx()+x)*3+2] = bb
+			if changeToBGR {
+				output[(y*img.Bounds().Dx()+x)*3+0] = bb
+				output[(y*img.Bounds().Dx()+x)*3+1] = gg
+				output[(y*img.Bounds().Dx()+x)*3+2] = rr
+			} else {
+				output[(y*img.Bounds().Dx()+x)*3+0] = rr
+				output[(y*img.Bounds().Dx()+x)*3+1] = gg
+				output[(y*img.Bounds().Dx()+x)*3+2] = bb
+			}
 		}
 	}
 	return output
@@ -433,22 +432,42 @@ func ImageToUInt8Buffer(img image.Image) []byte {
 
 // ImageToFloatBuffer reads an image into a byte slice (buffer) the most common sense way.
 // Left to right like a book; R, then G, then B. No funny stuff. Assumes values between -1 and 1.
-func ImageToFloatBuffer(img image.Image) []float32 {
+// if  changeToBGR is true, then R and B get swapped.
+// if meanValue and stdDev are not length 0, use those instead to normalize the bytes.
+func ImageToFloatBuffer(img image.Image, changeToBGR bool, meanValue, stdDev []float32) []float32 {
 	output := make([]float32, img.Bounds().Dx()*img.Bounds().Dy()*3)
+	if len(meanValue) == 0 {
+		meanValue = []float32{0.5, 0.5, 0.5}
+	}
+	if len(stdDev) == 0 {
+		stdDev = []float32{0.5, 0.5, 0.5}
+	}
 	for y := 0; y < img.Bounds().Dy(); y++ {
 		for x := 0; x < img.Bounds().Dx(); x++ {
 			r, g, b, a := img.At(x, y).RGBA()
-			rr, gg, bb := float32(r)/float32(a)*2-1, float32(g)/float32(a)*2-1, float32(b)/float32(a)*2-1
-			output[(y*img.Bounds().Dx()+x)*3+0] = rr
-			output[(y*img.Bounds().Dx()+x)*3+1] = gg
-			output[(y*img.Bounds().Dx()+x)*3+2] = bb
+			r8, g8, b8, _ := rgbaTo8Bit(r, g, b, a)
+			if changeToBGR {
+				bb := ((float32(b8) / 255.0) - meanValue[0]) / stdDev[0]
+				gg := ((float32(g8) / 255.0) - meanValue[1]) / stdDev[1]
+				rr := ((float32(r8) / 255.0) - meanValue[2]) / stdDev[2]
+				output[(y*img.Bounds().Dx()+x)*3+0] = bb
+				output[(y*img.Bounds().Dx()+x)*3+1] = gg
+				output[(y*img.Bounds().Dx()+x)*3+2] = rr
+			} else {
+				rr := ((float32(r8) / 255.0) - meanValue[0]) / stdDev[0]
+				gg := ((float32(g8) / 255.0) - meanValue[1]) / stdDev[1]
+				bb := ((float32(b8) / 255.0) - meanValue[2]) / stdDev[2]
+				output[(y*img.Bounds().Dx()+x)*3+0] = rr
+				output[(y*img.Bounds().Dx()+x)*3+1] = gg
+				output[(y*img.Bounds().Dx()+x)*3+2] = bb
+			}
 		}
 	}
 	return output
 }
 
 // rgbaTo8Bit converts the uint32s from RGBA() to uint8s.
-func rgbaTo8Bit(r, g, b, a uint32) (rr, gg, bb, aa uint8) {
+func rgbaTo8Bit(r, g, b, a uint32) (rr, gg, bb, aa uint8) { //nolint:unparam
 	r >>= 8
 	rr = uint8(r)
 	g >>= 8

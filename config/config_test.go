@@ -13,11 +13,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/golang/geo/r3"
 	"github.com/lestrrat-go/jwx/jwk"
 	"github.com/pkg/errors"
 	"go.viam.com/test"
+	"go.viam.com/utils"
 	"go.viam.com/utils/jwks"
 	"go.viam.com/utils/pexec"
 	"go.viam.com/utils/rpc"
@@ -30,18 +30,20 @@ import (
 	"go.viam.com/rdk/components/encoder/incremental"
 	fakemotor "go.viam.com/rdk/components/motor/fake"
 	"go.viam.com/rdk/config"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/resource"
+	"go.viam.com/rdk/services/shell"
 	"go.viam.com/rdk/spatialmath"
 	rutils "go.viam.com/rdk/utils"
 )
 
 func TestConfigRobot(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	cfg, err := config.Read(context.Background(), "data/robot.json", logger)
 	test.That(t, err, test.ShouldBeNil)
 
-	test.That(t, cfg.Components, test.ShouldHaveLength, 4)
+	test.That(t, cfg.Components, test.ShouldHaveLength, 3)
 	test.That(t, len(cfg.Remotes), test.ShouldEqual, 2)
 	test.That(t, cfg.Remotes[0].Name, test.ShouldEqual, "one")
 	test.That(t, cfg.Remotes[0].Address, test.ShouldEqual, "foo")
@@ -68,8 +70,10 @@ func TestConfigRobot(t *testing.T) {
 	test.That(t, newBc, test.ShouldResemble, bc)
 }
 
+// TestConfig3 depends on the `datamanager` package *not* being loaded. Its `init` function
+// registers an associated API that alters `AssociatedResourceConfigs` results.
 func TestConfig3(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 
 	test.That(t, os.Setenv("TEST_THING_FOO", "5"), test.ShouldBeNil)
 	cfg, err := config.Read(context.Background(), "data/config3.json", logger)
@@ -89,7 +93,7 @@ func TestConfig3(t *testing.T) {
 	test.That(t, cfg.Components[0].Attributes.Float64("bar5-no", 1.1), test.ShouldEqual, 1.1)
 
 	test.That(t, cfg.Components[1].ConvertedAttributes, test.ShouldResemble, &fakeboard.Config{
-		Analogs: []board.AnalogConfig{
+		AnalogReaders: []board.AnalogReaderConfig{
 			{Name: "analog1", Pin: "0"},
 		},
 		DigitalInterrupts: []board.DigitalInterruptConfig{
@@ -146,8 +150,44 @@ func TestConfig3(t *testing.T) {
 	})
 }
 
+func TestConfigWithLogDeclarations(t *testing.T) {
+	logger := logging.NewTestLogger(t)
+	cfg, err := config.Read(context.Background(), "data/config_with_log.json", logger)
+	test.That(t, err, test.ShouldBeNil)
+
+	test.That(t, len(cfg.Components), test.ShouldEqual, 4)
+	// The board log level is explicitly configured as `Info`.
+	test.That(t, cfg.Components[0].Name, test.ShouldEqual, "board1")
+	test.That(t, cfg.Components[0].LogConfiguration.Level, test.ShouldEqual, logging.INFO)
+
+	// The left motor is explicitly configured as `debug`. Note the lower case.
+	test.That(t, cfg.Components[1].Name, test.ShouldEqual, "left_motor")
+	test.That(t, cfg.Components[1].LogConfiguration.Level, test.ShouldEqual, logging.DEBUG)
+
+	// The right motor is left unconfigured. The default log level is `Info`. However, the global
+	// log configure for builtin fake motors would apply for a log level of `warn`. This "overlayed"
+	// log level is not applied at config parsing time.
+	test.That(t, cfg.Components[2].Name, test.ShouldEqual, "right_motor")
+	test.That(t, cfg.Components[2].LogConfiguration, test.ShouldBeNil)
+
+	// The wheeled base is also left unconfigured. The global log configuration for things
+	// implementing the `base` API is `error`. This "overlayed" log level is not applied at config
+	// parsing time.
+	test.That(t, cfg.Components[3].Name, test.ShouldEqual, "wheeley")
+	test.That(t, cfg.Components[3].LogConfiguration, test.ShouldBeNil)
+
+	test.That(t, len(cfg.Services), test.ShouldEqual, 2)
+	// The slam service has a log level of `WARN`. Note the upper case.
+	test.That(t, cfg.Services[0].Name, test.ShouldEqual, "slam1")
+	test.That(t, cfg.Services[0].LogConfiguration.Level, test.ShouldEqual, logging.WARN)
+
+	// The data manager service is left unconfigured.
+	test.That(t, cfg.Services[1].Name, test.ShouldEqual, "dm")
+	test.That(t, cfg.Services[1].LogConfiguration, test.ShouldBeNil)
+}
+
 func TestConfigEnsure(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	var emptyConfig config.Config
 	test.That(t, emptyConfig.Ensure(false, logger), test.ShouldBeNil)
 
@@ -157,14 +197,14 @@ func TestConfigEnsure(t *testing.T) {
 	err := invalidCloud.Ensure(false, logger)
 	test.That(t, err, test.ShouldNotBeNil)
 	test.That(t, err.Error(), test.ShouldContainSubstring, `cloud`)
-	test.That(t, err.Error(), test.ShouldContainSubstring, `"id" is required`)
+	test.That(t, resource.GetFieldFromFieldRequiredError(err), test.ShouldEqual, "id")
 	invalidCloud.Cloud.ID = "some_id"
 	err = invalidCloud.Ensure(false, logger)
 	test.That(t, err, test.ShouldNotBeNil)
-	test.That(t, err.Error(), test.ShouldContainSubstring, `"secret" is required`)
+	test.That(t, resource.GetFieldFromFieldRequiredError(err), test.ShouldEqual, "secret")
 	err = invalidCloud.Ensure(true, logger)
 	test.That(t, err, test.ShouldNotBeNil)
-	test.That(t, err.Error(), test.ShouldContainSubstring, `"fqdn" is required`)
+	test.That(t, resource.GetFieldFromFieldRequiredError(err), test.ShouldEqual, "fqdn")
 	invalidCloud.Cloud.Secret = "my_secret"
 	test.That(t, invalidCloud.Ensure(false, logger), test.ShouldBeNil)
 	test.That(t, invalidCloud.Ensure(true, logger), test.ShouldNotBeNil)
@@ -172,9 +212,8 @@ func TestConfigEnsure(t *testing.T) {
 	invalidCloud.Cloud.FQDN = "wooself"
 	err = invalidCloud.Ensure(true, logger)
 	test.That(t, err, test.ShouldNotBeNil)
-	test.That(t, err.Error(), test.ShouldContainSubstring, `"local_fqdn" is required`)
+	test.That(t, resource.GetFieldFromFieldRequiredError(err), test.ShouldEqual, "local_fqdn")
 	invalidCloud.Cloud.LocalFQDN = "yeeself"
-	test.That(t, invalidCloud.Ensure(true, logger), test.ShouldBeNil)
 
 	invalidRemotes := config.Config{
 		DisablePartialStart: true,
@@ -183,13 +222,13 @@ func TestConfigEnsure(t *testing.T) {
 	err = invalidRemotes.Ensure(false, logger)
 	test.That(t, err, test.ShouldNotBeNil)
 	test.That(t, err.Error(), test.ShouldContainSubstring, `remotes.0`)
-	test.That(t, err.Error(), test.ShouldContainSubstring, `"name" is required`)
+	test.That(t, resource.GetFieldFromFieldRequiredError(err), test.ShouldEqual, "name")
 	invalidRemotes.Remotes[0] = config.Remote{
 		Name: "foo",
 	}
 	err = invalidRemotes.Ensure(false, logger)
 	test.That(t, err, test.ShouldNotBeNil)
-	test.That(t, err.Error(), test.ShouldContainSubstring, `"address" is required`)
+	test.That(t, resource.GetFieldFromFieldRequiredError(err), test.ShouldEqual, "address")
 	invalidRemotes.Remotes[0] = config.Remote{
 		Name:    "foo",
 		Address: "bar",
@@ -203,7 +242,7 @@ func TestConfigEnsure(t *testing.T) {
 	err = invalidComponents.Ensure(false, logger)
 	test.That(t, err, test.ShouldNotBeNil)
 	test.That(t, err.Error(), test.ShouldContainSubstring, `components.0`)
-	test.That(t, err.Error(), test.ShouldContainSubstring, `"name" is required`)
+	test.That(t, resource.GetFieldFromFieldRequiredError(err), test.ShouldEqual, "name")
 	invalidComponents.Components[0] = resource.Config{
 		Name:  "foo",
 		API:   base.API,
@@ -352,7 +391,8 @@ func TestConfigEnsure(t *testing.T) {
 	validAPIKeyHandler := config.AuthHandlerConfig{
 		Type: rpc.CredentialsTypeAPIKey,
 		Config: rutils.AttributeMap{
-			"key": "foo",
+			"key":  "foo",
+			"keys": []string{"key"},
 		},
 	}
 
@@ -391,7 +431,7 @@ func TestConfigEnsure(t *testing.T) {
 	test.That(t, err, test.ShouldNotBeNil)
 	test.That(t, err.Error(), test.ShouldContainSubstring, `auth.handlers.0`)
 	test.That(t, err.Error(), test.ShouldContainSubstring, `required`)
-	test.That(t, err.Error(), test.ShouldContainSubstring, `key`)
+	test.That(t, err.Error(), test.ShouldContainSubstring, `keys`)
 
 	validAPIKeyHandler.Config = rutils.AttributeMap{
 		"keys": []string{"one", "two"},
@@ -404,7 +444,7 @@ func TestConfigEnsure(t *testing.T) {
 }
 
 func TestConfigEnsurePartialStart(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	var emptyConfig config.Config
 	test.That(t, emptyConfig.Ensure(false, logger), test.ShouldBeNil)
 
@@ -414,14 +454,14 @@ func TestConfigEnsurePartialStart(t *testing.T) {
 	err := invalidCloud.Ensure(false, logger)
 	test.That(t, err, test.ShouldNotBeNil)
 	test.That(t, err.Error(), test.ShouldContainSubstring, `cloud`)
-	test.That(t, err.Error(), test.ShouldContainSubstring, `"id" is required`)
+	test.That(t, resource.GetFieldFromFieldRequiredError(err), test.ShouldEqual, "id")
 	invalidCloud.Cloud.ID = "some_id"
 	err = invalidCloud.Ensure(false, logger)
 	test.That(t, err, test.ShouldNotBeNil)
-	test.That(t, err.Error(), test.ShouldContainSubstring, `"secret" is required`)
+	test.That(t, resource.GetFieldFromFieldRequiredError(err), test.ShouldEqual, "secret")
 	err = invalidCloud.Ensure(true, logger)
 	test.That(t, err, test.ShouldNotBeNil)
-	test.That(t, err.Error(), test.ShouldContainSubstring, `"fqdn" is required`)
+	test.That(t, resource.GetFieldFromFieldRequiredError(err), test.ShouldEqual, "fqdn")
 	invalidCloud.Cloud.Secret = "my_secret"
 	test.That(t, invalidCloud.Ensure(false, logger), test.ShouldBeNil)
 	test.That(t, invalidCloud.Ensure(true, logger), test.ShouldNotBeNil)
@@ -429,8 +469,9 @@ func TestConfigEnsurePartialStart(t *testing.T) {
 	invalidCloud.Cloud.FQDN = "wooself"
 	err = invalidCloud.Ensure(true, logger)
 	test.That(t, err, test.ShouldNotBeNil)
-	test.That(t, err.Error(), test.ShouldContainSubstring, `"local_fqdn" is required`)
+	test.That(t, resource.GetFieldFromFieldRequiredError(err), test.ShouldEqual, "local_fqdn")
 	invalidCloud.Cloud.LocalFQDN = "yeeself"
+
 	test.That(t, invalidCloud.Ensure(true, logger), test.ShouldBeNil)
 
 	invalidRemotes := config.Config{
@@ -471,6 +512,49 @@ func TestConfigEnsurePartialStart(t *testing.T) {
 	test.That(t, err, test.ShouldBeNil)
 	invalidProcesses.Processes[0].Name = "foo"
 	test.That(t, invalidProcesses.Ensure(false, logger), test.ShouldBeNil)
+
+	cloudErr := "bad cloud err doing validation"
+	invalidModules := config.Config{
+		Modules: []config.Module{{
+			Name:        "testmodErr",
+			ExePath:     ".",
+			LogLevel:    "debug",
+			Type:        config.ModuleTypeRegistry,
+			ModuleID:    "mod:testmodErr",
+			Environment: map[string]string{},
+			Status: &config.AppValidationStatus{
+				Error: cloudErr,
+			},
+		}},
+	}
+	invalidModules.DisablePartialStart = true
+	err = invalidModules.Ensure(false, logger)
+	test.That(t, err, test.ShouldNotBeNil)
+	test.That(t, err.Error(), test.ShouldContainSubstring, cloudErr)
+
+	invalidModules.DisablePartialStart = false
+	err = invalidModules.Ensure(false, logger)
+	test.That(t, err, test.ShouldBeNil)
+
+	invalidPackges := config.Config{
+		Packages: []config.PackageConfig{{
+			Name:    "testPackage",
+			Type:    config.PackageTypeMlModel,
+			Package: "hi/package/test",
+			Status: &config.AppValidationStatus{
+				Error: cloudErr,
+			},
+		}},
+	}
+
+	invalidModules.DisablePartialStart = true
+	err = invalidModules.Ensure(false, logger)
+	test.That(t, err, test.ShouldNotBeNil)
+	test.That(t, err.Error(), test.ShouldContainSubstring, cloudErr)
+
+	invalidModules.DisablePartialStart = false
+	err = invalidPackges.Ensure(false, logger)
+	test.That(t, err, test.ShouldBeNil)
 
 	invalidNetwork := config.Config{
 		Network: config.NetworkConfig{
@@ -527,7 +611,8 @@ func TestConfigEnsurePartialStart(t *testing.T) {
 	validAPIKeyHandler := config.AuthHandlerConfig{
 		Type: rpc.CredentialsTypeAPIKey,
 		Config: rutils.AttributeMap{
-			"key": "foo",
+			"key":  "foo",
+			"keys": []string{"key"},
 		},
 	}
 
@@ -566,7 +651,7 @@ func TestConfigEnsurePartialStart(t *testing.T) {
 	test.That(t, err, test.ShouldNotBeNil)
 	test.That(t, err.Error(), test.ShouldContainSubstring, `auth.handlers.0`)
 	test.That(t, err.Error(), test.ShouldContainSubstring, `required`)
-	test.That(t, err.Error(), test.ShouldContainSubstring, `key`)
+	test.That(t, err.Error(), test.ShouldContainSubstring, `keys`)
 
 	validAPIKeyHandler.Config = rutils.AttributeMap{
 		"keys": []string{"one", "two"},
@@ -603,7 +688,7 @@ func TestRemoteValidate(t *testing.T) {
 			t,
 			err.Error(),
 			test.ShouldContainSubstring,
-			"must start with a letter and must only contain letters, numbers, dashes, and underscores",
+			"must start with a letter or number and must only contain letters, numbers, dashes, and underscores",
 		)
 	})
 }
@@ -643,29 +728,8 @@ func TestCopyOnlyPublicFields(t *testing.T) {
 	})
 }
 
-func TestNewTLSConfig(t *testing.T) {
-	for _, tc := range []struct {
-		TestName     string
-		Config       *config.Config
-		HasTLSConfig bool
-	}{
-		{TestName: "no cloud", Config: &config.Config{}, HasTLSConfig: false},
-		{TestName: "cloud but no cert", Config: &config.Config{Cloud: &config.Cloud{TLSCertificate: ""}}, HasTLSConfig: false},
-		{TestName: "cloud and cert", Config: &config.Config{Cloud: &config.Cloud{TLSCertificate: "abc"}}, HasTLSConfig: true},
-	} {
-		t.Run(tc.TestName, func(t *testing.T) {
-			observed := config.NewTLSConfig(tc.Config)
-			if tc.HasTLSConfig {
-				test.That(t, observed.MinVersion, test.ShouldEqual, tls.VersionTLS12)
-			} else {
-				test.That(t, observed, test.ShouldResemble, &config.TLSConfig{})
-			}
-		})
-	}
-}
-
-func TestUpdateCert(t *testing.T) {
-	t.Run("cert update", func(t *testing.T) {
+func TestCreateTLSWithCert(t *testing.T) {
+	t.Run("create TLS cert", func(t *testing.T) {
 		cfg := &config.Config{
 			Cloud: &config.Cloud{
 				TLSCertificate: `-----BEGIN CERTIFICATE-----
@@ -691,8 +755,7 @@ ph2C/7IgjA==
 		cert, err := tls.X509KeyPair([]byte(cfg.Cloud.TLSCertificate), []byte(cfg.Cloud.TLSPrivateKey))
 		test.That(t, err, test.ShouldBeNil)
 
-		tlsCfg := config.NewTLSConfig(cfg)
-		err = tlsCfg.UpdateCert(cfg)
+		tlsCfg, err := config.CreateTLSWithCert(cfg)
 		test.That(t, err, test.ShouldBeNil)
 
 		observed, err := tlsCfg.GetCertificate(&tls.ClientHelloInfo{})
@@ -701,8 +764,7 @@ ph2C/7IgjA==
 	})
 	t.Run("cert error", func(t *testing.T) {
 		cfg := &config.Config{Cloud: &config.Cloud{TLSCertificate: "abcd", TLSPrivateKey: "abcd"}}
-		tlsCfg := &config.TLSConfig{}
-		err := tlsCfg.UpdateCert(cfg)
+		_, err := config.CreateTLSWithCert(cfg)
 		test.That(t, err, test.ShouldBeError, errors.New("tls: failed to find any PEM data in certificate input"))
 	})
 }
@@ -778,15 +840,14 @@ ph2C/7IgjA==
 	expectedRemoteDiffManagerNoCloud := remoteDiffManager
 	expectedRemoteDiffManagerNoCloud.Auth = expectedRemoteAuthNoCloud
 
-	tlsCfg := &config.TLSConfig{}
-	err := tlsCfg.UpdateCert(cloudWTLSCfg)
+	tlsCfg, err := config.CreateTLSWithCert(cloudWTLSCfg)
 	test.That(t, err, test.ShouldBeNil)
 
 	expectedCloudWTLSCfg := &config.Config{Cloud: cloudWTLS, Remotes: []config.Remote{}}
-	expectedCloudWTLSCfg.Network.TLSConfig = tlsCfg.Config
+	expectedCloudWTLSCfg.Network.TLSConfig = tlsCfg
 
 	expectedRemotesCloudWTLSCfg := &config.Config{Cloud: cloudWTLS, Remotes: []config.Remote{expectedRemoteCloud, remoteDiffManager}}
-	expectedRemotesCloudWTLSCfg.Network.TLSConfig = tlsCfg.Config
+	expectedRemotesCloudWTLSCfg.Network.TLSConfig = tlsCfg
 
 	for _, tc := range []struct {
 		TestName string
@@ -809,22 +870,33 @@ ph2C/7IgjA==
 		{TestName: "remotes cloud and cert", Config: remotesCloudWTLSCfg, Expected: expectedRemotesCloudWTLSCfg},
 	} {
 		t.Run(tc.TestName, func(t *testing.T) {
-			observed, err := config.ProcessConfig(tc.Config, &config.TLSConfig{})
+			observed, err := config.ProcessConfig(tc.Config)
 			test.That(t, err, test.ShouldBeNil)
+			// TLSConfig holds funcs, which do not resemble each other so check separately and nil them out after.
+			if tc.Expected.Network.TLSConfig != nil {
+				obsCert, err := observed.Network.TLSConfig.GetCertificate(nil)
+				test.That(t, err, test.ShouldBeNil)
+				expCert, err := tc.Expected.Network.TLSConfig.GetCertificate(nil)
+				test.That(t, err, test.ShouldBeNil)
+
+				test.That(t, obsCert, test.ShouldResemble, expCert)
+				tc.Expected.Network.TLSConfig = nil
+				observed.Network.TLSConfig = nil
+			}
 			test.That(t, observed, test.ShouldResemble, tc.Expected)
 		})
 	}
 
 	t.Run("cert error", func(t *testing.T) {
 		cfg := &config.Config{Cloud: &config.Cloud{TLSCertificate: "abcd", TLSPrivateKey: "abcd"}}
-		_, err := config.ProcessConfig(cfg, &config.TLSConfig{})
+		_, err := config.ProcessConfig(cfg)
 		test.That(t, err, test.ShouldBeError, errors.New("tls: failed to find any PEM data in certificate input"))
 	})
 }
 
 func TestAuthConfigEnsure(t *testing.T) {
 	t.Run("unknown handler", func(t *testing.T) {
-		logger := golog.NewTestLogger(t)
+		logger := logging.NewTestLogger(t)
 		config := config.Config{
 			Auth: config.AuthConfig{
 				Handlers: []config.AuthHandlerConfig{
@@ -841,13 +913,16 @@ func TestAuthConfigEnsure(t *testing.T) {
 	})
 
 	t.Run("api-key handler", func(t *testing.T) {
-		logger := golog.NewTestLogger(t)
+		logger := logging.NewTestLogger(t)
 		config := config.Config{
 			Auth: config.AuthConfig{
 				Handlers: []config.AuthHandlerConfig{
 					{
-						Type:   rpc.CredentialsTypeAPIKey,
-						Config: rutils.AttributeMap{"key": "abc123"},
+						Type: rpc.CredentialsTypeAPIKey,
+						Config: rutils.AttributeMap{
+							"abc123": "abc123",
+							"keys":   []string{"abc123"},
+						},
 					},
 				},
 			},
@@ -858,7 +933,7 @@ func TestAuthConfigEnsure(t *testing.T) {
 	})
 
 	t.Run("external auth with invalid keyset", func(t *testing.T) {
-		logger := golog.NewTestLogger(t)
+		logger := logging.NewTestLogger(t)
 		config := config.Config{
 			Auth: config.AuthConfig{
 				ExternalAuthConfig: &config.ExternalAuthConfig{},
@@ -870,7 +945,7 @@ func TestAuthConfigEnsure(t *testing.T) {
 	})
 
 	t.Run("external auth valid config", func(t *testing.T) {
-		logger := golog.NewTestLogger(t)
+		logger := logging.NewTestLogger(t)
 		algTypes := map[string]bool{
 			"RS256": true,
 			"RS384": true,
@@ -905,7 +980,7 @@ func TestAuthConfigEnsure(t *testing.T) {
 	})
 
 	t.Run("web-oauth invalid alg type", func(t *testing.T) {
-		logger := golog.NewTestLogger(t)
+		logger := logging.NewTestLogger(t)
 		badTypes := []string{"invalid", "", "nil"} // nil is a special case and is not set.
 		for _, badType := range badTypes {
 			t.Run(fmt.Sprintf(" with %s", badType), func(t *testing.T) {
@@ -937,7 +1012,7 @@ func TestAuthConfigEnsure(t *testing.T) {
 	})
 
 	t.Run("external auth no keys", func(t *testing.T) {
-		logger := golog.NewTestLogger(t)
+		logger := logging.NewTestLogger(t)
 		config := config.Config{
 			Auth: config.AuthConfig{
 				ExternalAuthConfig: &config.ExternalAuthConfig{
@@ -950,6 +1025,93 @@ func TestAuthConfigEnsure(t *testing.T) {
 		test.That(t, err, test.ShouldNotBeNil)
 		test.That(t, err.Error(), test.ShouldContainSubstring, "must contain at least 1 key")
 	})
+}
+
+func TestValidateUniqueNames(t *testing.T) {
+	logger := logging.NewTestLogger(t)
+	component := resource.Config{
+		Name:  "custom",
+		Model: fakeModel,
+		API:   arm.API,
+	}
+	service := resource.Config{
+		Name:  "custom",
+		Model: fakeModel,
+		API:   shell.API,
+	}
+	package1 := config.PackageConfig{
+		Package: "package1",
+		Name:    "package1",
+		Type:    config.PackageTypeMlModel,
+	}
+	module1 := config.Module{
+		Name:     "m1",
+		LogLevel: "info",
+		ExePath:  ".",
+	}
+
+	process1 := pexec.ProcessConfig{
+		ID: "process1", Name: "process1",
+	}
+
+	remote1 := config.Remote{
+		Name:    "remote1",
+		Address: "test",
+	}
+	config1 := config.Config{
+		Components: []resource.Config{component, component},
+	}
+	config2 := config.Config{
+		Services: []resource.Config{service, service},
+	}
+
+	config3 := config.Config{
+		Packages: []config.PackageConfig{package1, package1},
+	}
+	config4 := config.Config{
+		Modules: []config.Module{module1, module1},
+	}
+	config5 := config.Config{
+		Processes: []pexec.ProcessConfig{process1, process1},
+	}
+
+	config6 := config.Config{
+		Remotes: []config.Remote{remote1, remote1},
+	}
+	allConfigs := []config.Config{config1, config2, config3, config4, config5, config6}
+
+	for _, config := range allConfigs {
+		// returns an error instead of logging it
+		config.DisablePartialStart = true
+		// test that the logger returns an error after the ensure method is done
+		err := config.Ensure(false, logger)
+		test.That(t, err, test.ShouldNotBeNil)
+		test.That(t, err.Error(), test.ShouldContainSubstring, "duplicate resource")
+
+		observedLogger, logs := logging.NewObservedTestLogger(t)
+		// now test it with logging enabled
+		config.DisablePartialStart = false
+		err = config.Ensure(false, observedLogger)
+		test.That(t, err, test.ShouldBeNil)
+
+		test.That(t, logs.FilterMessageSnippet("duplicate resource").Len(), test.ShouldBeGreaterThan, 0)
+	}
+
+	// mix components and services with the same name -- no error as use triplets
+	config7 := config.Config{
+		Components: []resource.Config{component},
+		Services:   []resource.Config{service},
+		Modules:    []config.Module{module1},
+		Remotes: []config.Remote{
+			{
+				Name:    module1.Name,
+				Address: "test1",
+			},
+		},
+	}
+	config7.DisablePartialStart = true
+	err := config7.Ensure(false, logger)
+	test.That(t, err, test.ShouldBeNil)
 }
 
 func keysetToAttributeMap(t *testing.T, keyset jwks.KeySet) rutils.AttributeMap {
@@ -982,7 +1144,7 @@ func TestPackageConfig(t *testing.T) {
 				Package: "my_org/my_package",
 				Version: "0",
 			},
-			expectedRealFilePath: filepath.Join(viamDotDir, "packages", ".data", "ml_model", "my_org-my_package-0"),
+			shouldFailValidation: true,
 		},
 		{
 			config: config.PackageConfig{
@@ -991,7 +1153,7 @@ func TestPackageConfig(t *testing.T) {
 				Package: "my_org/my_module",
 				Version: "1.2",
 			},
-			expectedRealFilePath: filepath.Join(viamDotDir, "packages", ".data", "module", "my_org-my_module-1_2"),
+			expectedRealFilePath: filepath.Join(viamDotDir, "packages", "data", "module", "my_org-my_module-1_2"),
 		},
 		{
 			config: config.PackageConfig{
@@ -1000,7 +1162,7 @@ func TestPackageConfig(t *testing.T) {
 				Package: "my_org/my_ml_model",
 				Version: "latest",
 			},
-			expectedRealFilePath: filepath.Join(viamDotDir, "packages", ".data", "ml_model", "my_org-my_ml_model-latest"),
+			expectedRealFilePath: filepath.Join(viamDotDir, "packages", "data", "ml_model", "my_org-my_ml_model-latest"),
 		},
 		{
 			config: config.PackageConfig{
@@ -1009,16 +1171,7 @@ func TestPackageConfig(t *testing.T) {
 				Package: "my_org/my_slam_map",
 				Version: "latest",
 			},
-			expectedRealFilePath: filepath.Join(viamDotDir, "packages", ".data", "slam_map", "my_org-my_slam_map-latest"),
-		},
-		{
-			config: config.PackageConfig{
-				Name:    "my_board_defs",
-				Type:    config.PackageTypeBoardDefs,
-				Package: "my_org/my_board_defs",
-				Version: "latest",
-			},
-			expectedRealFilePath: filepath.Join(viamDotDir, "packages", ".data", "board_defs", "my_org-my_board_defs-latest"),
+			expectedRealFilePath: filepath.Join(viamDotDir, "packages", "data", "slam_map", "my_org-my_slam_map-latest"),
 		},
 		{
 			config: config.PackageConfig{
@@ -1049,5 +1202,110 @@ func TestPackageConfig(t *testing.T) {
 		test.That(t, err, test.ShouldBeNil)
 		actualFilepath := pt.config.LocalDataDirectory(filepath.Join(viamDotDir, "packages"))
 		test.That(t, actualFilepath, test.ShouldEqual, pt.expectedRealFilePath)
+	}
+}
+
+func TestConfigRobotWebProfile(t *testing.T) {
+	logger := logging.NewTestLogger(t)
+	cfg, err := config.Read(context.Background(), "data/config_with_web_profile.json", logger)
+	test.That(t, err, test.ShouldBeNil)
+
+	test.That(t, cfg.EnableWebProfile, test.ShouldBeTrue)
+}
+
+func TestConfigRobotRevision(t *testing.T) {
+	logger := logging.NewTestLogger(t)
+	cfg, err := config.Read(context.Background(), "data/config_with_revision.json", logger)
+	test.That(t, err, test.ShouldBeNil)
+
+	test.That(t, cfg.Revision, test.ShouldEqual, "rev1")
+}
+
+func TestConfigJSONMarshalRoundtrip(t *testing.T) {
+	type testcase struct {
+		name     string
+		c        config.Config
+		expected config.Config
+	}
+
+	// TODO(RSDK-9717): Add more test cases around config JSON round-tripping. We're testing
+	// only a few fields here. It would be great if adding a new field to config.Config
+	// broke this test somehow so we would remember to change (Un)MarhsalJSON methods.
+	for _, tc := range []testcase{
+		{
+			name: "maintenance config",
+			c: config.Config{
+				MaintenanceConfig: &config.MaintenanceConfig{
+					SensorName:            "SensorName",
+					MaintenanceAllowedKey: "Key",
+				},
+			},
+			expected: config.Config{
+				MaintenanceConfig: &config.MaintenanceConfig{
+					SensorName:            "SensorName",
+					MaintenanceAllowedKey: "Key",
+				},
+			},
+		},
+		{
+			name: "module",
+			c: config.Config{
+				Modules: []config.Module{
+					{
+						Name:            "ModuleName",
+						ExePath:         "ExecutablePath",
+						LogLevel:        "WARN",
+						Type:            config.ModuleTypeLocal,
+						ModuleID:        "ModuleID",
+						Environment:     map[string]string{"KEY": "VAL"},
+						FirstRunTimeout: utils.Duration(5 * time.Minute),
+						Status:          &config.AppValidationStatus{Error: "durrr"},
+					},
+				},
+			},
+			expected: config.Config{
+				Modules: []config.Module{
+					{
+						Name:            "ModuleName",
+						ExePath:         "ExecutablePath",
+						LogLevel:        "WARN",
+						Type:            config.ModuleTypeLocal,
+						ModuleID:        "ModuleID",
+						FirstRunTimeout: utils.Duration(5 * time.Minute),
+						Environment:     map[string]string{"KEY": "VAL"},
+						Status:          &config.AppValidationStatus{Error: "durrr"},
+					},
+				},
+			},
+		},
+		{
+			name: "disable log deduplication",
+			c: config.Config{
+				DisableLogDeduplication: true,
+			},
+			expected: config.Config{
+				DisableLogDeduplication: true,
+			},
+		},
+		{
+			name: "package path",
+			c: config.Config{
+				PackagePath: "path/to/home/depot",
+			},
+			expected: config.Config{
+				PackagePath: "path/to/home/depot",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := tc.c
+
+			data, err := c.MarshalJSON()
+			test.That(t, err, test.ShouldBeNil)
+
+			err = c.UnmarshalJSON(data)
+			test.That(t, err, test.ShouldBeNil)
+			test.That(t, c, test.ShouldResemble, tc.expected)
+		})
 	}
 }

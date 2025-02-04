@@ -6,7 +6,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/edaniels/golog"
 	pb "go.viam.com/api/component/inputcontroller/v1"
 	"go.viam.com/utils"
 	"go.viam.com/utils/protoutils"
@@ -14,6 +13,7 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"go.viam.com/rdk/logging"
 	rprotoutils "go.viam.com/rdk/protoutils"
 	"go.viam.com/rdk/resource"
 )
@@ -24,15 +24,19 @@ type client struct {
 	resource.TriviallyReconfigurable
 	resource.TriviallyCloseable
 	client pb.InputControllerServiceClient
-	logger golog.Logger
+	logger logging.Logger
 
 	name          string
 	streamCancel  context.CancelFunc
 	streamHUP     bool
 	streamRunning bool
 	streamReady   bool
-	streamMu      sync.Mutex
-	mu            sync.RWMutex
+
+	// streamMu ensures that only one stream at most is active at any given time
+	streamMu sync.Mutex
+
+	// mu guards access to other members of the struct
+	mu sync.RWMutex
 
 	closeContext            context.Context
 	activeBackgroundWorkers sync.WaitGroup
@@ -48,7 +52,7 @@ func NewClientFromConn(
 	conn rpc.ClientConn,
 	remoteName string,
 	name resource.Name,
-	logger golog.Logger,
+	logger logging.Logger,
 ) (Controller, error) {
 	c := pb.NewInputControllerServiceClient(conn)
 	return &client{
@@ -72,6 +76,9 @@ func (c *client) Controls(ctx context.Context, extra map[string]interface{}) ([]
 	if err != nil {
 		return nil, err
 	}
+	if resp.Controls == nil {
+		return nil, nil
+	}
 	var controls []Control
 	for _, control := range resp.Controls {
 		controls = append(controls, Control(control))
@@ -90,6 +97,9 @@ func (c *client) Events(ctx context.Context, extra map[string]interface{}) (map[
 	})
 	if err != nil {
 		return nil, err
+	}
+	if resp.Events == nil {
+		return nil, nil
 	}
 
 	eventsOut := make(map[Control]Event)
@@ -126,6 +136,22 @@ func (c *client) TriggerEvent(ctx context.Context, event Event, extra map[string
 	return err
 }
 
+func (c *client) checkReady(ctx context.Context) error {
+	c.mu.RLock()
+	ready := c.streamReady
+	c.mu.RUnlock()
+
+	for !ready {
+		c.mu.RLock()
+		ready = c.streamReady
+		c.mu.RUnlock()
+		if !utils.SelectContextOrWait(ctx, 50*time.Millisecond) {
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
 func (c *client) RegisterControlCallback(
 	ctx context.Context,
 	control Control,
@@ -159,16 +185,18 @@ func (c *client) RegisterControlCallback(
 	if err != nil {
 		return err
 	}
+	c.mu.Lock()
 	c.extra = ext
+	c.mu.Unlock()
 	if c.streamRunning {
-		for !c.streamReady {
-			if !utils.SelectContextOrWait(ctx, 50*time.Millisecond) {
-				return ctx.Err()
-			}
+		if err := c.checkReady(ctx); err != nil {
+			return err
 		}
+		c.mu.Lock()
 		c.streamHUP = true
 		c.streamReady = false
 		c.streamCancel()
+		c.mu.Unlock()
 	} else {
 		c.streamRunning = true
 		c.activeBackgroundWorkers.Add(1)
@@ -178,17 +206,8 @@ func (c *client) RegisterControlCallback(
 			defer c.activeBackgroundWorkers.Done()
 			c.connectStream(closeContext)
 		})
-		c.mu.RLock()
-		ready := c.streamReady
-		c.mu.RUnlock()
-
-		for !ready {
-			c.mu.RLock()
-			ready = c.streamReady
-			c.mu.RUnlock()
-			if !utils.SelectContextOrWait(ctx, 50*time.Millisecond) {
-				return ctx.Err()
-			}
+		if err := c.checkReady(ctx); err != nil {
+			return err
 		}
 	}
 
@@ -246,18 +265,18 @@ func (c *client) connectStream(ctx context.Context) {
 		if !haveCallbacks {
 			return
 		}
-
+		c.mu.Lock()
 		streamCtx, cancel := context.WithCancel(ctx)
 		c.streamCancel = cancel
+		c.mu.Unlock()
 
 		stream, err := c.client.StreamEvents(streamCtx, req)
 		if err != nil {
-			c.logger.Error(err)
+			c.logger.CError(ctx, err)
 			if utils.SelectContextOrWait(ctx, 3*time.Second) {
 				continue
-			} else {
-				return
 			}
+			return
 		}
 
 		c.mu.RLock()
@@ -290,14 +309,13 @@ func (c *client) connectStream(ctx context.Context) {
 				}
 				c.sendConnectionStatus(ctx, false)
 				if utils.SelectContextOrWait(ctx, 3*time.Second) {
-					c.logger.Error(err)
+					c.logger.CError(ctx, err)
 					break
-				} else {
-					return
 				}
+				return
 			}
 			if err != nil {
-				c.logger.Error(err)
+				c.logger.CError(ctx, err)
 			}
 			eventIn := streamResp.Event
 			eventOut := Event{

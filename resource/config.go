@@ -6,30 +6,37 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/mitchellh/mapstructure"
+	"github.com/go-viper/mapstructure/v2"
 	"github.com/pkg/errors"
-	goutils "go.viam.com/utils"
 
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/utils"
 )
 
 // A Config describes the configuration of a resource.
 type Config struct {
-	Name                      string
-	API                       API
-	Model                     Model
-	Frame                     *referenceframe.LinkConfig
-	DependsOn                 []string
-	AssociatedResourceConfigs []AssociatedResourceConfig
-	Attributes                utils.AttributeMap
+	Name             string
+	API              API
+	Model            Model
+	Frame            *referenceframe.LinkConfig
+	DependsOn        []string
+	LogConfiguration *LogConfig
+	Attributes       utils.AttributeMap
 
-	ConvertedAttributes ConfigValidator
-	ImplicitDependsOn   []string
+	AssociatedResourceConfigs []AssociatedResourceConfig
+	AssociatedAttributes      map[Name]AssociatedConfig
+	ConvertedAttributes       ConfigValidator
+	ImplicitDependsOn         []string
 
 	alreadyValidated   bool
 	cachedImplicitDeps []string
 	cachedErr          error
+}
+
+// A LogConfig describes the LogConfig config object.
+type LogConfig struct {
+	Level logging.Level `json:"level"`
 }
 
 // NOTE: This data must be maintained with what is in Config.
@@ -40,6 +47,7 @@ type typeSpecificConfigData struct {
 	Model                     Model                      `json:"model"`
 	Frame                     *referenceframe.LinkConfig `json:"frame,omitempty"`
 	DependsOn                 []string                   `json:"depends_on,omitempty"`
+	LogConfiguration          *LogConfig                 `json:"log_configuration"`
 	AssociatedResourceConfigs []AssociatedResourceConfig `json:"service_configs,omitempty"`
 	Attributes                utils.AttributeMap         `json:"attributes,omitempty"`
 }
@@ -51,6 +59,7 @@ type configData struct {
 	Model                     Model                      `json:"model"`
 	Frame                     *referenceframe.LinkConfig `json:"frame,omitempty"`
 	DependsOn                 []string                   `json:"depends_on,omitempty"`
+	LogConfiguration          *LogConfig                 `json:"log_configuration"`
 	AssociatedResourceConfigs []AssociatedResourceConfig `json:"service_configs,omitempty"`
 	Attributes                utils.AttributeMap         `json:"attributes,omitempty"`
 }
@@ -71,6 +80,7 @@ func (conf *Config) UnmarshalJSON(data []byte) error {
 		conf.Model = confData.Model
 		conf.Frame = confData.Frame
 		conf.DependsOn = confData.DependsOn
+		conf.LogConfiguration = confData.LogConfiguration
 		conf.AssociatedResourceConfigs = confData.AssociatedResourceConfigs
 		conf.Attributes = confData.Attributes
 		return nil
@@ -86,6 +96,7 @@ func (conf *Config) UnmarshalJSON(data []byte) error {
 	conf.Model = typeSpecificConf.Model
 	conf.Frame = typeSpecificConf.Frame
 	conf.DependsOn = typeSpecificConf.DependsOn
+	conf.LogConfiguration = typeSpecificConf.LogConfiguration
 	conf.AssociatedResourceConfigs = typeSpecificConf.AssociatedResourceConfigs
 	conf.Attributes = typeSpecificConf.Attributes
 	return nil
@@ -99,6 +110,7 @@ func (conf Config) MarshalJSON() ([]byte, error) {
 		Model:                     conf.Model,
 		Frame:                     conf.Frame,
 		DependsOn:                 conf.DependsOn,
+		LogConfiguration:          conf.LogConfiguration,
 		AssociatedResourceConfigs: conf.AssociatedResourceConfigs,
 		Attributes:                conf.Attributes,
 	})
@@ -110,7 +122,13 @@ func (conf Config) MarshalJSON() ([]byte, error) {
 // this should be a method on the type and hide away both Attributes and
 // ConvertedAttributes.
 func NativeConfig[T any](conf Config) (T, error) {
-	return utils.AssertType[T](conf.ConvertedAttributes)
+	val, err := utils.AssertType[T](conf.ConvertedAttributes)
+	if err != nil {
+		err = fmt.Errorf(
+			"incorrect config type: NativeConfig %w. Make sure the config type registered to the "+
+				"resource matches the one passed into NativeConfig", err)
+	}
+	return val, err
 }
 
 // NewEmptyConfig returns a new, empty config for the given name and model.
@@ -164,14 +182,34 @@ func (assoc AssociatedResourceConfig) MarshalJSON() ([]byte, error) {
 // Equals checks if the two configs are deeply equal to each other. Validation
 // related fields and implicit dependencies will be ignored.
 func (conf Config) Equals(other Config) bool {
+	if len(conf.AssociatedAttributes) != len(other.AssociatedAttributes) {
+		return false
+	}
+	for association, assocCfg := range conf.AssociatedAttributes {
+		otherAssocCfg, ok := other.AssociatedAttributes[association]
+		if !ok || !assocCfg.Equals(otherAssocCfg) {
+			return false
+		}
+	}
+
+	// These `Config` objects are copies. Changing the members here for equality checking does not
+	// impact the original versions.
 	conf.alreadyValidated = false
 	conf.ImplicitDependsOn = nil
 	conf.cachedImplicitDeps = nil
 	conf.cachedErr = nil
+	conf.ConvertedAttributes = nil
+	conf.AssociatedResourceConfigs = nil
+	conf.AssociatedAttributes = nil
+
 	other.alreadyValidated = false
 	other.ImplicitDependsOn = nil
 	other.cachedImplicitDeps = nil
 	other.cachedErr = nil
+	other.ConvertedAttributes = nil
+	other.AssociatedResourceConfigs = nil
+	other.AssociatedAttributes = nil
+
 	//nolint:govet
 	return reflect.DeepEqual(conf, other)
 }
@@ -256,11 +294,13 @@ func (conf *Config) validate(path, defaultAPIType string) ([]string, error) {
 	conf.AdjustPartialNames(defaultAPIType)
 
 	if conf.Name == "" {
-		return nil, goutils.NewConfigValidationFieldRequiredError(path, "name")
+		return nil, NewConfigValidationFieldRequiredError(path, "name")
 	}
-	if !utils.ValidNameRegex.MatchString(conf.Name) {
-		return nil, utils.ErrInvalidName(conf.Name)
+
+	if err := utils.ValidateResourceName(conf.Name); err != nil {
+		return nil, err
 	}
+
 	if err := ContainsReservedCharacter(conf.Name); err != nil {
 		return nil, err
 	}
@@ -348,4 +388,42 @@ func TransformAttributeMap[T any](attributes utils.AttributeMap) (T, error) {
 		}
 	}
 	return out, nil
+}
+
+// NewConfigValidationError returns a config validation error occurring at a given path.
+func NewConfigValidationError(path string, err error) error {
+	return fmt.Errorf("Error validating. Path: %q Error: %w", path, err)
+}
+
+// FieldRequiredError describes a missing field on a config object.
+type FieldRequiredError struct {
+	Path  string
+	Field string
+}
+
+func (fre FieldRequiredError) Error() string {
+	return fre.String()
+}
+
+func (fre FieldRequiredError) String() string {
+	if fre.Path == "" {
+		return fmt.Sprintf("Error validating, missing required field. Field: %q", fre.Field)
+	}
+	return fmt.Sprintf("Error validating, missing required field. Path: %q Field: %q", fre.Path, fre.Field)
+}
+
+// NewConfigValidationFieldRequiredError returns a config validation error for a field missing at a
+// given path.
+func NewConfigValidationFieldRequiredError(path, field string) error {
+	return FieldRequiredError{path, field}
+}
+
+// GetFieldFromFieldRequiredError returns the `Field` object from a `FieldRequiredError`.
+func GetFieldFromFieldRequiredError(err error) string {
+	var fre FieldRequiredError
+	if ok := errors.As(err, &fre); ok {
+		return fre.Field
+	}
+
+	return ""
 }

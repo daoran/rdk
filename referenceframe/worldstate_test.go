@@ -1,6 +1,7 @@
 package referenceframe
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/jedib0t/go-pretty/v6/table"
@@ -21,7 +22,7 @@ func TestWorldStateConstruction(t *testing.T) {
 	expectedErr := NewDuplicateGeometryNameError(foo.Label()).Error()
 
 	// test that you can add two geometries of different names
-	_, err = NewWorldState([]*GeometriesInFrame{NewGeometriesInFrame("", []spatialmath.Geometry{foo, bar})}, nil)
+	_, err = NewWorldState([]*GeometriesInFrame{NewGeometriesInFrame("world", []spatialmath.Geometry{foo, bar})}, nil)
 	test.That(t, err, test.ShouldBeNil)
 
 	// test that you can't add two "foos" to the same frame
@@ -61,17 +62,17 @@ func TestString(t *testing.T) {
 	testTable.AppendHeader(table.Row{"Name", "Geometry Type", "Parent"})
 	testTable.AppendRow([]interface{}{
 		"foo",
-		foo.String(),
+		foo.(fmt.Stringer).String(),
 		"world",
 	})
 	testTable.AppendRow([]interface{}{
 		"bar",
-		bar.String(),
+		bar.(fmt.Stringer).String(),
 		"world",
 	})
 	testTable.AppendRow([]interface{}{
 		"testgeo",
-		testgeo.String(),
+		testgeo.(fmt.Stringer).String(),
 		"camera",
 	})
 

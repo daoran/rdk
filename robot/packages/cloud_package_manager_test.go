@@ -1,32 +1,44 @@
 package packages
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
+	"strings"
 	"testing"
+	"time"
 
-	"github.com/edaniels/golog"
 	pb "go.viam.com/api/app/packages/v1"
 	"go.viam.com/test"
 	"go.viam.com/utils"
-	"golang.org/x/exp/slices"
 
 	"go.viam.com/rdk/config"
+	"go.viam.com/rdk/logging"
 	putils "go.viam.com/rdk/robot/packages/testutils"
 )
 
 func newPackageManager(t *testing.T,
 	client pb.PackageServiceClient,
-	fakeServer *putils.FakePackagesClientAndGCSServer, logger golog.Logger,
+	fakeServer *putils.FakePackagesClientAndGCSServer, logger logging.Logger, packageDir string,
 ) (string, ManagerSyncer) {
 	fakeServer.Clear()
 
-	packageDir := t.TempDir()
+	if packageDir == "" {
+		packageDir = t.TempDir()
+	}
 	logger.Info(packageDir)
 
-	pm, err := NewCloudManager(client, packageDir, logger)
+	testCloudConfig := &config.Cloud{
+		ID:     "some-id",
+		Secret: "some-secret",
+	}
+
+	pm, err := NewCloudManager(testCloudConfig, client, packageDir, logger)
 	test.That(t, err, test.ShouldBeNil)
 
 	return packageDir, pm
@@ -34,7 +46,7 @@ func newPackageManager(t *testing.T,
 
 func TestCloud(t *testing.T) {
 	ctx := context.Background()
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 
 	fakeServer, err := putils.NewFakePackageServer(ctx, logger)
 	test.That(t, err, test.ShouldBeNil)
@@ -45,11 +57,11 @@ func TestCloud(t *testing.T) {
 	defer utils.UncheckedErrorFunc(conn.Close)
 
 	t.Run("missing package on server", func(t *testing.T) {
-		packageDir, pm := newPackageManager(t, client, fakeServer, logger)
+		packageDir, pm := newPackageManager(t, client, fakeServer, logger, "")
 		defer utils.UncheckedErrorFunc(func() error { return pm.Close(context.Background()) })
 
 		input := []config.PackageConfig{{Name: "some-name", Package: "org1/test-model", Version: "v1", Type: "ml_model"}}
-		err = pm.Sync(ctx, input)
+		err = pm.Sync(ctx, input, []config.Module{})
 		test.That(t, err, test.ShouldNotBeNil)
 		test.That(t, err.Error(), test.ShouldContainSubstring, "failed loading package url")
 
@@ -58,7 +70,7 @@ func TestCloud(t *testing.T) {
 	})
 
 	t.Run("valid packages on server", func(t *testing.T) {
-		packageDir, pm := newPackageManager(t, client, fakeServer, logger)
+		packageDir, pm := newPackageManager(t, client, fakeServer, logger, "")
 		defer utils.UncheckedErrorFunc(func() error { return pm.Close(context.Background()) })
 
 		input := []config.PackageConfig{
@@ -67,7 +79,7 @@ func TestCloud(t *testing.T) {
 		}
 		fakeServer.StorePackage(input...)
 
-		err = pm.Sync(ctx, input)
+		err = pm.Sync(ctx, input, []config.Module{})
 		test.That(t, err, test.ShouldBeNil)
 
 		// validate dir should be empty
@@ -75,7 +87,7 @@ func TestCloud(t *testing.T) {
 	})
 
 	t.Run("sync continues on error", func(t *testing.T) {
-		packageDir, pm := newPackageManager(t, client, fakeServer, logger)
+		packageDir, pm := newPackageManager(t, client, fakeServer, logger, "")
 		defer utils.UncheckedErrorFunc(func() error { return pm.Close(context.Background()) })
 
 		input := []config.PackageConfig{
@@ -84,7 +96,7 @@ func TestCloud(t *testing.T) {
 		}
 		fakeServer.StorePackage(input[1]) // only store second
 
-		err = pm.Sync(ctx, input)
+		err = pm.Sync(ctx, input, []config.Module{})
 		test.That(t, err, test.ShouldNotBeNil)
 		test.That(t, err.Error(), test.ShouldContainSubstring, "failed loading package url for org1/test-model:v1")
 
@@ -92,8 +104,77 @@ func TestCloud(t *testing.T) {
 		validatePackageDir(t, packageDir, []config.PackageConfig{input[1]})
 	})
 
+	t.Run("sync re-downloads on missing status file", func(t *testing.T) {
+		pkg := config.PackageConfig{Name: "some-name", Package: "org1/test-model", Version: "v1", Type: "module"}
+
+		// create a package manager and Sync to download the package
+		_, pm := newPackageManager(t, client, fakeServer, logger, "")
+		defer utils.UncheckedErrorFunc(func() error { return pm.Close(context.Background()) })
+		pkgDir := pkg.LocalDataDirectory(pm.(*cloudManager).packagesDir)
+		module := config.Module{ExePath: pkgDir + "/some-text.txt"}
+		fakeServer.StorePackage(pkg)
+		err = pm.Sync(ctx, []config.PackageConfig{pkg}, []config.Module{module})
+		test.That(t, err, test.ShouldBeNil)
+
+		// grab ExePath ModTime for comparison
+		info, err := os.Stat(module.ExePath)
+		test.That(t, err, test.ShouldBeNil)
+		modTime := info.ModTime()
+
+		// grab sync file ModTime for comparison
+		syncFileName := getSyncFileName(pkg.LocalDataDirectory(pm.(*cloudManager).packagesDir))
+		_, err = os.Stat(syncFileName)
+		test.That(t, err, test.ShouldBeNil)
+		firstStatusFile, err := readStatusFile(pkg, pm.(*cloudManager).packagesDir)
+		test.That(t, err, test.ShouldBeNil)
+
+		// close previous package manager, make sure new PM *doesn't* re-download with intact package sync file
+		pm.Close(ctx)
+		_, pm = newPackageManager(t, client, fakeServer, logger, pm.(*cloudManager).packagesDir)
+		defer utils.UncheckedErrorFunc(func() error { return pm.Close(context.Background()) })
+		fakeServer.StorePackage(pkg)
+		// sleep to make super sure modification time increments
+		time.Sleep(10 * time.Millisecond)
+		err = pm.Sync(ctx, []config.PackageConfig{pkg}, []config.Module{module})
+		test.That(t, err, test.ShouldBeNil)
+
+		// Ensure that files have not changed on 2nd sync
+		info, err = os.Stat(module.ExePath)
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, info.ModTime(), test.ShouldEqual, modTime)
+		secondStatusFile, err := readStatusFile(pkg, pm.(*cloudManager).packagesDir)
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, secondStatusFile.ModifiedTime, test.ShouldEqual, firstStatusFile.ModifiedTime)
+
+		// close previous package manager, then corrupt the package sync file
+		pm.Close(ctx)
+		info, err = os.Stat(syncFileName)
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, info.Size(), test.ShouldNotBeZeroValue)
+		err = os.Remove(syncFileName)
+		test.That(t, err, test.ShouldBeNil)
+
+		// create fresh packageManager to simulate a reboot, i.e. so the system doesn't think the module is already managed.
+		_, pm = newPackageManager(t, client, fakeServer, logger, pm.(*cloudManager).packagesDir)
+		defer utils.UncheckedErrorFunc(func() error { return pm.Close(context.Background()) })
+		fakeServer.StorePackage(pkg)
+		err = pm.Sync(ctx, []config.PackageConfig{pkg}, []config.Module{module})
+		test.That(t, err, test.ShouldBeNil)
+
+		// test that Exe file exists, is non-empty, and modTime is different
+		info, err = os.Stat(syncFileName)
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, info.Size(), test.ShouldNotBeZeroValue)
+		test.That(t, info.ModTime(), test.ShouldNotEqual, modTime)
+
+		// test that Exe file exists, is non-empty, and modTime is different
+		thirdStatusFile, err := readStatusFile(pkg, pm.(*cloudManager).packagesDir)
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, thirdStatusFile.ModifiedTime, test.ShouldNotEqual, firstStatusFile.ModifiedTime)
+	})
+
 	t.Run("sync and clean should remove file", func(t *testing.T) {
-		packageDir, pm := newPackageManager(t, client, fakeServer, logger)
+		packageDir, pm := newPackageManager(t, client, fakeServer, logger, "")
 		defer utils.UncheckedErrorFunc(func() error { return pm.Close(context.Background()) })
 
 		input := []config.PackageConfig{
@@ -103,14 +184,14 @@ func TestCloud(t *testing.T) {
 		fakeServer.StorePackage(input...)
 
 		// first sync
-		err = pm.Sync(ctx, input)
+		err = pm.Sync(ctx, input, []config.Module{})
 		test.That(t, err, test.ShouldBeNil)
 
 		// validate dir should be empty
 		validatePackageDir(t, packageDir, input)
 
 		// second sync
-		err = pm.Sync(ctx, []config.PackageConfig{input[1]})
+		err = pm.Sync(ctx, []config.PackageConfig{input[1]}, []config.Module{})
 		test.That(t, err, test.ShouldBeNil)
 
 		validatePackageDir(t, packageDir, input)
@@ -124,7 +205,7 @@ func TestCloud(t *testing.T) {
 	})
 
 	t.Run("second sync should not call http server", func(t *testing.T) {
-		packageDir, pm := newPackageManager(t, client, fakeServer, logger)
+		packageDir, pm := newPackageManager(t, client, fakeServer, logger, "")
 		defer utils.UncheckedErrorFunc(func() error { return pm.Close(context.Background()) })
 
 		input := []config.PackageConfig{
@@ -133,7 +214,7 @@ func TestCloud(t *testing.T) {
 		}
 		fakeServer.StorePackage(input...)
 
-		err = pm.Sync(ctx, input)
+		err = pm.Sync(ctx, input, []config.Module{})
 		test.That(t, err, test.ShouldBeNil)
 
 		getCount, downloadCount := fakeServer.RequestCounts()
@@ -143,7 +224,7 @@ func TestCloud(t *testing.T) {
 		// validate dir should be empty
 		validatePackageDir(t, packageDir, input)
 
-		err = pm.Sync(ctx, input)
+		err = pm.Sync(ctx, input, []config.Module{})
 		test.That(t, err, test.ShouldBeNil)
 
 		// validate dir should be empty
@@ -155,7 +236,7 @@ func TestCloud(t *testing.T) {
 	})
 
 	t.Run("upgrade version", func(t *testing.T) {
-		packageDir, pm := newPackageManager(t, client, fakeServer, logger)
+		packageDir, pm := newPackageManager(t, client, fakeServer, logger, "")
 		defer utils.UncheckedErrorFunc(func() error { return pm.Close(context.Background()) })
 
 		input := []config.PackageConfig{
@@ -163,7 +244,7 @@ func TestCloud(t *testing.T) {
 		}
 		fakeServer.StorePackage(input...)
 
-		err = pm.Sync(ctx, input)
+		err = pm.Sync(ctx, input, []config.Module{})
 		test.That(t, err, test.ShouldBeNil)
 
 		validatePackageDir(t, packageDir, input)
@@ -171,7 +252,7 @@ func TestCloud(t *testing.T) {
 		input[0].Version = "v2"
 		fakeServer.StorePackage(input...)
 
-		err = pm.Sync(ctx, input)
+		err = pm.Sync(ctx, input, []config.Module{})
 		test.That(t, err, test.ShouldBeNil)
 
 		err = pm.Cleanup(ctx)
@@ -181,7 +262,7 @@ func TestCloud(t *testing.T) {
 	})
 
 	t.Run("invalid checksum", func(t *testing.T) {
-		packageDir, pm := newPackageManager(t, client, fakeServer, logger)
+		packageDir, pm := newPackageManager(t, client, fakeServer, logger, "")
 		defer utils.UncheckedErrorFunc(func() error { return pm.Close(context.Background()) })
 
 		fakeServer.SetInvalidChecksum(true)
@@ -191,9 +272,9 @@ func TestCloud(t *testing.T) {
 		}
 		fakeServer.StorePackage(input...)
 
-		err = pm.Sync(ctx, input)
+		err = pm.Sync(ctx, input, []config.Module{})
 		test.That(t, err, test.ShouldNotBeNil)
-		test.That(t, err.Error(), test.ShouldContainSubstring, "download did not match expected hash")
+		test.That(t, err.Error(), test.ShouldContainSubstring, "failed to decode")
 
 		err = pm.Cleanup(ctx)
 		test.That(t, err, test.ShouldBeNil)
@@ -201,8 +282,27 @@ func TestCloud(t *testing.T) {
 		validatePackageDir(t, packageDir, []config.PackageConfig{})
 	})
 
+	t.Run("leading zeroes checksum", func(t *testing.T) {
+		packageDir, pm := newPackageManager(t, client, fakeServer, logger, "")
+		defer utils.UncheckedErrorFunc(func() error { return pm.Close(context.Background()) })
+
+		fakeServer.SetChecksumWithLeadingZeroes(true)
+
+		input := []config.PackageConfig{
+			{Name: "some-name", Package: "org1/test-model", Version: "v1", Type: "ml_model"},
+			{Name: "some-name-2", Package: "org1/test-model", Version: "v2", Type: "ml_model"},
+		}
+		fakeServer.StorePackage(input...)
+
+		err = pm.Sync(ctx, input, []config.Module{})
+		test.That(t, err, test.ShouldBeNil)
+
+		// validate dir should be empty
+		validatePackageDir(t, packageDir, input)
+	})
+
 	t.Run("invalid gcs download", func(t *testing.T) {
-		packageDir, pm := newPackageManager(t, client, fakeServer, logger)
+		packageDir, pm := newPackageManager(t, client, fakeServer, logger, "")
 		defer utils.UncheckedErrorFunc(func() error { return pm.Close(context.Background()) })
 
 		fakeServer.SetInvalidHTTPRes(true)
@@ -212,7 +312,7 @@ func TestCloud(t *testing.T) {
 		}
 		fakeServer.StorePackage(input...)
 
-		err = pm.Sync(ctx, input)
+		err = pm.Sync(ctx, input, []config.Module{})
 		test.That(t, err, test.ShouldNotBeNil)
 		test.That(t, err.Error(), test.ShouldContainSubstring, "invalid status code 500")
 
@@ -223,7 +323,7 @@ func TestCloud(t *testing.T) {
 	})
 
 	t.Run("invalid tar", func(t *testing.T) {
-		packageDir, pm := newPackageManager(t, client, fakeServer, logger)
+		packageDir, pm := newPackageManager(t, client, fakeServer, logger, "")
 		defer utils.UncheckedErrorFunc(func() error { return pm.Close(context.Background()) })
 
 		fakeServer.SetInvalidTar(true)
@@ -233,7 +333,7 @@ func TestCloud(t *testing.T) {
 		}
 		fakeServer.StorePackage(input...)
 
-		err = pm.Sync(ctx, input)
+		err = pm.Sync(ctx, input, []config.Module{})
 		test.That(t, err, test.ShouldNotBeNil)
 		test.That(t, err.Error(), test.ShouldContainSubstring, "unexpected EOF")
 
@@ -262,7 +362,7 @@ func validatePackageDir(t *testing.T, dir string, input []config.PackageConfig) 
 	// check all known packages exist and are linked to the correct package dir.
 	for _, p := range input {
 		logicalPath := filepath.Join(dir, p.Name)
-		dataPath := filepath.Join(dir, ".data", string(p.Type), p.SanitizedName())
+		dataPath := filepath.Join(dir, "data", string(p.Type), p.SanitizedName())
 
 		info, err := os.Stat(logicalPath)
 		test.That(t, err, test.ShouldBeNil)
@@ -276,13 +376,16 @@ func validatePackageDir(t *testing.T, dir string, input []config.PackageConfig) 
 
 		test.That(t, linkTarget, test.ShouldEqual, dataPath)
 
+		_, err = os.Stat(dataPath + statusFileExt)
+		test.That(t, err, test.ShouldBeNil)
+
 		info, err = os.Stat(dataPath)
 		test.That(t, err, test.ShouldBeNil)
 		test.That(t, info.IsDir(), test.ShouldBeTrue)
 	}
 
-	// find any dangling files in the package dir or .data sub dir
-	// packageDir will contain either symlinks to the packages or the .data directory.
+	// find any dangling files in the package dir or data sub dir
+	// packageDir will contain either symlinks to the packages or the data directory.
 	files, err := os.ReadDir(dir)
 	test.That(t, err, test.ShouldBeNil)
 
@@ -294,15 +397,15 @@ func validatePackageDir(t *testing.T, dir string, input []config.PackageConfig) 
 			continue
 		}
 
-		// skip over any directories including the .data
-		if f.IsDir() && f.Name() == ".data" {
+		// skip over any directories including the data
+		if f.IsDir() && f.Name() == "data" {
 			continue
 		}
 
 		t.Fatalf("found unknown file in package dir %s", f.Name())
 	}
 
-	typeFolders, err := os.ReadDir(filepath.Join(dir, ".data"))
+	typeFolders, err := os.ReadDir(filepath.Join(dir, "data"))
 	test.That(t, err, test.ShouldBeNil)
 
 	for _, typeFile := range typeFolders {
@@ -310,10 +413,11 @@ func validatePackageDir(t *testing.T, dir string, input []config.PackageConfig) 
 		if !ok {
 			t.Errorf("found unknown file in package data dir %s", typeFile.Name())
 		}
-		foundFiles, err := os.ReadDir(filepath.Join(dir, ".data", typeFile.Name()))
+		foundFiles, err := os.ReadDir(filepath.Join(dir, "data", typeFile.Name()))
 		test.That(t, err, test.ShouldBeNil)
 		for _, packageFile := range foundFiles {
-			if !slices.Contains(expectedPackages, packageFile.Name()) {
+			// skip over status files
+			if !slices.Contains(expectedPackages, packageFile.Name()) && !strings.HasSuffix(packageFile.Name(), ".status.json") {
 				t.Errorf("found unknown file in package %s dir %s", typeFile.Name(), packageFile.Name())
 			}
 		}
@@ -322,7 +426,7 @@ func validatePackageDir(t *testing.T, dir string, input []config.PackageConfig) 
 
 func TestPackageRefs(t *testing.T) {
 	ctx := context.Background()
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 
 	fakeServer, err := putils.NewFakePackageServer(ctx, logger)
 	test.That(t, err, test.ShouldBeNil)
@@ -332,17 +436,21 @@ func TestPackageRefs(t *testing.T) {
 	test.That(t, err, test.ShouldBeNil)
 	defer utils.UncheckedErrorFunc(conn.Close)
 
-	packageDir, pm := newPackageManager(t, client, fakeServer, logger)
+	packageDir, pm := newPackageManager(t, client, fakeServer, logger, "")
 	defer utils.UncheckedErrorFunc(func() error { return pm.Close(context.Background()) })
 
 	input := []config.PackageConfig{{Name: "some-name", Package: "org1/test-model", Version: "v1", Type: "ml_model"}}
 	fakeServer.StorePackage(input...)
 
-	err = pm.Sync(ctx, input)
+	err = pm.Sync(ctx, input, []config.Module{})
 	test.That(t, err, test.ShouldBeNil)
 
 	t.Run("PackagePath", func(t *testing.T) {
+		// FYI: This test passes in CI but fails when ran on MacOS
 		t.Run("valid package", func(t *testing.T) {
+			if runtime.GOOS == "darwin" {
+				t.Skip("skip on macos because file permissions are 755 instead of 777")
+			}
 			pPath, err := pm.PackagePath("some-name")
 			test.That(t, err, test.ShouldBeNil)
 			test.That(t, pPath, test.ShouldEqual, input[0].LocalDataDirectory(packageDir))
@@ -368,27 +476,6 @@ func isSymLink(t *testing.T, file string) bool {
 	return fileInfo.Mode()&os.ModeSymlink != 0
 }
 
-func TestSafeJoin(t *testing.T) {
-	parentDir := "/some/parent"
-
-	validate := func(in, expectedOut string, expectedErr error) {
-		t.Helper()
-
-		out, err := safeJoin(parentDir, in)
-		if expectedErr == nil {
-			test.That(t, err, test.ShouldBeNil)
-			test.That(t, out, test.ShouldEqual, expectedOut)
-		} else {
-			test.That(t, err, test.ShouldNotBeNil)
-			test.That(t, err.Error(), test.ShouldContainSubstring, expectedErr.Error())
-		}
-	}
-
-	validate("sub/dir", "/some/parent/sub/dir", nil)
-	validate("/other/parent", "/some/parent/other/parent", nil)
-	validate("../../../root", "", errors.New("unsafe path join"))
-}
-
 func TestSafeLink(t *testing.T) {
 	parentDir := "/some/parent"
 
@@ -408,4 +495,66 @@ func TestSafeLink(t *testing.T) {
 	validate("sub/../dir", "sub/../dir", nil)
 	validate("sub/../../dir", "", errors.New("unsafe path join"))
 	validate("/root", "", errors.New("unsafe path link"))
+}
+
+func TestMissingDirEntry(t *testing.T) {
+	file, err := os.CreateTemp("", "missing-dir-entry")
+	test.That(t, err, test.ShouldBeNil)
+	head := tar.Header{
+		Name: "subdir/file.md",
+		Size: 1,
+		Mode: 0o600,
+		Uid:  1000,
+		Gid:  1000,
+	}
+	gzipWriter := gzip.NewWriter(file)
+	writer := tar.NewWriter(gzipWriter)
+	writer.WriteHeader(&head)
+	writer.Write([]byte("x"))
+	writer.Close()
+	gzipWriter.Close()
+	file.Close()
+	defer os.Remove(file.Name())
+	dest, err := os.MkdirTemp("", "missing-dir-entry")
+	defer os.RemoveAll(dest)
+	test.That(t, err, test.ShouldBeNil)
+	// The inner MkdirAll in unpackFile will fail with 'permission denied' if we
+	// create the subdirectory with the wrong permissions.
+	err = unpackFile(context.Background(), file.Name(), dest)
+	test.That(t, err, test.ShouldBeNil)
+}
+
+func TestTrimLeadingZeroes(t *testing.T) {
+	testCases := []struct {
+		name     string
+		input    []byte
+		expected []byte
+	}{
+		{
+			name:     "Empty slice",
+			input:    []byte{},
+			expected: []byte{},
+		},
+		{
+			name:     "Single zero byte",
+			input:    []byte{0x00},
+			expected: []byte{0x00},
+		},
+		{
+			name:     "Leading zeroes trimmed",
+			input:    []byte{0x00, 0x00, 0x03, 0x04, 0x05},
+			expected: []byte{0x03, 0x04, 0x05},
+		},
+		{
+			name:     "All zero bytes",
+			input:    []byte{0x00, 0x00, 0x00},
+			expected: []byte{0x00},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			test.That(t, trimLeadingZeroes(tc.input), test.ShouldResemble, tc.expected)
+		})
+	}
 }

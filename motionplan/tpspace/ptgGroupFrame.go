@@ -1,13 +1,18 @@
+//go:build !no_cgo
+
 package tpspace
 
 import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 
-	"github.com/edaniels/golog"
+	"go.uber.org/multierr"
 	pb "go.viam.com/api/component/arm/v1"
+	"go.viam.com/utils"
 
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/spatialmath"
 )
@@ -15,113 +20,125 @@ import (
 const (
 	ptgIndex int = iota
 	trajectoryAlphaWithinPTG
-	distanceAlongTrajectoryIndex
+	startDistanceAlongTrajectoryIndex
+	endDistanceAlongTrajectoryIndex
 )
 
 // If refDist is not explicitly set, default to pi radians times this adjustment value.
-const refDistHalfCircles = 0.9
+const (
+	defaultRefDistLong        = 100000. // 100 meters
+	defaultRefDistShortMin    = 500.    // 500 mm
+	defaultRefDistHalfCircles = 0.9
+	defaultTrajCount          = 2
+)
 
-type ptgFactory func(float64, float64) PrecomputePTG
+type ptgFactory func(float64) PTG
 
-var defaultPTGs = []ptgFactory{
-	NewCirclePTG,
+// These PTGs do not end in a straight line, and thus are restricted to a shorter maximum length.
+var defaultShortPtgs = []ptgFactory{
 	NewCCPTG,
 	NewCCSPTG,
+}
+
+var defaultCorrectionPtg = NewCirclePTG
+
+// These PTGs curve at the beginning and then have a straight line of arbitrary length, which is allowed to extend to defaultRefDistLong.
+var defaultPTGs = []ptgFactory{
 	NewCSPTG,
-	NewSideSPTG,
 	NewSideSOverturnPTG,
 }
+
+var defaultDiffPTG ptgFactory = NewDiffDrivePTG
 
 type ptgGroupFrame struct {
 	name               string
 	limits             []referenceframe.Limit
 	geometries         []spatialmath.Geometry
-	ptgs               []PTG
-	velocityMMps       float64
+	solvers            []PTGSolver
 	turnRadMillimeters float64
-	logger             golog.Logger
+	trajCount          int
+	correctionIdx      int
+	logger             logging.Logger
 }
 
-// NewPTGFrameFromTurningRadius will create a new Frame which is also a PTGProvider. It will precompute the default set of
+// NewPTGFrameFromKinematicOptions will create a new Frame which is also a PTGProvider. It will precompute the default set of
 // trajectories out to a given distance, or a default distance if the given distance is <= 0.
-func NewPTGFrameFromTurningRadius(
+func NewPTGFrameFromKinematicOptions(
 	name string,
-	logger golog.Logger,
-	velocityMMps, turnRadMeters, refDist float64,
+	logger logging.Logger,
+	turnRadMeters float64,
+	trajCount int,
 	geoms []spatialmath.Geometry,
+	diffDriveOnly bool,
+	canRotateInPlace bool,
 ) (referenceframe.Frame, error) {
-	if velocityMMps <= 0 {
-		return nil, fmt.Errorf("cannot create ptg frame, movement velocity %f must be >0", velocityMMps)
-	}
 	if turnRadMeters <= 0 {
 		return nil, fmt.Errorf("cannot create ptg frame, turning radius %f must be >0", turnRadMeters)
 	}
-	if refDist < 0 {
-		return nil, fmt.Errorf("cannot create ptg frame, refDist %f must be >=0", refDist)
+	if diffDriveOnly && !canRotateInPlace {
+		return nil, errors.New("if diffDriveOnly is used, canRotateInPlace must be true")
+	}
+
+	if trajCount <= 0 {
+		trajCount = defaultTrajCount
 	}
 
 	turnRadMillimeters := turnRadMeters * 1000
 
-	if refDist == 0 {
-		// Default to a distance of just over one half of a circle turning at max radius
-		refDist = turnRadMillimeters * math.Pi * refDistHalfCircles
-		logger.Debugf("refDist was zero, calculating default %f", refDist)
+	refDistLong := defaultRefDistLong
+	refDistShort := math.Max(
+		math.Min(turnRadMillimeters*math.Pi*defaultRefDistHalfCircles, refDistLong*0.1),
+		defaultRefDistShortMin,
+	)
+
+	pf := &ptgGroupFrame{name: name}
+
+	longPtgsToUse := []ptgFactory{}
+	shortPtgsToUse := []ptgFactory{}
+	if canRotateInPlace {
+		longPtgsToUse = append(longPtgsToUse, defaultDiffPTG)
+	}
+	if !diffDriveOnly {
+		longPtgsToUse = append(longPtgsToUse, defaultPTGs...)
+		shortPtgsToUse = append(shortPtgsToUse, defaultShortPtgs...)
+		// Use Circle PTG for course correction. Ensure it is last.
+		shortPtgsToUse = append(shortPtgsToUse, defaultCorrectionPtg)
+		pf.correctionIdx = len(longPtgsToUse) + (len(shortPtgsToUse) - 1)
+	} else {
+		// Use diff drive PTG for course correction
+		pf.correctionIdx = 0
 	}
 
-	// Get max angular velocity in radians per second
-	maxRPS := velocityMMps / turnRadMillimeters
-	pf := &ptgGroupFrame{name: name}
-	err := pf.initPTGs(logger, velocityMMps, maxRPS, refDist)
+	longPtgs := initializePTGs(turnRadMillimeters, longPtgsToUse)
+	allSolvers, err := initializeSolvers(logger, refDistLong, refDistShort, trajCount, longPtgs)
 	if err != nil {
 		return nil, err
 	}
+	shortPtgs := initializePTGs(turnRadMillimeters, shortPtgsToUse)
+	shortSolvers, err := initializeSolvers(logger, refDistShort, refDistShort, trajCount, shortPtgs)
+	if err != nil {
+		return nil, err
+	}
+	allSolvers = append(allSolvers, shortSolvers...)
 
+	pf.solvers = allSolvers
 	pf.geometries = geoms
-	pf.velocityMMps = velocityMMps
 	pf.turnRadMillimeters = turnRadMillimeters
+	pf.trajCount = trajCount
+	pf.logger = logger
 
 	pf.limits = []referenceframe.Limit{
-		{Min: 0, Max: float64(len(pf.ptgs) - 1)},
+		{Min: 0, Max: float64(len(pf.solvers) - 1)},
 		{Min: -math.Pi, Max: math.Pi},
-		{Min: 0, Max: refDist},
+		{Min: 0, Max: refDistLong},
+		{Min: 0, Max: refDistLong},
 	}
 
 	return pf, nil
 }
 
-// NewPTGFrameFromPTGFrame will create a new Frame from a preexisting ptgGroupFrame, allowing the adjustment of `refDist` while keeping
-// other params the same. This may be expanded to allow altering turning radius, geometries, etc.
-func NewPTGFrameFromPTGFrame(frame referenceframe.Frame, refDist float64) (referenceframe.Frame, error) {
-	ptgFrame, ok := frame.(*ptgGroupFrame)
-	if !ok {
-		return nil, errors.New("cannot create ptg framem given frame is not a ptgGroupFrame")
-	}
-	if refDist < 0 {
-		return nil, fmt.Errorf("cannot create ptg frame, refDist %f must be >=0", refDist)
-	}
-
-	if refDist <= 0 {
-		refDist = ptgFrame.turnRadMillimeters * math.Pi * refDistHalfCircles
-		ptgFrame.logger.Debugf("refDist was zero, calculating default %f", refDist)
-	}
-
-	// Get max angular velocity in radians per second
-	maxRPS := ptgFrame.velocityMMps / ptgFrame.turnRadMillimeters
-	pf := &ptgGroupFrame{name: ptgFrame.name}
-	err := pf.initPTGs(ptgFrame.logger, ptgFrame.velocityMMps, maxRPS, refDist)
-	if err != nil {
-		return nil, err
-	}
-
-	pf.geometries = ptgFrame.geometries
-
-	pf.limits = []referenceframe.Limit{
-		{Min: 0, Max: float64(len(pf.ptgs) - 1)},
-		{Min: -math.Pi, Max: math.Pi},
-		{Min: 0, Max: refDist},
-	}
-
-	return pf, nil
+func (pf *ptgGroupFrame) CorrectionSolverIdx() int {
+	return pf.correctionIdx
 }
 
 func (pf *ptgGroupFrame) DoF() []referenceframe.Limit {
@@ -137,22 +154,93 @@ func (pf *ptgGroupFrame) MarshalJSON() ([]byte, error) {
 	return nil, nil
 }
 
-// Inputs are: [0] index of PTG to use, [1] index of the trajectory within that PTG, and [2] distance to travel along that trajectory.
+// Inputs are: [0] index of PTG to use, [1] index of the trajectory within that PTG, [2] starting point on the trajectory, and [3] distance
+// to travel along that trajectory.
 func (pf *ptgGroupFrame) Transform(inputs []referenceframe.Input) (spatialmath.Pose, error) {
-	if len(inputs) != len(pf.DoF()) {
-		return nil, referenceframe.NewIncorrectInputLengthError(len(inputs), len(pf.DoF()))
-	}
-	alpha := inputs[trajectoryAlphaWithinPTG].Value
-	dist := inputs[distanceAlongTrajectoryIndex].Value
-
-	ptgIdx := int(math.Round(inputs[ptgIndex].Value))
-
-	traj, err := pf.ptgs[ptgIdx].Trajectory(alpha, dist)
-	if err != nil {
+	if err := pf.validInputs(inputs); err != nil {
 		return nil, err
 	}
 
-	return traj[len(traj)-1].Pose, nil
+	ptgIdx := int(math.Round(inputs[ptgIndex].Value))
+
+	endPose, err := pf.solvers[ptgIdx].Transform([]referenceframe.Input{
+		inputs[trajectoryAlphaWithinPTG],
+		inputs[endDistanceAlongTrajectoryIndex],
+	})
+	if err != nil {
+		return nil, err
+	}
+	if inputs[startDistanceAlongTrajectoryIndex].Value != 0 {
+		startPose, err := pf.solvers[ptgIdx].Transform([]referenceframe.Input{
+			inputs[trajectoryAlphaWithinPTG],
+			inputs[startDistanceAlongTrajectoryIndex],
+		})
+		if err != nil {
+			return nil, err
+		}
+		if inputs[endDistanceAlongTrajectoryIndex].Value < inputs[startDistanceAlongTrajectoryIndex].Value {
+			endPose = spatialmath.PoseBetween(spatialmath.Compose(endPose, flipPose), flipPose)
+			startPose = spatialmath.PoseBetween(spatialmath.Compose(startPose, flipPose), flipPose)
+			endPose = spatialmath.PoseBetweenInverse(endPose, startPose)
+		} else {
+			endPose = spatialmath.PoseBetween(startPose, endPose)
+		}
+	}
+
+	return endPose, nil
+}
+
+// Interpolate on a PTG group frame follows the following framework:
+// Let us say we are executing a set on inputs, for example [1, pi/2, 20, 2000].
+// The starting configuration would be [1, pi/2, 20, 20], and Transform() would yield a zero pose. Interpolating from this to the final set
+// of inputs above would yield things like [1, pi/2, 20, 50] and so on, the Transform() of each giving the amount moved from the start.
+// Some current intermediate input may be [1, pi/2, 20, 150]. If we were to try to interpolate the remainder of the arc, then that would be
+// the `from`, while the `to` remains the same. Thus a point along the interpolated path might be [1, pi/2, 150, 170], which would yield
+// the Transform from the current position that would be expected during the next 20 distance to be executed.
+// If we are interpolating against a hypothetical arc, there is no true "from", so `nil` should be passed instead if coming from somewhere
+// which does not have knowledge of specific inputs.
+// The above is inverted with negative distances, requiring some complicated logic which should be radically simplified by RSDK-7515.
+func (pf *ptgGroupFrame) Interpolate(from, to []referenceframe.Input, by float64) ([]referenceframe.Input, error) {
+	if err := pf.validInputs(from); err != nil {
+		return nil, err
+	}
+	if err := pf.validInputs(to); err != nil {
+		return nil, err
+	}
+
+	// There are two different valid interpretations of `from`. Either it can be an all-zero input, in which case we interpolate across `to`
+	// or it can match `to` in every value except the end distance index, as described above.
+	zeroInputFrom := true
+
+	nonMatchIndex := endDistanceAlongTrajectoryIndex
+	for i, input := range from {
+		if input.Value != 0 {
+			zeroInputFrom = false
+		}
+
+		if !zeroInputFrom {
+			if i == nonMatchIndex {
+				continue
+			}
+			if input.Value != to[i].Value {
+				return nil, NewNonMatchingInputError(from[i].Value, to[i].Value)
+			}
+		}
+	}
+
+	startVal := from[endDistanceAlongTrajectoryIndex].Value
+	if zeroInputFrom {
+		startVal = to[startDistanceAlongTrajectoryIndex].Value
+	}
+	endVal := to[endDistanceAlongTrajectoryIndex].Value
+
+	changeVal := (endVal - startVal) * by
+	return []referenceframe.Input{
+		to[ptgIndex],
+		to[trajectoryAlphaWithinPTG],
+		{startVal},
+		{startVal + changeVal},
+	}, nil
 }
 
 func (pf *ptgGroupFrame) InputFromProtobuf(jp *pb.JointPositions) []referenceframe.Input {
@@ -181,28 +269,71 @@ func (pf *ptgGroupFrame) Geometries(inputs []referenceframe.Input) (*referencefr
 		return nil, err
 	}
 	geoms := make([]spatialmath.Geometry, 0, len(pf.geometries))
-	for _, geom := range pf.geometries {
-		geoms = append(geoms, geom.Transform(transformedPose))
+	for i, geom := range pf.geometries {
+		tfGeom := geom.Transform(transformedPose)
+		if tfGeom.Label() == "" {
+			tfGeom.SetLabel(pf.name + "_geometry_" + strconv.Itoa(i))
+		}
+		geoms = append(geoms, tfGeom)
 	}
 	return referenceframe.NewGeometriesInFrame(pf.name, geoms), nil
 }
 
-func (pf *ptgGroupFrame) PTGs() []PTG {
-	return pf.ptgs
+func (pf *ptgGroupFrame) PTGSolvers() []PTGSolver {
+	return pf.solvers
 }
 
-func (pf *ptgGroupFrame) initPTGs(logger golog.Logger, maxMps, maxRPS, simDist float64) error {
-	ptgs := []PTG{}
-	for _, ptg := range defaultPTGs {
-		ptgGen := ptg(maxMps, maxRPS)
-		if ptgGen != nil {
-			newptg, err := NewPTGIK(ptgGen, logger, simDist, 2)
-			if err != nil {
-				return err
-			}
-			ptgs = append(ptgs, newptg)
+// validInputs checks whether the given array of inputs violates any limits.
+func (pf *ptgGroupFrame) validInputs(inputs []referenceframe.Input) error {
+	var errAll error
+	if len(inputs) != len(pf.limits) {
+		return referenceframe.NewIncorrectDoFError(len(inputs), len(pf.limits))
+	}
+	for i := 0; i < len(pf.limits); i++ {
+		if inputs[i].Value < pf.limits[i].Min || inputs[i].Value > pf.limits[i].Max {
+			lim := []float64{pf.limits[i].Min, pf.limits[i].Max}
+			multierr.AppendInto(&errAll, fmt.Errorf("%s %s %s, %s %.5f %s %.5f", "input", fmt.Sprint(i),
+				referenceframe.OOBErrString, "input", inputs[i].Value, "needs to be within range", lim))
 		}
 	}
-	pf.ptgs = ptgs
-	return nil
+	return errAll
+}
+
+func initializePTGs(turnRadius float64, constructors []ptgFactory) []PTG {
+	ptgs := []PTG{}
+	for _, ptg := range constructors {
+		ptgs = append(ptgs, ptg(turnRadius))
+	}
+	return ptgs
+}
+
+type solverAndError struct {
+	idx    int
+	solver PTGSolver
+	err    error
+}
+
+func initializeSolvers(logger logging.Logger, simDistFar, simDistRestricted float64, trajCount int, ptgs []PTG) ([]PTGSolver, error) {
+	solvers := make([]PTGSolver, len(ptgs))
+	solverChan := make(chan *solverAndError, len(ptgs))
+	for i := range ptgs {
+		j := i
+		utils.PanicCapturingGo(func() {
+			solver, err := NewPTGIK(ptgs[j], logger, simDistFar, simDistRestricted, j, trajCount)
+			solverChan <- &solverAndError{j, solver, err}
+		})
+	}
+	var allErr error
+	for range ptgs {
+		solverReturn := <-solverChan
+		if solverReturn.solver != nil {
+			// Consistent ordering, so that if we create a child frame with NewPTGFrameFromPTGFrame, then the same inputs still work
+			solvers[solverReturn.idx] = solverReturn.solver
+		}
+		allErr = multierr.Combine(allErr, solverReturn.err)
+	}
+	if allErr != nil {
+		return nil, allErr
+	}
+	return solvers, nil
 }

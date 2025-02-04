@@ -3,8 +3,8 @@ package segmentation
 import (
 	"context"
 
+	"github.com/go-viper/mapstructure/v2"
 	"github.com/golang/geo/r3"
-	"github.com/mitchellh/mapstructure"
 	"github.com/pkg/errors"
 
 	"go.viam.com/rdk/components/camera"
@@ -87,7 +87,7 @@ func NewRadiusClustering(params utils.AttributeMap) (Segmenter, error) {
 }
 
 // RadiusClustering applies the radius clustering algorithm directly on a given point cloud.
-func (rcc *RadiusClusteringConfig) RadiusClustering(ctx context.Context, src camera.VideoSource) ([]*vision.Object, error) {
+func (rcc *RadiusClusteringConfig) RadiusClustering(ctx context.Context, src camera.Camera) ([]*vision.Object, error) {
 	// get next point cloud
 	cloud, err := src.NextPointCloud(ctx)
 	if err != nil {

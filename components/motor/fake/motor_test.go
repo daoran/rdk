@@ -4,19 +4,20 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
-	"github.com/edaniels/golog"
 	"go.viam.com/test"
 	"go.viam.com/utils/testutils"
 
 	"go.viam.com/rdk/components/encoder/fake"
 	"go.viam.com/rdk/components/motor"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/operation"
 	"go.viam.com/rdk/resource"
 )
 
 func TestMotorInit(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	ctx := context.Background()
 
 	enc, err := fake.NewEncoder(context.Background(), resource.Config{
@@ -42,7 +43,7 @@ func TestMotorInit(t *testing.T) {
 }
 
 func TestGoFor(t *testing.T) {
-	logger, obs := golog.NewObservedTestLogger(t)
+	logger, obs := logging.NewObservedTestLogger(t)
 	ctx := context.Background()
 
 	enc, err := fake.NewEncoder(context.Background(), resource.Config{
@@ -61,7 +62,7 @@ func TestGoFor(t *testing.T) {
 	err = m.GoFor(ctx, 0, 1, nil)
 	allObs := obs.All()
 	latestLoggedEntry := allObs[len(allObs)-1]
-	test.That(t, fmt.Sprint(latestLoggedEntry), test.ShouldContainSubstring, "nearly 0")
+	test.That(t, fmt.Sprint(latestLoggedEntry), test.ShouldContainSubstring, "is 0 rev_per_min")
 	test.That(t, err, test.ShouldBeError, motor.NewZeroRPMError())
 
 	err = m.GoFor(ctx, 60, 1, nil)
@@ -69,6 +70,9 @@ func TestGoFor(t *testing.T) {
 	allObs = obs.All()
 	latestLoggedEntry = allObs[1]
 	test.That(t, fmt.Sprint(latestLoggedEntry), test.ShouldContainSubstring, "nearly the max")
+
+	// zero revs error
+	test.That(t, m.GoFor(ctx, 10, 0, nil), test.ShouldBeError, motor.NewZeroRevsError())
 
 	testutils.WaitForAssertion(t, func(tb testing.TB) {
 		tb.Helper()
@@ -79,7 +83,7 @@ func TestGoFor(t *testing.T) {
 }
 
 func TestGoTo(t *testing.T) {
-	logger, obs := golog.NewObservedTestLogger(t)
+	logger, obs := logging.NewObservedTestLogger(t)
 	ctx := context.Background()
 
 	enc, err := fake.NewEncoder(context.Background(), resource.Config{
@@ -102,10 +106,10 @@ func TestGoTo(t *testing.T) {
 	test.That(t, fmt.Sprint(latestLoggedEntry), test.ShouldContainSubstring, "nearly the max")
 
 	err = m.GoTo(ctx, 0, 1, nil)
-	test.That(t, err, test.ShouldBeNil)
+	test.That(t, err, test.ShouldNotBeNil)
 	allObs = obs.All()
 	latestLoggedEntry = allObs[3]
-	test.That(t, fmt.Sprint(latestLoggedEntry), test.ShouldContainSubstring, "nearly 0")
+	test.That(t, fmt.Sprint(latestLoggedEntry), test.ShouldContainSubstring, "is 0 rev_per_min")
 
 	testutils.WaitForAssertion(t, func(tb testing.TB) {
 		tb.Helper()
@@ -115,8 +119,45 @@ func TestGoTo(t *testing.T) {
 	})
 }
 
+func TestSetRPM(t *testing.T) {
+	logger, obs := logging.NewObservedTestLogger(t)
+	ctx := context.Background()
+
+	enc, err := fake.NewEncoder(context.Background(), resource.Config{
+		ConvertedAttributes: &fake.Config{},
+	}, logger)
+	test.That(t, err, test.ShouldBeNil)
+	m := &Motor{
+		Encoder:           enc.(fake.Encoder),
+		Logger:            logger,
+		PositionReporting: true,
+		MaxRPM:            60,
+		TicksPerRotation:  1,
+		OpMgr:             operation.NewSingleOperationManager(),
+	}
+
+	err = m.SetRPM(ctx, 0, nil)
+	allObs := obs.All()
+	latestLoggedEntry := allObs[len(allObs)-1]
+	test.That(t, fmt.Sprint(latestLoggedEntry), test.ShouldContainSubstring, "is 0 rev_per_min")
+	test.That(t, err, test.ShouldBeError, motor.NewZeroRPMError())
+
+	err = m.SetRPM(ctx, 60, nil)
+	test.That(t, err, test.ShouldBeNil)
+	allObs = obs.All()
+	latestLoggedEntry = allObs[1]
+	test.That(t, fmt.Sprint(latestLoggedEntry), test.ShouldContainSubstring, "nearly the max")
+
+	testutils.WaitForAssertion(t, func(tb testing.TB) {
+		tb.Helper()
+		pos, err := m.Position(ctx, nil)
+		test.That(tb, err, test.ShouldBeNil)
+		test.That(tb, pos, test.ShouldBeGreaterThan, 0)
+	})
+}
+
 func TestResetZeroPosition(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	ctx := context.Background()
 
 	enc, err := fake.NewEncoder(context.Background(), resource.Config{
@@ -141,7 +182,7 @@ func TestResetZeroPosition(t *testing.T) {
 }
 
 func TestPower(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	ctx := context.Background()
 
 	enc, err := fake.NewEncoder(context.Background(), resource.Config{
@@ -180,4 +221,38 @@ func TestPower(t *testing.T) {
 
 	powerPct = m.PowerPct()
 	test.That(t, powerPct, test.ShouldEqual, 0.0)
+}
+
+func TestGoForMath(t *testing.T) {
+	maxRPM := 100.0
+
+	// + rpm / + revolutions
+	pwrPct, waitDur, dir := goForMath(maxRPM, 10, 2)
+	test.That(t, pwrPct, test.ShouldEqual, 0.1)
+	test.That(t, waitDur, test.ShouldEqual, 12000*time.Millisecond)
+	test.That(t, dir, test.ShouldEqual, 1)
+
+	// - rpm / + revolutions
+	pwrPct, waitDur, dir = goForMath(maxRPM, -10, 2)
+	test.That(t, pwrPct, test.ShouldEqual, -0.1)
+	test.That(t, waitDur, test.ShouldEqual, 12000*time.Millisecond)
+	test.That(t, dir, test.ShouldEqual, -1)
+
+	// + rpm / - revolutions
+	pwrPct, waitDur, dir = goForMath(maxRPM, 10, -2)
+	test.That(t, pwrPct, test.ShouldEqual, -0.1)
+	test.That(t, waitDur, test.ShouldEqual, 12000*time.Millisecond)
+	test.That(t, dir, test.ShouldEqual, -1)
+
+	// - rpm / - revolutions
+	pwrPct, waitDur, dir = goForMath(maxRPM, 10, 2)
+	test.That(t, pwrPct, test.ShouldEqual, 0.1)
+	test.That(t, waitDur, test.ShouldEqual, 12000*time.Millisecond)
+	test.That(t, dir, test.ShouldEqual, 1)
+
+	// + rpm / 0 revolutions
+	pwrPct, waitDur, dir = goForMath(maxRPM, 10, 0)
+	test.That(t, pwrPct, test.ShouldEqual, 0)
+	test.That(t, waitDur, test.ShouldEqual, 0)
+	test.That(t, dir, test.ShouldEqual, 0)
 }

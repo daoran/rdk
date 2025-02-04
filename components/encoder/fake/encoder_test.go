@@ -4,11 +4,11 @@ import (
 	"context"
 	"testing"
 
-	"github.com/edaniels/golog"
 	"go.viam.com/test"
 	"go.viam.com/utils/testutils"
 
 	"go.viam.com/rdk/components/encoder"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 )
 
@@ -18,8 +18,10 @@ func TestEncoder(t *testing.T) {
 		UpdateRate: 100,
 	}
 	cfg := resource.Config{Name: "enc1", ConvertedAttributes: &ic}
-	logger := golog.NewTestLogger(t)
-	e, _ := NewEncoder(ctx, cfg, logger)
+	logger := logging.NewTestLogger(t)
+	eRaw, _ := NewEncoder(ctx, cfg, logger)
+	e, ok := eRaw.(Encoder)
+	test.That(t, ok, test.ShouldBeTrue)
 
 	// Get and set position
 	t.Run("get and set position", func(t *testing.T) {
@@ -28,9 +30,7 @@ func TestEncoder(t *testing.T) {
 		test.That(t, err, test.ShouldBeNil)
 		test.That(t, positionType, test.ShouldEqual, encoder.PositionTypeTicks)
 
-		e1 := e.(Encoder)
-
-		err = e1.SetPosition(ctx, 1)
+		err = e.SetPosition(ctx, 1)
 		test.That(t, err, test.ShouldBeNil)
 
 		pos, _, err = e.Position(ctx, encoder.PositionTypeUnspecified, nil)

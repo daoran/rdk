@@ -17,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/edaniels/golog"
 	pb "go.viam.com/api/app/packages/v1"
 	"go.viam.com/test"
 	"go.viam.com/utils"
@@ -26,6 +25,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"go.viam.com/rdk/config"
+	"go.viam.com/rdk/logging"
 )
 
 var errPackageMissng = errors.New("package missing")
@@ -46,19 +46,20 @@ type FakePackagesClientAndGCSServer struct {
 	testPackagePath     string
 	testPackageChecksum string
 
-	invalidHTTPRes  bool
-	invalidChecksum bool
-	invalidTar      bool
+	invalidHTTPRes           bool
+	invalidChecksum          bool
+	hasLeadingZeroesChecksum bool
+	invalidTar               bool
 
 	getRequestCount      int
 	downloadRequestCount int
 
 	mu     sync.Mutex
-	logger golog.Logger
+	logger logging.Logger
 }
 
 // NewFakePackageServer creates a new fake package server.
-func NewFakePackageServer(ctx context.Context, logger golog.Logger) (*FakePackagesClientAndGCSServer, error) {
+func NewFakePackageServer(ctx context.Context, logger logging.Logger) (*FakePackagesClientAndGCSServer, error) {
 	httplistener, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		return nil, err
@@ -158,6 +159,14 @@ func (c *FakePackagesClientAndGCSServer) SetInvalidChecksum(flag bool) {
 	c.invalidChecksum = flag
 }
 
+// SetChecksumWithLeadingZeroes sets checksum to a valid checksum with leading zeroes.
+func (c *FakePackagesClientAndGCSServer) SetChecksumWithLeadingZeroes(flag bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.hasLeadingZeroesChecksum = flag
+}
+
 // SetInvalidTar sets failure state.
 func (c *FakePackagesClientAndGCSServer) SetInvalidTar(flag bool) {
 	c.mu.Lock()
@@ -217,6 +226,17 @@ func (c *FakePackagesClientAndGCSServer) servePackage(w http.ResponseWriter, r *
 		return
 	}
 
+	if c.hasLeadingZeroesChecksum {
+		decodedBytes, err := base64.StdEncoding.DecodeString(c.testPackageChecksum)
+		if err != nil {
+			c.logger.Error(err)
+			return
+		}
+
+		prependedBytes := append([]byte{0x00, 0x00}, decodedBytes...)
+		c.testPackageChecksum = base64.StdEncoding.EncodeToString(prependedBytes)
+	}
+
 	w.Header().Set("Content-Type", "application/x-gzip")
 	if !c.invalidChecksum {
 		w.Header().Add("x-goog-hash", fmt.Sprintf("crc32c=%s", c.testPackageChecksum))
@@ -270,6 +290,7 @@ func (c *FakePackagesClientAndGCSServer) Clear() {
 	defer c.mu.Unlock()
 
 	c.packages = make(map[string]*pb.Package)
+	c.hasLeadingZeroesChecksum = false
 	c.invalidChecksum = false
 	c.invalidTar = false
 	c.invalidHTTPRes = false

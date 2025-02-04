@@ -41,6 +41,8 @@ func (server *serviceServer) GetMode(ctx context.Context, req *pb.GetModeRequest
 		protoMode = pb.Mode_MODE_MANUAL
 	case ModeWaypoint:
 		protoMode = pb.Mode_MODE_WAYPOINT
+	case ModeExplore:
+		protoMode = pb.Mode_MODE_EXPLORE
 	}
 	return &pb.GetModeResponse{
 		Mode: protoMode,
@@ -59,6 +61,10 @@ func (server *serviceServer) SetMode(ctx context.Context, req *pb.SetModeRequest
 		}
 	case pb.Mode_MODE_WAYPOINT:
 		if err := svc.SetMode(ctx, ModeWaypoint, req.Extra.AsMap()); err != nil {
+			return nil, err
+		}
+	case pb.Mode_MODE_EXPLORE:
+		if err := svc.SetMode(ctx, ModeExplore, req.Extra.AsMap()); err != nil {
 			return nil, err
 		}
 	case pb.Mode_MODE_UNSPECIFIED:
@@ -138,15 +144,46 @@ func (server *serviceServer) GetObstacles(ctx context.Context, req *pb.GetObstac
 	if err != nil {
 		return nil, err
 	}
-	obstacles, err := svc.GetObstacles(ctx, req.Extra.AsMap())
+	obstacles, err := svc.Obstacles(ctx, req.Extra.AsMap())
 	if err != nil {
 		return nil, err
 	}
-	protoObs := []*commonpb.GeoObstacle{}
+	protoObs := []*commonpb.GeoGeometry{}
 	for _, obstacle := range obstacles {
-		protoObs = append(protoObs, spatialmath.GeoObstacleToProtobuf(obstacle))
+		protoObs = append(protoObs, spatialmath.GeoGeometryToProtobuf(obstacle))
 	}
 	return &pb.GetObstaclesResponse{Obstacles: protoObs}, nil
+}
+
+func (server *serviceServer) GetPaths(ctx context.Context, req *pb.GetPathsRequest) (*pb.GetPathsResponse, error) {
+	svc, err := server.coll.Resource(req.Name)
+	if err != nil {
+		return nil, err
+	}
+	paths, err := svc.Paths(ctx, req.Extra.AsMap())
+	if err != nil {
+		return nil, err
+	}
+	pbPaths, err := PathSliceToProto(paths)
+	if err != nil {
+		return nil, err
+	}
+	return &pb.GetPathsResponse{Paths: pbPaths}, nil
+}
+
+func (server *serviceServer) GetProperties(ctx context.Context, req *pb.GetPropertiesRequest) (*pb.GetPropertiesResponse, error) {
+	svc, err := server.coll.Resource(req.Name)
+	if err != nil {
+		return nil, err
+	}
+	prop, err := svc.Properties(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return &pb.GetPropertiesResponse{
+		MapType: mapTypeToProtobuf(prop.MapType),
+	}, nil
 }
 
 // DoCommand receives arbitrary commands.

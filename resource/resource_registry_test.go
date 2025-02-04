@@ -6,7 +6,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/edaniels/golog"
 	"github.com/google/uuid"
 	"github.com/jhump/protoreflect/grpcreflect"
 	pb "go.viam.com/api/robot/v1"
@@ -15,6 +14,7 @@ import (
 
 	"go.viam.com/rdk/components/arm"
 	"go.viam.com/rdk/components/arm/fake"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/utils"
 )
@@ -27,8 +27,8 @@ var (
 )
 
 func TestComponentRegistry(t *testing.T) {
-	logger := golog.NewTestLogger(t)
-	rf := func(ctx context.Context, deps resource.Dependencies, conf resource.Config, logger golog.Logger) (arm.Arm, error) {
+	logger := logging.NewTestLogger(t)
+	rf := func(ctx context.Context, deps resource.Dependencies, conf resource.Config, logger logging.Logger) (arm.Arm, error) {
 		return &fake.Arm{Named: conf.ResourceName().AsNamed()}, nil
 	}
 	model := resource.Model{Name: "x"}
@@ -75,35 +75,29 @@ func TestComponentRegistry(t *testing.T) {
 }
 
 func TestResourceAPIRegistry(t *testing.T) {
-	statf := func(context.Context, arm.Arm) (interface{}, error) {
-		return nil, errors.New("one")
-	}
 	var capColl resource.APIResourceCollection[arm.Arm]
 
 	sf := func(apiResColl resource.APIResourceCollection[arm.Arm]) interface{} {
 		capColl = apiResColl
 		return 5
 	}
-	rcf := func(_ context.Context, _ rpc.ClientConn, _ string, name resource.Name, _ golog.Logger) (arm.Arm, error) {
+	rcf := func(_ context.Context, _ rpc.ClientConn, _ string, name resource.Name, _ logging.Logger) (arm.Arm, error) {
 		return capColl.Resource(name.ShortName())
 	}
 
 	test.That(t, func() {
 		resource.RegisterAPI(acme.API, resource.APIRegistration[arm.Arm]{
-			Status:                      statf,
 			RPCServiceServerConstructor: sf,
 			RPCServiceDesc:              &pb.RobotService_ServiceDesc,
 		})
 	}, test.ShouldPanic)
 	test.That(t, func() {
 		resource.RegisterAPIWithAssociation(acme.API, resource.APIRegistration[arm.Arm]{
-			Status:                      statf,
 			RPCServiceServerConstructor: sf,
 			RPCServiceDesc:              &pb.RobotService_ServiceDesc,
-		}, resource.AssociatedConfigRegistration[resource.AssociatedNameUpdater]{})
+		}, resource.AssociatedConfigRegistration[resource.AssociatedConfig]{})
 	}, test.ShouldPanic)
 	resource.RegisterAPI(acme.API, resource.APIRegistration[arm.Arm]{
-		Status:                      statf,
 		RPCServiceServerConstructor: sf,
 		RPCServiceHandler:           pb.RegisterRobotServiceHandlerFromEndpoint,
 		RPCServiceDesc:              &pb.RobotService_ServiceDesc,
@@ -112,8 +106,6 @@ func TestResourceAPIRegistry(t *testing.T) {
 	test.That(t, err, test.ShouldBeNil)
 	test.That(t, ok, test.ShouldBeTrue)
 	test.That(t, apiInfo, test.ShouldNotBeNil)
-	_, err = apiInfo.Status(nil, &fake.Arm{Named: arm.Named("foo").AsNamed()})
-	test.That(t, err, test.ShouldBeError, errors.New("one"))
 	coll, err := resource.NewAPIResourceCollection(arm.API, map[resource.Name]arm.Arm{
 		arm.Named("foo"): &fake.Arm{Named: arm.Named("foo").AsNamed()},
 	})
@@ -136,7 +128,6 @@ func TestResourceAPIRegistry(t *testing.T) {
 	apiInfo, ok, err = resource.LookupAPIRegistration[arm.Arm](api2)
 	test.That(t, err, test.ShouldBeNil)
 	test.That(t, ok, test.ShouldBeTrue)
-	test.That(t, apiInfo.Status, test.ShouldBeNil)
 	svcServer = apiInfo.RPCServiceServerConstructor(coll)
 	test.That(t, svcServer, test.ShouldNotBeNil)
 	res, err := apiInfo.RPCClient(nil, nil, "", arm.Named("foo"), nil)
@@ -178,7 +169,7 @@ func TestResourceAPIRegistry(t *testing.T) {
 			RPCServiceServerConstructor: sf,
 			RPCClient:                   rcf,
 			RPCServiceHandler:           pb.RegisterRobotServiceHandlerFromEndpoint,
-		}, resource.AssociatedConfigRegistration[resource.AssociatedNameUpdater]{})
+		}, resource.AssociatedConfigRegistration[resource.AssociatedConfig]{})
 	}, test.ShouldPanic)
 
 	resource.DeregisterAPI(api3)
@@ -187,51 +178,64 @@ func TestResourceAPIRegistry(t *testing.T) {
 	test.That(t, ok, test.ShouldBeFalse)
 }
 
-type someType struct {
+type mockAssociatedConfig struct {
 	Field1  string `json:"field1"`
 	capName resource.Name
 }
 
-func (st *someType) UpdateResourceNames(updater func(old resource.Name) resource.Name) {
+func (st *mockAssociatedConfig) Equals(other resource.AssociatedConfig) bool {
+	st2, err := utils.AssertType[*mockAssociatedConfig](other)
+	if err != nil {
+		return false
+	}
+	return st.Field1 == st2.Field1 && st.capName == st2.capName
+}
+
+func (st *mockAssociatedConfig) UpdateResourceNames(updater func(old resource.Name) resource.Name) {
 	st.capName = updater(arm.Named("foo"))
 }
 
+func (st *mockAssociatedConfig) Link(conf *resource.Config) {
+	copySt := st
+	conf.AssociatedAttributes = make(map[resource.Name]resource.AssociatedConfig)
+	conf.AssociatedAttributes[st.capName] = copySt
+}
+
 func TestResourceAPIRegistryWithAssociation(t *testing.T) {
-	statf := func(context.Context, arm.Arm) (interface{}, error) {
-		return nil, errors.New("one")
-	}
 	sf := func(apiResColl resource.APIResourceCollection[arm.Arm]) interface{} {
 		return nil
 	}
 
 	someName := resource.NewName(resource.APINamespace(uuid.NewString()).WithComponentType(button), "button1")
 	resource.RegisterAPIWithAssociation(someName.API, resource.APIRegistration[arm.Arm]{
-		Status:                      statf,
 		RPCServiceServerConstructor: sf,
 		RPCServiceHandler:           pb.RegisterRobotServiceHandlerFromEndpoint,
 		RPCServiceDesc:              &pb.RobotService_ServiceDesc,
-	}, resource.AssociatedConfigRegistration[*someType]{})
+	}, resource.AssociatedConfigRegistration[*mockAssociatedConfig]{})
 	reg, ok := resource.LookupAssociatedConfigRegistration(someName.API)
 	test.That(t, ok, test.ShouldBeTrue)
 	assoc, err := reg.AttributeMapConverter(utils.AttributeMap{"field1": "hey"})
 	test.That(t, err, test.ShouldBeNil)
-	test.That(t, assoc.(*someType).Field1, test.ShouldEqual, "hey")
-	test.That(t, assoc.(*someType).capName, test.ShouldResemble, resource.Name{})
+	test.That(t, assoc.(*mockAssociatedConfig).Field1, test.ShouldEqual, "hey")
+	test.That(t, assoc.(*mockAssociatedConfig).capName, test.ShouldResemble, resource.Name{})
 	assoc.UpdateResourceNames(func(n resource.Name) resource.Name {
 		return arm.Named(n.String()) // odd but whatever
 	})
-	test.That(t, assoc.(*someType).capName, test.ShouldResemble, arm.Named(arm.Named("foo").String()))
+	test.That(t, assoc.(*mockAssociatedConfig).capName, test.ShouldResemble, arm.Named(arm.Named("foo").String()))
+	cfg := &resource.Config{}
+	assoc.Link(cfg)
+	test.That(t, assoc.Equals(cfg.AssociatedAttributes[assoc.(*mockAssociatedConfig).capName]), test.ShouldBeTrue)
 }
 
 func TestDiscoveryFunctions(t *testing.T) {
-	df := func(ctx context.Context, logger golog.Logger) (interface{}, error) {
+	df := func(ctx context.Context, logger logging.Logger, extra map[string]interface{}) (interface{}, error) {
 		return []resource.Discovery{}, nil
 	}
-	validAPIQuery := resource.NewDiscoveryQuery(acme.API, resource.Model{Name: "some model"})
+	validAPIQuery := resource.NewDiscoveryQuery(acme.API, resource.Model{Name: "some model"}, nil)
 	_, ok := resource.LookupRegistration(validAPIQuery.API, validAPIQuery.Model)
 	test.That(t, ok, test.ShouldBeFalse)
 
-	rf := func(ctx context.Context, deps resource.Dependencies, conf resource.Config, logger golog.Logger) (arm.Arm, error) {
+	rf := func(ctx context.Context, deps resource.Dependencies, conf resource.Config, logger logging.Logger) (arm.Arm, error) {
 		return &fake.Arm{Named: conf.ResourceName().AsNamed()}, nil
 	}
 

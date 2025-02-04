@@ -28,6 +28,13 @@ func TestColorDetector(t *testing.T) {
 	img, err := rimage.NewImageFromFile(artifact.MustPath("vision/objectdetection/detection_test.jpg"))
 	test.That(t, err, test.ShouldBeNil)
 
+	// Test properties. Should support detections and not classifications or object PCDs
+	props, err := srv.GetProperties(ctx, nil)
+	test.That(t, err, test.ShouldBeNil)
+	test.That(t, props.DetectionSupported, test.ShouldEqual, true)
+	test.That(t, props.ClassificationSupported, test.ShouldEqual, false)
+	test.That(t, props.ObjectPCDsSupported, test.ShouldEqual, false)
+
 	// Does implement Detections
 	det, err := srv.Detections(ctx, img, nil)
 	test.That(t, err, test.ShouldBeNil)
@@ -41,7 +48,7 @@ func TestColorDetector(t *testing.T) {
 	// with error - bad parameters
 	inp.HueTolerance = 4.0 // value out of range
 	_, err = registerColorDetector(ctx, name, &inp, r)
-	test.That(t, err.Error(), test.ShouldContainSubstring, "hue_tolerance_pct must be between")
+	test.That(t, err.Error(), test.ShouldContainSubstring, "hue_tolerance_pct is required")
 
 	// with error - nil parameters
 	_, err = registerColorDetector(ctx, name, nil, r)

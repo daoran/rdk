@@ -32,10 +32,11 @@ type MovementSensor struct {
 	PropertiesFuncExtraCap      map[string]interface{}
 	PropertiesFunc              func(ctx context.Context, extra map[string]interface{}) (*movementsensor.Properties, error)
 	AccuracyFuncExtraCap        map[string]interface{}
-	AccuracyFunc                func(ctx context.Context, extra map[string]interface{}) (map[string]float32, error)
-
-	DoFunc    func(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error)
-	CloseFunc func() error
+	AccuracyFunc                func(ctx context.Context, extra map[string]interface{}) (*movementsensor.Accuracy, error)
+	ReadingsFuncExtraCap        map[string]interface{}
+	ReadingsFunc                func(ctx context.Context, extra map[string]interface{}) (map[string]interface{}, error)
+	DoFunc                      func(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error)
+	CloseFunc                   func() error
 }
 
 // NewMovementSensor returns a new injected movement sensor.
@@ -133,10 +134,20 @@ func (i *MovementSensor) Properties(ctx context.Context, extra map[string]interf
 }
 
 // Accuracy func or passthrough.
-func (i *MovementSensor) Accuracy(ctx context.Context, extra map[string]interface{}) (map[string]float32, error) {
+func (i *MovementSensor) Accuracy(ctx context.Context, extra map[string]interface{}) (*movementsensor.Accuracy, error,
+) {
 	if i.AccuracyFunc == nil {
 		return i.MovementSensor.Accuracy(ctx, extra)
 	}
 	i.AccuracyFuncExtraCap = extra
 	return i.AccuracyFunc(ctx, extra)
+}
+
+// Readings func or passthrough.
+func (i *MovementSensor) Readings(ctx context.Context, extra map[string]interface{}) (map[string]interface{}, error) {
+	if i.ReadingsFunc == nil {
+		return i.MovementSensor.Readings(ctx, extra)
+	}
+	i.ReadingsFuncExtraCap = extra
+	return i.ReadingsFunc(ctx, extra)
 }

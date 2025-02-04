@@ -5,17 +5,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
-	"strconv"
 	"testing"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/golang/geo/r3"
 	geo "github.com/kellydunn/golang-geo"
 	"go.viam.com/test"
 	goutils "go.viam.com/utils"
-	"go.viam.com/utils/pexec"
 	"go.viam.com/utils/rpc"
 
 	"go.viam.com/rdk/components/base"
@@ -23,10 +21,12 @@ import (
 	"go.viam.com/rdk/config"
 	"go.viam.com/rdk/examples/customresources/apis/gizmoapi"
 	"go.viam.com/rdk/examples/customresources/apis/summationapi"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/robot"
 	"go.viam.com/rdk/robot/client"
 	"go.viam.com/rdk/services/navigation"
 	"go.viam.com/rdk/testutils"
+	"go.viam.com/rdk/testutils/robottestutils"
 	"go.viam.com/rdk/utils"
 )
 
@@ -35,27 +35,31 @@ import (
 // needs to be added to the web service before it normally would be avalilable after completing
 // a config cycle.
 func TestComplexModule(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger, observer := logging.NewObservedTestLogger(t)
 
-	// Modify the example config to run directly, without compiling the module first.
-	cfgFilename, port, err := modifyCfg(t, utils.ResolveFile("examples/customresources/demos/complexmodule/module.json"), logger)
-	test.That(t, err, test.ShouldBeNil)
+	var port int
+	success := false
+	for portTryNum := 0; portTryNum < 10; portTryNum++ {
+		// Modify the example config to run directly, without compiling the module first.
+		cfgFilename, portLocal, err := modifyCfg(t, utils.ResolveFile("examples/customresources/demos/complexmodule/module.json"), logger)
+		port = portLocal
+		test.That(t, err, test.ShouldBeNil)
 
-	serverPath, err := testutils.BuildTempModule(t, "web/cmd/server/")
-	test.That(t, err, test.ShouldBeNil)
+		server := robottestutils.ServerAsSeparateProcess(t, cfgFilename, logger)
 
-	server := pexec.NewManagedProcess(pexec.ProcessConfig{
-		Name: serverPath,
-		Args: []string{"-config", cfgFilename},
-		CWD:  utils.ResolveFile("./"),
-		Log:  true,
-	}, logger)
+		err = server.Start(context.Background())
+		test.That(t, err, test.ShouldBeNil)
 
-	err = server.Start(context.Background())
-	test.That(t, err, test.ShouldBeNil)
-	defer func() {
-		test.That(t, server.Stop(), test.ShouldBeNil)
-	}()
+		if robottestutils.WaitForServing(observer, port) {
+			success = true
+			defer func() {
+				test.That(t, server.Stop(), test.ShouldBeNil)
+			}()
+			break
+		}
+		server.Stop()
+	}
+	test.That(t, success, test.ShouldBeTrue)
 
 	rc, err := connect(port, logger)
 	test.That(t, err, test.ShouldBeNil)
@@ -73,7 +77,8 @@ func TestComplexModule(t *testing.T) {
 		test.That(t, err, test.ShouldBeNil)
 		test.That(t, ret1, test.ShouldBeFalse)
 
-		ret2, err := giz.DoOneClientStream(context.Background(), []string{"hello", "arg1", "foo"})
+		// also tests that the ForeignServiceHandler does not drop the first message
+		ret2, err := giz.DoOneClientStream(context.Background(), []string{"hello", "arg1", "arg1"})
 		test.That(t, err, test.ShouldBeNil)
 		test.That(t, ret2, test.ShouldBeFalse)
 
@@ -87,11 +92,11 @@ func TestComplexModule(t *testing.T) {
 
 		ret3, err = giz.DoOneBiDiStream(context.Background(), []string{"hello", "arg1", "foo"})
 		test.That(t, err, test.ShouldBeNil)
-		test.That(t, ret3, test.ShouldResemble, []bool{true, false})
+		test.That(t, ret3, test.ShouldResemble, []bool{false, true, false})
 
 		ret3, err = giz.DoOneBiDiStream(context.Background(), []string{"arg1", "arg1", "arg1"})
 		test.That(t, err, test.ShouldBeNil)
-		test.That(t, ret3, test.ShouldResemble, []bool{true, true})
+		test.That(t, ret3, test.ShouldResemble, []bool{true, true, true})
 	})
 
 	// Summation is a custom service model and API.
@@ -115,17 +120,17 @@ func TestComplexModule(t *testing.T) {
 
 	// Base is a custom component, but built-in API. It also depends on built-in motors, so tests dependencies.
 	t.Run("Test Base", func(t *testing.T) {
-		res, err := rc.ResourceByName(base.Named("base1"))
-		test.That(t, err, test.ShouldBeNil)
-		mybase := res.(base.Base)
-
-		res, err = rc.ResourceByName(motor.Named("motor1"))
+		res, err := rc.ResourceByName(motor.Named("motor1"))
 		test.That(t, err, test.ShouldBeNil)
 		motorL := res.(motor.Motor)
 
 		res, err = rc.ResourceByName(motor.Named("motor2"))
 		test.That(t, err, test.ShouldBeNil)
 		motorR := res.(motor.Motor)
+
+		res, err = rc.ResourceByName(base.Named("base1"))
+		test.That(t, err, test.ShouldBeNil)
+		mybase := res.(base.Base)
 
 		// Test generic echo
 		testCmd := map[string]interface{}{"foo": "bar"}
@@ -290,12 +295,12 @@ func TestComplexModule(t *testing.T) {
 	})
 }
 
-func connect(port string, logger golog.Logger) (robot.Robot, error) {
+func connect(port int, logger logging.Logger) (robot.Robot, error) {
 	connectCtx, cancelConn := context.WithTimeout(context.Background(), time.Second*30)
 	defer cancelConn()
 	for {
 		dialCtx, dialCancel := context.WithTimeout(context.Background(), time.Millisecond*500)
-		rc, err := client.New(dialCtx, "localhost:"+port, logger,
+		rc, err := client.New(dialCtx, fmt.Sprintf("localhost:%d", port), logger,
 			client.WithDialOptions(rpc.WithForceDirectGRPC()),
 			client.WithDisableSessions(), // TODO(PRODUCT-343): add session support to modules
 		)
@@ -311,75 +316,64 @@ func connect(port string, logger golog.Logger) (robot.Robot, error) {
 	}
 }
 
-func modifyCfg(t *testing.T, cfgIn string, logger golog.Logger) (string, string, error) {
-	modPath, err := testutils.BuildTempModule(t, "examples/customresources/demos/complexmodule")
+func modifyCfg(t *testing.T, cfgIn string, logger logging.Logger) (string, int, error) {
+	modPath := testutils.BuildTempModule(t, "examples/customresources/demos/complexmodule")
+
+	port, err := goutils.TryReserveRandomPort()
 	if err != nil {
-		return "", "", err
+		return "", 0, err
 	}
 
-	p, err := goutils.TryReserveRandomPort()
-	if err != nil {
-		return "", "", err
-	}
-	port := strconv.Itoa(p)
-
-	// workaround because config.Read can't validate a module config with a "missing" ExePath
-	touchFile("./complexmodule")
-	defer os.Remove("./complexmodule")
 	cfg, err := config.Read(context.Background(), cfgIn, logger)
 	if err != nil {
-		return "", "", err
+		return "", 0, err
 	}
-	cfg.Network.BindAddress = "localhost:" + port
+	cfg.Network.BindAddress = fmt.Sprintf("localhost:%d", port)
 	cfg.Modules[0].ExePath = modPath
 	output, err := json.Marshal(cfg)
 	if err != nil {
-		return "", "", err
+		return "", 0, err
 	}
 	file, err := os.CreateTemp(t.TempDir(), "viam-test-config-*")
 	if err != nil {
-		return "", "", err
+		return "", 0, err
 	}
 	cfgFilename := file.Name()
 	_, err = file.Write(output)
 	if err != nil {
-		return "", "", err
+		return "", 0, err
 	}
 	return cfgFilename, port, file.Close()
 }
 
-func touchFile(path string) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	return f.Close()
-}
-
 func TestValidationFailure(t *testing.T) {
-	logger, logs := golog.NewObservedTestLogger(t)
+	logger, logs := logging.NewObservedTestLogger(t)
 
-	// bad_modular_validation.json contains a "mybase" modular component that will
-	// fail modular Validation due to a missing "motorL" attribute.
-	cfgFilename, port, err := modifyCfg(t,
-		utils.ResolveFile("examples/customresources/demos/complexmodule/moduletest/bad_modular_validation.json"), logger)
-	test.That(t, err, test.ShouldBeNil)
+	var port int
+	success := false
+	for portTryNum := 0; portTryNum < 10; portTryNum++ {
+		// bad_modular_validation.json contains a "mybase" modular component that will
+		// fail modular Validation due to a missing "motorL" attribute.
+		cfgFilename, localPort, err := modifyCfg(t,
+			utils.ResolveFile("examples/customresources/demos/complexmodule/moduletest/bad_modular_validation.json"), logger)
+		test.That(t, err, test.ShouldBeNil)
+		port = localPort
 
-	serverPath, err := testutils.BuildTempModule(t, "web/cmd/server/")
-	test.That(t, err, test.ShouldBeNil)
+		server := robottestutils.ServerAsSeparateProcess(t, cfgFilename, logger)
 
-	server := pexec.NewManagedProcess(pexec.ProcessConfig{
-		Name: serverPath,
-		Args: []string{"-config", cfgFilename},
-		CWD:  utils.ResolveFile("./"),
-		Log:  true,
-	}, logger)
+		err = server.Start(context.Background())
+		test.That(t, err, test.ShouldBeNil)
 
-	err = server.Start(context.Background())
-	test.That(t, err, test.ShouldBeNil)
-	defer func() {
-		test.That(t, server.Stop(), test.ShouldBeNil)
-	}()
+		if robottestutils.WaitForServing(logs, port) {
+			success = true
+			defer func() {
+				test.That(t, server.Stop(), test.ShouldBeNil)
+			}()
+			break
+		}
+		server.Stop()
+	}
+	test.That(t, success, test.ShouldBeTrue)
 
 	rc, err := connect(port, logger)
 	test.That(t, err, test.ShouldBeNil)
@@ -395,10 +389,4 @@ func TestValidationFailure(t *testing.T) {
 	_, err = rc.ResourceByName(base.Named("base1"))
 	test.That(t, err, test.ShouldNotBeNil)
 	test.That(t, err.Error(), test.ShouldResemble, `resource "rdk:component:base/base1" not found`)
-
-	// Assert that Validation failure is present in server output, but build failure
-	// is not.
-	test.That(t, logs.FilterMessageSnippet(
-		"modular config validation error found in resource: base1").Len(), test.ShouldEqual, 1)
-	test.That(t, logs.FilterMessageSnippet("error building component").Len(), test.ShouldEqual, 0)
 }

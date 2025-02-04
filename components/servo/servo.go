@@ -1,3 +1,7 @@
+// Package servo supports “RC” or “hobby” servo motors.
+// For more information, see the [servo component docs].
+//
+// [servo component docs]: https://docs.viam.com/components/servo/
 package servo
 
 import (
@@ -12,7 +16,6 @@ import (
 
 func init() {
 	resource.RegisterAPI(API, resource.APIRegistration[Servo]{
-		Status:                      resource.StatusFunc(CreateStatus),
 		RPCServiceServerConstructor: NewRPCServiceServer,
 		RPCServiceHandler:           pb.RegisterServoServiceHandlerFromEndpoint,
 		RPCServiceDesc:              &pb.ServoService_ServiceDesc,
@@ -31,12 +34,40 @@ const SubtypeName = "servo"
 var API = resource.APINamespaceRDK.WithComponentType(SubtypeName)
 
 // A Servo represents a physical servo connected to a board.
+// For more information, see the [servo component docs].
+//
+// Move example:
+//
+//	// Move the servo from its origin to the desired angle of 30 degrees.
+//	myServoComponent.Move(context.Background(), 30, nil)
+//
+// For more information, see the [Move method docs].
+//
+// Position example:
+//
+//	// Get the current set angle of the servo.
+//	pos1, err := myServoComponent.Position(context.Background(), nil)
+//
+//	// Move the servo from its origin to the desired angle of 20 degrees.
+//	myServoComponent.Move(context.Background(), 20, nil)
+//
+//	// Get the current set angle of the servo.
+//	pos2, err := myServoComponent.Position(context.Background(), nil)
+//
+//	logger.Info("Position 1: ", pos1)
+//	logger.Info("Position 2: ", pos2)
+//
+// For more information, see the [Position method docs].
+//
+// [servo component docs]: https://docs.viam.com/dev/reference/apis/components/servo/
+// [Move method docs]: https://docs.viam.com/dev/reference/apis/components/servo/#move
+// [Position method docs]: https://docs.viam.com/dev/reference/apis/components/servo/#getposition
 type Servo interface {
 	resource.Resource
 	resource.Actuator
 
-	// Move moves the servo to the given angle (0-180 degrees)
-	// This will block until done or a new operation cancels this one
+	// Move moves the servo to the given angle (0-180 degrees).
+	// This will block until done or a new operation cancels this one.
 	Move(ctx context.Context, angleDeg uint32, extra map[string]interface{}) error
 
 	// Position returns the current set angle (degrees) of the servo.
@@ -56,17 +87,4 @@ func FromRobot(r robot.Robot, name string) (Servo, error) {
 // NamesFromRobot is a helper for getting all servo names from the given Robot.
 func NamesFromRobot(r robot.Robot) []string {
 	return robot.NamesByAPI(r, API)
-}
-
-// CreateStatus creates a status from the servo.
-func CreateStatus(ctx context.Context, s Servo) (*pb.Status, error) {
-	position, err := s.Position(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	isMoving, err := s.IsMoving(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return &pb.Status{PositionDeg: position, IsMoving: isMoving}, nil
 }

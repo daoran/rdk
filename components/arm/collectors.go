@@ -1,12 +1,18 @@
+//go:build !no_cgo
+
 package arm
 
 import (
 	"context"
 	"errors"
+	"time"
 
+	v1 "go.viam.com/api/common/v1"
+	pb "go.viam.com/api/component/arm/v1"
 	"google.golang.org/protobuf/types/known/anypb"
 
 	"go.viam.com/rdk/data"
+	"go.viam.com/rdk/referenceframe"
 )
 
 type method int64
@@ -26,44 +32,69 @@ func (m method) String() string {
 	return "Unknown"
 }
 
+// newEndPositionCollector returns a collector to register an end position method. If one is already registered
+// with the same MethodMetadata it will panic.
 func newEndPositionCollector(resource interface{}, params data.CollectorParams) (data.Collector, error) {
 	arm, err := assertArm(resource)
 	if err != nil {
 		return nil, err
 	}
 
-	cFunc := data.CaptureFunc(func(ctx context.Context, _ map[string]*anypb.Any) (interface{}, error) {
+	cFunc := data.CaptureFunc(func(ctx context.Context, _ map[string]*anypb.Any) (data.CaptureResult, error) {
+		timeRequested := time.Now()
+		var res data.CaptureResult
 		v, err := arm.EndPosition(ctx, data.FromDMExtraMap)
 		if err != nil {
 			// A modular filter component can be created to filter the readings from a component. The error ErrNoCaptureToStore
 			// is used in the datamanager to exclude readings from being captured and stored.
 			if errors.Is(err, data.ErrNoCaptureToStore) {
-				return nil, err
+				return res, err
 			}
-			return nil, data.FailedToReadErr(params.ComponentName, endPosition.String(), err)
+			return res, data.FailedToReadErr(params.ComponentName, endPosition.String(), err)
 		}
-		return v, nil
+		o := v.Orientation().OrientationVectorDegrees()
+		ts := data.Timestamps{TimeRequested: timeRequested, TimeReceived: time.Now()}
+		return data.NewTabularCaptureResult(ts, pb.GetEndPositionResponse{
+			Pose: &v1.Pose{
+				X:     v.Point().X,
+				Y:     v.Point().Y,
+				Z:     v.Point().Z,
+				OX:    o.OX,
+				OY:    o.OY,
+				OZ:    o.OZ,
+				Theta: o.Theta,
+			},
+		})
 	})
 	return data.NewCollector(cFunc, params)
 }
 
+// newJointPositionsCollector returns a collector to register a joint positions method. If one is already registered
+// with the same MethodMetadata it will panic.
 func newJointPositionsCollector(resource interface{}, params data.CollectorParams) (data.Collector, error) {
 	arm, err := assertArm(resource)
 	if err != nil {
 		return nil, err
 	}
 
-	cFunc := data.CaptureFunc(func(ctx context.Context, _ map[string]*anypb.Any) (interface{}, error) {
+	cFunc := data.CaptureFunc(func(ctx context.Context, _ map[string]*anypb.Any) (data.CaptureResult, error) {
+		timeRequested := time.Now()
+		var res data.CaptureResult
 		v, err := arm.JointPositions(ctx, data.FromDMExtraMap)
 		if err != nil {
 			// A modular filter component can be created to filter the readings from a component. The error ErrNoCaptureToStore
 			// is used in the datamanager to exclude readings from being captured and stored.
 			if errors.Is(err, data.ErrNoCaptureToStore) {
-				return nil, err
+				return res, err
 			}
-			return nil, data.FailedToReadErr(params.ComponentName, jointPositions.String(), err)
+			return res, data.FailedToReadErr(params.ComponentName, jointPositions.String(), err)
 		}
-		return v, nil
+		jp, err := referenceframe.JointPositionsFromInputs(arm.ModelFrame(), v)
+		if err != nil {
+			return res, data.FailedToReadErr(params.ComponentName, jointPositions.String(), err)
+		}
+		ts := data.Timestamps{TimeRequested: timeRequested, TimeReceived: time.Now()}
+		return data.NewTabularCaptureResult(ts, pb.GetJointPositionsResponse{Positions: jp})
 	})
 	return data.NewCollector(cFunc, params)
 }

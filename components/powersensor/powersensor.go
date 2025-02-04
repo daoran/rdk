@@ -1,13 +1,15 @@
-// Package powersensor defines the interfaces of a powersensor
+// Package powersensor defines the interfaces of a powersensor.
+// For more information, see the [power sensor component docs].
+//
+// [power sensor component docs]: https://docs.viam.com/components/power-sensor/
 package powersensor
 
 import (
 	"context"
-	"strings"
 
 	pb "go.viam.com/api/component/powersensor/v1"
 
-	"go.viam.com/rdk/components/sensor"
+	"go.viam.com/rdk/data"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/robot"
 )
@@ -19,42 +21,22 @@ func init() {
 		RPCServiceDesc:              &pb.PowerSensorService_ServiceDesc,
 		RPCClient:                   NewClientFromConn,
 	})
-
-	registerCollector("Voltage", func(ctx context.Context, ps PowerSensor, extra map[string]interface{}) (interface{}, error) {
-		type Voltage struct {
-			Volts float64
-			IsAc  bool
-		}
-		v, ac, err := ps.Voltage(ctx, extra)
-		if err != nil {
-			return nil, err
-		}
-
-		return Voltage{Volts: v, IsAc: ac}, nil
-	})
-
-	registerCollector("Current", func(ctx context.Context, ps PowerSensor, extra map[string]interface{}) (interface{}, error) {
-		type Current struct {
-			Amperes float64
-			IsAc    bool
-		}
-		c, ac, err := ps.Current(ctx, extra)
-		if err != nil {
-			return nil, err
-		}
-		return Current{Amperes: c, IsAc: ac}, nil
-	})
-
-	registerCollector("Power", func(ctx context.Context, ps PowerSensor, extra map[string]interface{}) (interface{}, error) {
-		type Power struct {
-			Watts float64
-		}
-		p, err := ps.Power(ctx, extra)
-		if err != nil {
-			return nil, err
-		}
-		return Power{Watts: p}, nil
-	})
+	data.RegisterCollector(data.MethodMetadata{
+		API:        API,
+		MethodName: voltage.String(),
+	}, newVoltageCollector)
+	data.RegisterCollector(data.MethodMetadata{
+		API:        API,
+		MethodName: current.String(),
+	}, newCurrentCollector)
+	data.RegisterCollector(data.MethodMetadata{
+		API:        API,
+		MethodName: power.String(),
+	}, newPowerCollector)
+	data.RegisterCollector(data.MethodMetadata{
+		API:        API,
+		MethodName: readings.String(),
+	}, newReadingsCollector)
 }
 
 // SubtypeName is a constant that identifies the component resource API string "power_sensor".
@@ -69,10 +51,43 @@ func Named(name string) resource.Name {
 }
 
 // A PowerSensor reports information about voltage, current and power.
+// For more information, see the [power sensor component docs].
+//
+// Voltage example:
+//
+//	// Get the voltage from device in volts.
+//	voltage, isAC, err := myPowerSensor.Voltage(context.Background(), nil)
+//
+// For more information, see the [Voltage method docs].
+//
+// Current example:
+//
+//	// Get the current reading from device in amps.
+//	current, isAC, err := myPowerSensor.Current(context.Background(), nil)
+//
+// For more information, see the [Current method docs].
+//
+// Power example:
+//
+//	// Get the power measurement from device in watts.
+//	power, err := myPowerSensor.Power(context.Background(), nil)
+//
+// For more information, see the [Power method docs].
+//
+// [power sensor component docs]: https://docs.viam.com/dev/reference/apis/components/power-sensor/
+// [Voltage method docs]: https://docs.viam.com/dev/reference/apis/components/power-sensor/#getvoltage
+// [Current method docs]: https://docs.viam.com/dev/reference/apis/components/power-sensor/#getcurrent
+// [Power method docs]: https://docs.viam.com/dev/reference/apis/components/power-sensor/#getpower
 type PowerSensor interface {
-	sensor.Sensor
+	resource.Sensor
+	resource.Resource
+	// Voltage returns the voltage reading in volts and a bool returning true if the voltage is AC.
 	Voltage(ctx context.Context, extra map[string]interface{}) (float64, bool, error)
+
+	// Current returns the current reading in amperes and a bool returning true if the current is AC.
 	Current(ctx context.Context, extra map[string]interface{}) (float64, bool, error)
+
+	// Power returns the power reading in watts.
 	Power(ctx context.Context, extra map[string]interface{}) (float64, error)
 }
 
@@ -90,40 +105,4 @@ func FromRobot(r robot.Robot, name string) (PowerSensor, error) {
 // NamesFromRobot is a helper for getting all PowerSensor names from the given Robot.
 func NamesFromRobot(r robot.Robot) []string {
 	return robot.NamesByAPI(r, API)
-}
-
-// Readings is a helper for getting all readings from a PowerSensor.
-func Readings(ctx context.Context, g PowerSensor, extra map[string]interface{}) (map[string]interface{}, error) {
-	readings := map[string]interface{}{}
-
-	vol, isAC, err := g.Voltage(ctx, extra)
-	if err != nil {
-		if !strings.Contains(err.Error(), ErrMethodUnimplementedVoltage.Error()) {
-			return nil, err
-		}
-	} else {
-		readings["voltage"] = vol
-		readings["is_ac"] = isAC
-	}
-
-	cur, isAC, err := g.Current(ctx, extra)
-	if err != nil {
-		if !strings.Contains(err.Error(), ErrMethodUnimplementedCurrent.Error()) {
-			return nil, err
-		}
-	} else {
-		readings["current"] = cur
-		readings["is_ac"] = isAC
-	}
-
-	pow, err := g.Power(ctx, extra)
-	if err != nil {
-		if !strings.Contains(err.Error(), ErrMethodUnimplementedPower.Error()) {
-			return nil, err
-		}
-	} else {
-		readings["power"] = pow
-	}
-
-	return readings, nil
 }

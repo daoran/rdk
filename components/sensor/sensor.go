@@ -1,9 +1,10 @@
 // Package sensor defines an abstract sensing device that can provide measurement readings.
+// For more information, see the [sensor component docs].
+//
+// [sensor component docs]: https://docs.viam.com/dev/reference/apis/components/sensor/
 package sensor
 
 import (
-	"context"
-
 	pb "go.viam.com/api/component/sensor/v1"
 
 	"go.viam.com/rdk/data"
@@ -21,7 +22,7 @@ func init() {
 	data.RegisterCollector(data.MethodMetadata{
 		API:        API,
 		MethodName: readings.String(),
-	}, newSensorCollector)
+	}, newReadingsCollector)
 }
 
 // SubtypeName is a constant that identifies the component resource API string "Sensor".
@@ -39,8 +40,7 @@ func Named(name string) resource.Name {
 // of some thing that it is sensing.
 type Sensor interface {
 	resource.Resource
-	// Readings return data specific to the type of sensor and can be of any type.
-	Readings(ctx context.Context, extra map[string]interface{}) (map[string]interface{}, error)
+	resource.Sensor
 }
 
 // FromDependencies is a helper for getting the named sensor from a collection of

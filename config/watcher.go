@@ -7,9 +7,10 @@ import (
 	"time"
 
 	"github.com/bep/debounce"
-	"github.com/edaniels/golog"
 	"github.com/fsnotify/fsnotify"
 	"go.viam.com/utils"
+
+	"go.viam.com/rdk/logging"
 )
 
 // A Watcher is responsible for watching for changes
@@ -22,7 +23,7 @@ type Watcher interface {
 
 // NewWatcher returns an optimally selected Watcher based on the
 // given config.
-func NewWatcher(ctx context.Context, config *Config, logger golog.Logger) (Watcher, error) {
+func NewWatcher(ctx context.Context, config *Config, logger logging.Logger) (Watcher, error) {
 	if err := config.Ensure(false, logger); err != nil {
 		return nil, err
 	}
@@ -46,19 +47,24 @@ const checkForNewCertInterval = time.Hour
 
 // newCloudWatcher returns a cloudWatcher that will periodically fetch
 // new configs from the cloud.
-func newCloudWatcher(ctx context.Context, config *Config, logger golog.Logger) *cloudWatcher {
+func newCloudWatcher(ctx context.Context, config *Config, logger logging.Logger) *cloudWatcher {
 	configCh := make(chan *Config)
 	watcherDoneCh := make(chan struct{})
 	cancelCtx, cancel := context.WithCancel(ctx)
 
 	nextCheckForNewCert := time.Now().Add(checkForNewCertInterval)
 
-	ticker := time.NewTicker(config.Cloud.RefreshInterval)
-
 	var prevCfg *Config
 	utils.ManagedGo(func() {
+		firstRead := true
 		for {
-			if !utils.SelectContextOrWait(cancelCtx, config.Cloud.RefreshInterval) {
+			// have first read with the watcher happen much faster in case the request timed out on the initial read on server startup
+			interval := config.Cloud.RefreshInterval
+			if firstRead {
+				interval /= 5
+				firstRead = false
+			}
+			if !utils.SelectContextOrWait(cancelCtx, interval) {
 				return
 			}
 			var checkForNewCert bool
@@ -67,7 +73,7 @@ func newCloudWatcher(ctx context.Context, config *Config, logger golog.Logger) *
 			}
 			newConfig, err := readFromCloud(cancelCtx, config, prevCfg, false, checkForNewCert, logger)
 			if err != nil {
-				logger.Errorw("error reading cloud config", "error", err)
+				logger.Debugw("error reading cloud config; will try again", "error", err)
 				continue
 			}
 			if cp, err := newConfig.CopyOnlyPublicFields(); err == nil {
@@ -76,6 +82,7 @@ func newCloudWatcher(ctx context.Context, config *Config, logger golog.Logger) *
 			if checkForNewCert {
 				nextCheckForNewCert = time.Now().Add(checkForNewCertInterval)
 			}
+			UpdateCloudConfigDebug(newConfig.Debug)
 			select {
 			case <-cancelCtx.Done():
 				return
@@ -83,7 +90,6 @@ func newCloudWatcher(ctx context.Context, config *Config, logger golog.Logger) *
 			}
 		}
 	}, func() {
-		ticker.Stop()
 		close(watcherDoneCh)
 	})
 	return &cloudWatcher{
@@ -113,7 +119,7 @@ type fsConfigWatcher struct {
 
 // newFSWatcher returns a new v that will fetch new configs
 // as soon as the underlying file is written to.
-func newFSWatcher(ctx context.Context, configPath string, logger golog.Logger) (*fsConfigWatcher, error) {
+func newFSWatcher(ctx context.Context, configPath string, logger logging.Logger) (*fsConfigWatcher, error) {
 	fsWatcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
@@ -137,6 +143,7 @@ func newFSWatcher(ctx context.Context, configPath string, logger golog.Logger) (
 			case event := <-fsWatcher.Events:
 				if event.Op&fsnotify.Write == fsnotify.Write {
 					debounced(func() {
+						logger.Info("On-disk config file changed. Reloading the config file.")
 						//nolint:gosec
 						rd, err := os.ReadFile(configPath)
 						if err != nil {
@@ -152,6 +159,7 @@ func newFSWatcher(ctx context.Context, configPath string, logger golog.Logger) (
 							logger.Errorw("error reading config after write", "error", err)
 							return
 						}
+						UpdateFileConfigDebug(newConfig.Debug)
 						select {
 						case <-cancelCtx.Done():
 							return

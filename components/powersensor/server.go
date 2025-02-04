@@ -6,6 +6,7 @@ import (
 	commonpb "go.viam.com/api/common/v1"
 	pb "go.viam.com/api/component/powersensor/v1"
 
+	"go.viam.com/rdk/components/sensor"
 	"go.viam.com/rdk/protoutils"
 	"go.viam.com/rdk/resource"
 )
@@ -18,6 +19,29 @@ type serviceServer struct {
 // NewRPCServiceServer constructs a PowerSesnsor gRPC service serviceServer.
 func NewRPCServiceServer(coll resource.APIResourceCollection[PowerSensor]) interface{} {
 	return &serviceServer{coll: coll}
+}
+
+// GetReadings returns the most recent readings from the given Sensor.
+func (s *serviceServer) GetReadings(
+	ctx context.Context,
+	req *commonpb.GetReadingsRequest,
+) (*commonpb.GetReadingsResponse, error) {
+	sensorDevice, err := s.coll.Resource(req.Name)
+	if err != nil {
+		return nil, err
+	}
+	readings, err := sensorDevice.Readings(ctx, req.Extra.AsMap())
+	if err != nil {
+		return nil, err
+	}
+	if readings == nil {
+		return nil, sensor.ErrReadingsNil("power-sensor", req.Name)
+	}
+	m, err := protoutils.ReadingGoToProto(readings)
+	if err != nil {
+		return nil, err
+	}
+	return &commonpb.GetReadingsResponse{Readings: m}, nil
 }
 
 func (s *serviceServer) GetVoltage(

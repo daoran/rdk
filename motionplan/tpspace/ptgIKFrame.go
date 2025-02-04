@@ -7,24 +7,19 @@ import (
 	pb "go.viam.com/api/component/arm/v1"
 
 	"go.viam.com/rdk/referenceframe"
+	"go.viam.com/rdk/spatialmath"
 )
 
-// ptgFrame wraps a tpspace.PrecomputePTG so that it fills the Frame interface and can be used by IK.
+// ptgFrame wraps a tpspace.PTG so that it fills the Frame interface and can be used by IK.
 type ptgIKFrame struct {
-	PrecomputePTG
+	PTG
 	limits []referenceframe.Limit
 }
 
 // NewPTGIKFrame will create a new frame intended to be passed to an Inverse Kinematics solver, allowing IK to solve for parameters
 // for the passed in PTG.
-func newPTGIKFrame(ptg PrecomputePTG, dist float64) referenceframe.Frame {
-	pf := &ptgIKFrame{PrecomputePTG: ptg}
-
-	pf.limits = []referenceframe.Limit{
-		{Min: -math.Pi, Max: math.Pi},
-		{Min: 0, Max: dist},
-	}
-	return pf
+func newPTGIKFrame(ptg PTG, limits []referenceframe.Limit) referenceframe.Frame {
+	return &ptgIKFrame{PTG: ptg, limits: limits}
 }
 
 func (pf *ptgIKFrame) DoF() []referenceframe.Limit {
@@ -57,4 +52,29 @@ func (pf *ptgIKFrame) ProtobufFromInput(input []referenceframe.Input) *pb.JointP
 
 func (pf *ptgIKFrame) Geometries(inputs []referenceframe.Input) (*referenceframe.GeometriesInFrame, error) {
 	return nil, errors.New("geometries not implemented for ptg IK frame")
+}
+
+func (pf *ptgIKFrame) Transform(inputs []referenceframe.Input) (spatialmath.Pose, error) {
+	if len(inputs) != len(pf.DoF()) && len(inputs) != 2 {
+		// We also want to always support 2 inputs
+		return nil, referenceframe.NewIncorrectDoFError(len(inputs), len(pf.DoF()))
+	}
+	p1 := spatialmath.NewZeroPose()
+	for i := 0; i < len(inputs); i += 2 {
+		dist := math.Abs(inputs[i+1].Value)
+		p2, err := pf.PTG.Transform([]referenceframe.Input{inputs[i], {dist}})
+		if err != nil {
+			return nil, err
+		}
+		p1 = spatialmath.Compose(p1, p2)
+	}
+	return p1, nil
+}
+
+func (pf *ptgIKFrame) Interpolate(from, to []referenceframe.Input, by float64) ([]referenceframe.Input, error) {
+	// PTG IK frames are private and are not possible to surface outside of this package aside from how they are explicitly used within
+	// the package, so this is not necessary to implement.
+	// Furthermore, the multi-trajectory nature of these frames makes correct interpolation difficult. To avoid bad data, this should
+	// not be implemented until/unless it is guided by a specific need.
+	return nil, errors.New("cannot interpolate ptg IK frames")
 }

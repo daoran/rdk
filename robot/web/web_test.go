@@ -12,18 +12,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/golang-jwt/jwt/v4"
 	"github.com/golang/geo/r3"
 	"github.com/google/uuid"
 	"github.com/jhump/protoreflect/grpcreflect"
 	"github.com/lestrrat-go/jwx/jwk"
-	"github.com/viamrobotics/gostream/codec/x264"
-	streampb "github.com/viamrobotics/gostream/proto/stream/v1"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	echopb "go.viam.com/api/component/testecho/v1"
 	robotpb "go.viam.com/api/robot/v1"
+	streampb "go.viam.com/api/stream/v1"
 	"go.viam.com/test"
+	"go.viam.com/utils"
 	"go.viam.com/utils/rpc"
 	"go.viam.com/utils/testutils"
 	"google.golang.org/grpc"
@@ -36,7 +35,11 @@ import (
 	"go.viam.com/rdk/components/camera"
 	"go.viam.com/rdk/config"
 	gizmopb "go.viam.com/rdk/examples/customresources/apis/proto/api/component/gizmo/v1"
+	"go.viam.com/rdk/gostream"
+	"go.viam.com/rdk/gostream/codec/opus"
+	"go.viam.com/rdk/gostream/codec/x264"
 	rgrpc "go.viam.com/rdk/grpc"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/robot"
 	"go.viam.com/rdk/robot/framesystem"
@@ -55,7 +58,7 @@ var resources = []resource.Name{arm.Named(arm1String)}
 var pos = spatialmath.NewPoseFromPoint(r3.Vector{X: 1, Y: 2, Z: 3})
 
 func TestWebStart(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	ctx, injectRobot := setupRobotCtx(t)
 
 	svc := web.New(injectRobot, logger)
@@ -84,7 +87,7 @@ func TestWebStart(t *testing.T) {
 }
 
 func TestModule(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	ctx, injectRobot := setupRobotCtx(t)
 
 	svc := web.New(injectRobot, logger)
@@ -139,7 +142,7 @@ func TestModule(t *testing.T) {
 }
 
 func TestWebStartOptions(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	ctx, injectRobot := setupRobotCtx(t)
 
 	svc := web.New(injectRobot, logger)
@@ -170,7 +173,7 @@ func TestWebStartOptions(t *testing.T) {
 }
 
 func TestWebWithAuth(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	ctx, injectRobot := setupRobotCtx(t)
 
 	for _, tc := range []struct {
@@ -199,13 +202,18 @@ func TestWebWithAuth(t *testing.T) {
 			options.Managed = tc.Managed
 			options.FQDN = tc.EntityName
 			options.LocalFQDN = primitive.NewObjectID().Hex()
-			apiKey := "sosecret"
+			apiKeyID1 := uuid.New().String()
+			apiKey1 := utils.RandomAlphaString(32)
+			apiKeyID2 := uuid.New().String()
+			apiKey2 := utils.RandomAlphaString(32)
 			locationSecrets := []string{"locsosecret", "locsec2"}
 			options.Auth.Handlers = []config.AuthHandlerConfig{
 				{
 					Type: rpc.CredentialsTypeAPIKey,
 					Config: rutils.AttributeMap{
-						"key": apiKey,
+						apiKeyID1: apiKey1,
+						apiKeyID2: apiKey2,
+						"keys":    []string{apiKeyID1, apiKeyID2},
 					},
 				},
 				{
@@ -232,16 +240,16 @@ func TestWebWithAuth(t *testing.T) {
 
 			if tc.Managed {
 				_, err = rgrpc.Dial(context.Background(), addr, logger, rpc.WithAllowInsecureWithCredentialsDowngrade(),
-					rpc.WithEntityCredentials("wrong", rpc.Credentials{
+					rutils.WithEntityCredentials("wrong", rpc.Credentials{
 						Type:    rpc.CredentialsTypeAPIKey,
-						Payload: apiKey,
+						Payload: apiKey1,
 					}))
 				test.That(t, err, test.ShouldNotBeNil)
 				test.That(t, err.Error(), test.ShouldContainSubstring, "invalid credentials")
 
 				_, err = rgrpc.Dial(context.Background(), addr, logger,
 					rpc.WithAllowInsecureWithCredentialsDowngrade(),
-					rpc.WithEntityCredentials("wrong", rpc.Credentials{
+					rutils.WithEntityCredentials("wrong", rpc.Credentials{
 						Type:    rutils.CredentialsTypeRobotLocationSecret,
 						Payload: locationSecrets[0],
 					}),
@@ -254,12 +262,15 @@ func TestWebWithAuth(t *testing.T) {
 					entityName = options.LocalFQDN
 				}
 
+				// TODO(RSDK-4473) Reenable WebRTC when we figure out why multiple
+				// WebRTC connections across unix sockets can create deadlock in CI.
 				conn, err := rgrpc.Dial(context.Background(), addr, logger,
 					rpc.WithAllowInsecureWithCredentialsDowngrade(),
-					rpc.WithEntityCredentials(entityName, rpc.Credentials{
+					rpc.WithEntityCredentials(apiKeyID1, rpc.Credentials{
 						Type:    rpc.CredentialsTypeAPIKey,
-						Payload: apiKey,
+						Payload: apiKey1,
 					}),
+					rpc.WithForceDirectGRPC(),
 				)
 				test.That(t, err, test.ShouldBeNil)
 				arm1, err := arm.NewClientFromConn(context.Background(), conn, "", arm.Named(arm1String), logger)
@@ -272,12 +283,71 @@ func TestWebWithAuth(t *testing.T) {
 				test.That(t, arm1.Close(context.Background()), test.ShouldBeNil)
 				test.That(t, conn.Close(), test.ShouldBeNil)
 
+				// TODO(RSDK-4473) Reenable WebRTC when we figure out why multiple
+				// WebRTC connections across unix sockets can create deadlock in CI.
 				conn, err = rgrpc.Dial(context.Background(), addr, logger,
 					rpc.WithAllowInsecureWithCredentialsDowngrade(),
 					rpc.WithEntityCredentials(entityName, rpc.Credentials{
 						Type:    rutils.CredentialsTypeRobotLocationSecret,
 						Payload: locationSecrets[0],
 					}),
+					rpc.WithForceDirectGRPC(),
+				)
+				test.That(t, err, test.ShouldBeNil)
+				arm1, err = arm.NewClientFromConn(context.Background(), conn, "", arm.Named(arm1String), logger)
+				test.That(t, err, test.ShouldBeNil)
+
+				arm1Position, err = arm1.EndPosition(ctx, nil)
+				test.That(t, err, test.ShouldBeNil)
+				test.That(t, arm1Position, test.ShouldResemble, pos)
+
+				test.That(t, arm1.Close(context.Background()), test.ShouldBeNil)
+				test.That(t, conn.Close(), test.ShouldBeNil)
+
+				// TODO(RSDK-4473) Reenable WebRTC when we figure out why multiple
+				// WebRTC connections across unix sockets can create deadlock in CI.
+				conn, err = rgrpc.Dial(context.Background(), addr, logger,
+					rpc.WithAllowInsecureWithCredentialsDowngrade(),
+					rpc.WithEntityCredentials(entityName, rpc.Credentials{
+						Type:    rutils.CredentialsTypeRobotLocationSecret,
+						Payload: locationSecrets[1],
+					}),
+					rpc.WithForceDirectGRPC(),
+				)
+				test.That(t, err, test.ShouldBeNil)
+				arm1, err = arm.NewClientFromConn(context.Background(), conn, "", arm.Named(arm1String), logger)
+				test.That(t, err, test.ShouldBeNil)
+
+				arm1Position, err = arm1.EndPosition(ctx, nil)
+				test.That(t, err, test.ShouldBeNil)
+				test.That(t, arm1Position, test.ShouldResemble, pos)
+
+				test.That(t, arm1.Close(context.Background()), test.ShouldBeNil)
+				test.That(t, conn.Close(), test.ShouldBeNil)
+
+				_, err = rgrpc.Dial(context.Background(), addr, logger, rpc.WithAllowInsecureWithCredentialsDowngrade(),
+					rpc.WithEntityCredentials(apiKeyID1, rpc.Credentials{
+						Type:    rpc.CredentialsTypeAPIKey,
+						Payload: apiKey2,
+					}))
+				test.That(t, err, test.ShouldNotBeNil)
+				test.That(t, err.Error(), test.ShouldContainSubstring, "invalid credentials")
+
+				_, err = rgrpc.Dial(context.Background(), addr, logger, rpc.WithAllowInsecureWithCredentialsDowngrade(),
+					rpc.WithEntityCredentials(entityName, rpc.Credentials{
+						Type:    rpc.CredentialsTypeAPIKey,
+						Payload: apiKey1,
+					}))
+				test.That(t, err, test.ShouldNotBeNil)
+				test.That(t, err.Error(), test.ShouldContainSubstring, "invalid credentials")
+
+				conn, err = rgrpc.Dial(context.Background(), addr, logger,
+					rpc.WithAllowInsecureWithCredentialsDowngrade(),
+					rpc.WithEntityCredentials(apiKeyID1, rpc.Credentials{
+						Type:    rpc.CredentialsTypeAPIKey,
+						Payload: apiKey1,
+					}),
+					rpc.WithForceDirectGRPC(),
 				)
 				test.That(t, err, test.ShouldBeNil)
 				arm1, err = arm.NewClientFromConn(context.Background(), conn, "", arm.Named(arm1String), logger)
@@ -292,10 +362,11 @@ func TestWebWithAuth(t *testing.T) {
 
 				conn, err = rgrpc.Dial(context.Background(), addr, logger,
 					rpc.WithAllowInsecureWithCredentialsDowngrade(),
-					rpc.WithEntityCredentials(entityName, rpc.Credentials{
-						Type:    rutils.CredentialsTypeRobotLocationSecret,
-						Payload: locationSecrets[1],
+					rpc.WithEntityCredentials(apiKeyID2, rpc.Credentials{
+						Type:    rpc.CredentialsTypeAPIKey,
+						Payload: apiKey2,
 					}),
+					rpc.WithForceDirectGRPC(),
 				)
 				test.That(t, err, test.ShouldBeNil)
 				arm1, err = arm.NewClientFromConn(context.Background(), conn, "", arm.Named(arm1String), logger)
@@ -318,21 +389,27 @@ func TestWebWithAuth(t *testing.T) {
 							"key-id-1",
 						)
 						test.That(t, err, test.ShouldBeNil)
+						// TODO(RSDK-4473) Reenable WebRTC when we figure out why multiple
+						// WebRTC connections across unix sockets can create deadlock in CI.
 						conn, err = rgrpc.Dial(context.Background(), addr, logger,
 							rpc.WithAllowInsecureWithCredentialsDowngrade(),
 							rpc.WithStaticAuthenticationMaterial(accessToken),
+							rpc.WithForceDirectGRPC(),
 						)
 						test.That(t, err, test.ShouldBeNil)
 						test.That(t, conn.Close(), test.ShouldBeNil)
 					})
 				}
 			} else {
+				// TODO(RSDK-4473) Reenable WebRTC when we figure out why multiple
+				// WebRTC connections across unix sockets can create deadlock in CI.
 				conn, err := rgrpc.Dial(context.Background(), addr, logger,
 					rpc.WithAllowInsecureWithCredentialsDowngrade(),
-					rpc.WithCredentials(rpc.Credentials{
+					rpc.WithEntityCredentials(apiKeyID1, rpc.Credentials{
 						Type:    rpc.CredentialsTypeAPIKey,
-						Payload: apiKey,
+						Payload: apiKey1,
 					}),
+					rpc.WithForceDirectGRPC(),
 				)
 				test.That(t, err, test.ShouldBeNil)
 
@@ -346,12 +423,15 @@ func TestWebWithAuth(t *testing.T) {
 				test.That(t, arm1.Close(context.Background()), test.ShouldBeNil)
 				test.That(t, conn.Close(), test.ShouldBeNil)
 
+				// TODO(RSDK-4473) Reenable WebRTC when we figure out why multiple
+				// WebRTC connections across unix sockets can create deadlock in CI.
 				conn, err = rgrpc.Dial(context.Background(), addr, logger,
 					rpc.WithAllowInsecureWithCredentialsDowngrade(),
 					rpc.WithCredentials(rpc.Credentials{
 						Type:    rutils.CredentialsTypeRobotLocationSecret,
 						Payload: locationSecrets[0],
 					}),
+					rpc.WithForceDirectGRPC(),
 				)
 				test.That(t, err, test.ShouldBeNil)
 
@@ -373,7 +453,7 @@ func TestWebWithAuth(t *testing.T) {
 }
 
 func TestWebWithTLSAuth(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	ctx, injectRobot := setupRobotCtx(t)
 
 	svc := web.New(injectRobot, logger)
@@ -428,7 +508,7 @@ func TestWebWithTLSAuth(t *testing.T) {
 
 	_, err = rgrpc.Dial(context.Background(), addr, logger,
 		rpc.WithTLSConfig(clientTLSConfig),
-		rpc.WithEntityCredentials("wrong", rpc.Credentials{
+		rutils.WithEntityCredentials("wrong", rpc.Credentials{
 			Type:    rutils.CredentialsTypeRobotLocationSecret,
 			Payload: locationSecret,
 		}),
@@ -439,7 +519,7 @@ func TestWebWithTLSAuth(t *testing.T) {
 	// use secret
 	conn, err := rgrpc.Dial(context.Background(), addr, logger,
 		rpc.WithTLSConfig(clientTLSConfig),
-		rpc.WithEntityCredentials(options.FQDN, rpc.Credentials{
+		rutils.WithEntityCredentials(options.FQDN, rpc.Credentials{
 			Type:    rutils.CredentialsTypeRobotLocationSecret,
 			Payload: locationSecret,
 		}),
@@ -537,7 +617,7 @@ func TestWebWithTLSAuth(t *testing.T) {
 }
 
 func TestWebWithBadAuthHandlers(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	ctx, injectRobot := setupRobotCtx(t)
 
 	svc := web.New(injectRobot, logger)
@@ -571,8 +651,91 @@ func TestWebWithBadAuthHandlers(t *testing.T) {
 	test.That(t, svc.Close(context.Background()), test.ShouldBeNil)
 }
 
+func TestWebWithOnlyNewAPIKeyAuthHandlers(t *testing.T) {
+	logger := logging.NewTestLogger(t)
+	ctx, injectRobot := setupRobotCtx(t)
+
+	svc := web.New(injectRobot, logger)
+
+	options, _, addr := robottestutils.CreateBaseOptionsAndListener(t)
+	apiKeyID1 := uuid.New().String()
+	apiKey1 := utils.RandomAlphaString(32)
+	apiKeyID2 := uuid.New().String()
+	apiKey2 := utils.RandomAlphaString(32)
+	options.Auth.Handlers = []config.AuthHandlerConfig{
+		{
+			Type: rpc.CredentialsTypeAPIKey,
+			Config: rutils.AttributeMap{
+				apiKeyID1: apiKey1,
+				apiKeyID2: apiKey2,
+				"keys":    []string{apiKeyID1, apiKeyID2},
+			},
+		},
+	}
+
+	err := svc.Start(ctx, options)
+	test.That(t, err, test.ShouldBeNil)
+
+	_, err = rgrpc.Dial(context.Background(), addr, logger, rpc.WithAllowInsecureWithCredentialsDowngrade(),
+		rpc.WithEntityCredentials(apiKeyID1, rpc.Credentials{
+			Type:    rpc.CredentialsTypeAPIKey,
+			Payload: apiKey2,
+		}))
+	test.That(t, err, test.ShouldNotBeNil)
+	test.That(t, err.Error(), test.ShouldContainSubstring, "invalid credentials")
+
+	_, err = rgrpc.Dial(context.Background(), addr, logger, rpc.WithAllowInsecureWithCredentialsDowngrade(),
+		rpc.WithEntityCredentials("something-different", rpc.Credentials{
+			Type:    rpc.CredentialsTypeAPIKey,
+			Payload: apiKey1,
+		}))
+	test.That(t, err, test.ShouldNotBeNil)
+	test.That(t, err.Error(), test.ShouldContainSubstring, "invalid credentials")
+
+	conn, err := rgrpc.Dial(context.Background(), addr, logger,
+		rpc.WithAllowInsecureWithCredentialsDowngrade(),
+		rpc.WithEntityCredentials(apiKeyID1, rpc.Credentials{
+			Type:    rpc.CredentialsTypeAPIKey,
+			Payload: apiKey1,
+		}),
+		rpc.WithForceDirectGRPC(),
+	)
+	test.That(t, err, test.ShouldBeNil)
+	arm1, err := arm.NewClientFromConn(context.Background(), conn, "", arm.Named(arm1String), logger)
+	test.That(t, err, test.ShouldBeNil)
+
+	arm1Position, err := arm1.EndPosition(ctx, nil)
+	test.That(t, err, test.ShouldBeNil)
+	test.That(t, arm1Position, test.ShouldResemble, pos)
+
+	test.That(t, arm1.Close(context.Background()), test.ShouldBeNil)
+	test.That(t, conn.Close(), test.ShouldBeNil)
+
+	conn, err = rgrpc.Dial(context.Background(), addr, logger,
+		rpc.WithAllowInsecureWithCredentialsDowngrade(),
+		rpc.WithEntityCredentials(apiKeyID2, rpc.Credentials{
+			Type:    rpc.CredentialsTypeAPIKey,
+			Payload: apiKey2,
+		}),
+		rpc.WithForceDirectGRPC(),
+	)
+	test.That(t, err, test.ShouldBeNil)
+	arm1, err = arm.NewClientFromConn(context.Background(), conn, "", arm.Named(arm1String), logger)
+	test.That(t, err, test.ShouldBeNil)
+
+	arm1Position, err = arm1.EndPosition(ctx, nil)
+	test.That(t, err, test.ShouldBeNil)
+	test.That(t, arm1Position, test.ShouldResemble, pos)
+
+	test.That(t, arm1.Close(context.Background()), test.ShouldBeNil)
+	test.That(t, conn.Close(), test.ShouldBeNil)
+
+	test.That(t, svc.Close(context.Background()), test.ShouldBeNil)
+}
+
 func TestWebReconfigure(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
+	// robot is configured with an arm
 	ctx, robot := setupRobotCtx(t)
 
 	svc := web.New(robot, logger)
@@ -580,19 +743,27 @@ func TestWebReconfigure(t *testing.T) {
 	options, _, addr := robottestutils.CreateBaseOptionsAndListener(t)
 	err := svc.Start(ctx, options)
 	test.That(t, err, test.ShouldBeNil)
+	t.Cleanup(func() {
+		test.That(t, svc.Close(ctx), test.ShouldBeNil)
+	})
 
 	conn, err := rgrpc.Dial(context.Background(), addr, logger)
 	test.That(t, err, test.ShouldBeNil)
+	t.Cleanup(func() {
+		test.That(t, conn.Close(), test.ShouldBeNil)
+	})
 
-	arm1, err := arm.NewClientFromConn(context.Background(), conn, "", arm.Named(arm1String), logger)
+	aClient, err := arm.NewClientFromConn(context.Background(), conn, "", arm.Named(arm1String), logger)
 	test.That(t, err, test.ShouldBeNil)
+	t.Cleanup(func() {
+		test.That(t, aClient.Close(ctx), test.ShouldBeNil)
+	})
 
-	arm1Position, err := arm1.EndPosition(ctx, nil)
+	arm1Position, err := aClient.EndPosition(ctx, nil)
 	test.That(t, err, test.ShouldBeNil)
 	test.That(t, arm1Position, test.ShouldResemble, pos)
-	test.That(t, conn.Close(), test.ShouldBeNil)
 
-	// add arm to robot and then update
+	// replace the arm in the robot and then reconfigure web service
 	injectArm := &inject.Arm{}
 	newPos := spatialmath.NewPoseFromPoint(r3.Vector{X: 1, Y: 3, Z: 6})
 	injectArm.EndPositionFunc = func(ctx context.Context, extra map[string]interface{}) (spatialmath.Pose, error) {
@@ -602,50 +773,9 @@ func TestWebReconfigure(t *testing.T) {
 	err = svc.Reconfigure(context.Background(), rs, resource.Config{})
 	test.That(t, err, test.ShouldBeNil)
 
-	conn, err = rgrpc.Dial(context.Background(), addr, logger)
-	test.That(t, err, test.ShouldBeNil)
-	aClient, err := arm.NewClientFromConn(context.Background(), conn, "", arm.Named(arm1String), logger)
+	aClient, err = arm.NewClientFromConn(context.Background(), conn, "", arm.Named(arm1String), logger)
 	test.That(t, err, test.ShouldBeNil)
 	position, err := aClient.EndPosition(context.Background(), nil)
-	test.That(t, err, test.ShouldBeNil)
-	test.That(t, position, test.ShouldResemble, newPos)
-
-	test.That(t, arm1.Close(context.Background()), test.ShouldBeNil)
-	test.That(t, svc.Close(context.Background()), test.ShouldBeNil)
-	test.That(t, aClient.Close(context.Background()), test.ShouldBeNil)
-
-	// now start it with the arm already in it
-	ctx, robot2 := setupRobotCtx(t)
-	robot2.(*inject.Robot).ResourceNamesFunc = func() []resource.Name { return resources }
-	robot2.(*inject.Robot).ResourceByNameFunc = func(name resource.Name) (resource.Resource, error) {
-		return injectArm, nil
-	}
-
-	svc2 := web.New(robot2, logger)
-
-	listener := testutils.ReserveRandomListener(t)
-	addr = listener.Addr().String()
-	options.Network.Listener = listener
-
-	err = svc2.Start(ctx, options)
-	test.That(t, err, test.ShouldBeNil)
-
-	conn, err = rgrpc.Dial(context.Background(), addr, logger)
-	test.That(t, err, test.ShouldBeNil)
-
-	arm1, err = arm.NewClientFromConn(context.Background(), conn, "", arm.Named(arm1String), logger)
-	test.That(t, err, test.ShouldBeNil)
-
-	arm1Position, err = arm1.EndPosition(ctx, nil)
-	test.That(t, err, test.ShouldBeNil)
-	test.That(t, arm1Position, test.ShouldResemble, newPos)
-
-	conn, err = rgrpc.Dial(context.Background(), addr, logger)
-	test.That(t, err, test.ShouldBeNil)
-	aClient2, err := arm.NewClientFromConn(context.Background(), conn, "", arm.Named(arm1String), logger)
-	test.That(t, err, test.ShouldBeNil)
-	test.That(t, err, test.ShouldBeNil)
-	position, err = aClient2.EndPosition(context.Background(), nil)
 	test.That(t, err, test.ShouldBeNil)
 	test.That(t, position, test.ShouldResemble, newPos)
 
@@ -657,23 +787,30 @@ func TestWebReconfigure(t *testing.T) {
 		return pos2, nil
 	}
 	rs[arm.Named(arm2)] = injectArm2
-	err = svc2.Reconfigure(context.Background(), rs, resource.Config{})
+	err = svc.Reconfigure(context.Background(), rs, resource.Config{})
 	test.That(t, err, test.ShouldBeNil)
+
+	aClient2, err := arm.NewClientFromConn(context.Background(), conn, "", arm.Named(arm2), logger)
+	test.That(t, err, test.ShouldBeNil)
+	t.Cleanup(func() {
+		test.That(t, aClient2.Close(ctx), test.ShouldBeNil)
+	})
 
 	position, err = aClient2.EndPosition(context.Background(), nil)
 	test.That(t, err, test.ShouldBeNil)
-	test.That(t, position, test.ShouldResemble, newPos)
-
-	aClient3, err := arm.NewClientFromConn(context.Background(), conn, "", arm.Named(arm2), logger)
-	test.That(t, err, test.ShouldBeNil)
-	test.That(t, err, test.ShouldBeNil)
-	position, err = aClient3.EndPosition(context.Background(), nil)
-	test.That(t, err, test.ShouldBeNil)
 	test.That(t, position, test.ShouldResemble, pos2)
 
-	test.That(t, arm1.Close(context.Background()), test.ShouldBeNil)
-	test.That(t, svc2.Close(context.Background()), test.ShouldBeNil)
-	test.That(t, conn.Close(), test.ShouldBeNil)
+	// check that removing both arms means that neither arms are accessible
+	err = svc.Reconfigure(context.Background(), make(map[resource.Name]resource.Resource), resource.Config{})
+	test.That(t, err, test.ShouldBeNil)
+
+	_, err = aClient.EndPosition(context.Background(), nil)
+	test.That(t, err, test.ShouldNotBeNil)
+	test.That(t, err.Error(), test.ShouldContainSubstring, "resource \"rdk:component:arm/arm1\" not found")
+
+	_, err = aClient2.EndPosition(context.Background(), nil)
+	test.That(t, err, test.ShouldNotBeNil)
+	test.That(t, err.Error(), test.ShouldContainSubstring, "resource \"rdk:component:arm/arm2\" not found")
 }
 
 func TestWebWithStreams(t *testing.T) {
@@ -685,17 +822,23 @@ func TestWebWithStreams(t *testing.T) {
 
 	// Start a robot with a camera
 	robot := &inject.Robot{}
-	cam1 := &inject.Camera{}
-	rs := map[resource.Name]resource.Resource{camera.Named(camera1Key): cam1}
+	cam1 := inject.NewCamera(camera1Key)
+	cam1.PropertiesFunc = func(ctx context.Context) (camera.Properties, error) {
+		return camera.Properties{}, nil
+	}
+	rs := map[resource.Name]resource.Resource{cam1.Name(): cam1}
 	robot.MockResourcesFromMap(rs)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Start service
-	logger := golog.NewTestLogger(t)
-	robot.LoggerFunc = func() golog.Logger { return logger }
+	logger := logging.NewTestLogger(t)
+	robot.LoggerFunc = func() logging.Logger { return logger }
 	options, _, addr := robottestutils.CreateBaseOptionsAndListener(t)
-	svc := web.New(robot, logger, web.WithStreamConfig(x264.DefaultStreamConfig))
+	svc := web.New(robot, logger, web.WithStreamConfig(gostream.StreamConfig{
+		AudioEncoderFactory: opus.NewEncoderFactory(),
+		VideoEncoderFactory: x264.NewEncoderFactory(),
+	}))
 	err := svc.Start(ctx, options)
 	test.That(t, err, test.ShouldBeNil)
 
@@ -711,15 +854,22 @@ func TestWebWithStreams(t *testing.T) {
 	test.That(t, resp.Names, test.ShouldHaveLength, 1)
 
 	// Add another camera and update
-	cam2 := &inject.Camera{}
-	rs[camera.Named(camera2Key)] = cam2
+	cam2 := inject.NewCamera(camera2Key)
+	cam2.PropertiesFunc = func(ctx context.Context) (camera.Properties, error) {
+		return camera.Properties{}, nil
+	}
+	robot.Mu.Lock()
+	rs[cam2.Name()] = cam2
+	robot.Mu.Unlock()
 	robot.MockResourcesFromMap(rs)
 	err = svc.Reconfigure(context.Background(), rs, resource.Config{})
 	test.That(t, err, test.ShouldBeNil)
 
 	// Add an audio stream
 	audio := &inject.AudioInput{}
+	robot.Mu.Lock()
 	rs[audioinput.Named(audioKey)] = audio
+	robot.Mu.Unlock()
 	robot.MockResourcesFromMap(rs)
 	err = svc.Reconfigure(context.Background(), rs, resource.Config{})
 	test.That(t, err, test.ShouldBeNil)
@@ -735,6 +885,7 @@ func TestWebWithStreams(t *testing.T) {
 	cancel()
 	test.That(t, svc.Close(ctx), test.ShouldBeNil)
 	test.That(t, conn.Close(), test.ShouldBeNil)
+	<-ctx.Done()
 }
 
 func TestWebAddFirstStream(t *testing.T) {
@@ -750,8 +901,8 @@ func TestWebAddFirstStream(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Start service
-	logger := golog.NewTestLogger(t)
-	robot.LoggerFunc = func() golog.Logger { return logger }
+	logger := logging.NewTestLogger(t)
+	robot.LoggerFunc = func() logging.Logger { return logger }
 	options, _, addr := robottestutils.CreateBaseOptionsAndListener(t)
 	svc := web.New(robot, logger, web.WithStreamConfig(x264.DefaultStreamConfig))
 	err := svc.Start(ctx, options)
@@ -768,8 +919,13 @@ func TestWebAddFirstStream(t *testing.T) {
 	test.That(t, resp.Names, test.ShouldHaveLength, 0)
 
 	// Add first camera and update
-	cam1 := &inject.Camera{}
-	rs[camera.Named(camera1Key)] = cam1
+	cam1 := inject.NewCamera(camera1Key)
+	cam1.PropertiesFunc = func(ctx context.Context) (camera.Properties, error) {
+		return camera.Properties{}, nil
+	}
+	robot.Mu.Lock()
+	rs[cam1.Name()] = cam1
+	robot.Mu.Unlock()
 	robot.MockResourcesFromMap(rs)
 	err = svc.Reconfigure(ctx, rs, resource.Config{})
 	test.That(t, err, test.ShouldBeNil)
@@ -784,6 +940,7 @@ func TestWebAddFirstStream(t *testing.T) {
 	cancel()
 	test.That(t, svc.Close(ctx), test.ShouldBeNil)
 	test.That(t, conn.Close(), test.ShouldBeNil)
+	<-ctx.Done()
 }
 
 func TestWebStreamImmediateClose(t *testing.T) {
@@ -791,15 +948,19 @@ func TestWebStreamImmediateClose(t *testing.T) {
 
 	// Start a robot with a camera
 	robot := &inject.Robot{}
-	cam1 := &inject.Camera{}
+	cam1 := &inject.Camera{
+		PropertiesFunc: func(ctx context.Context) (camera.Properties, error) {
+			return camera.Properties{}, nil
+		},
+	}
 	rs := map[resource.Name]resource.Resource{camera.Named("camera1"): cam1}
 	robot.MockResourcesFromMap(rs)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Start service
-	logger := golog.NewTestLogger(t)
-	robot.LoggerFunc = func() golog.Logger { return logger }
+	logger := logging.NewTestLogger(t)
+	robot.LoggerFunc = func() logging.Logger { return logger }
 	options, _, _ := robottestutils.CreateBaseOptionsAndListener(t)
 	svc := web.New(robot, logger, web.WithStreamConfig(x264.DefaultStreamConfig))
 	err := svc.Start(ctx, options)
@@ -808,6 +969,7 @@ func TestWebStreamImmediateClose(t *testing.T) {
 	// Immediately Close service.
 	cancel()
 	test.That(t, svc.Close(ctx), test.ShouldBeNil)
+	<-ctx.Done()
 }
 
 func setupRobotCtx(t *testing.T) (context.Context, robot.Robot) {
@@ -824,7 +986,7 @@ func setupRobotCtx(t *testing.T) (context.Context, robot.Robot) {
 	injectRobot.ResourceByNameFunc = func(name resource.Name) (resource.Resource, error) {
 		return injectArm, nil
 	}
-	injectRobot.LoggerFunc = func() golog.Logger { return golog.NewTestLogger(t) }
+	injectRobot.LoggerFunc = func() logging.Logger { return logging.NewTestLogger(t) }
 	injectRobot.FrameSystemConfigFunc = func(ctx context.Context) (*framesystem.Config, error) {
 		return &framesystem.Config{}, nil
 	}
@@ -833,7 +995,7 @@ func setupRobotCtx(t *testing.T) (context.Context, robot.Robot) {
 }
 
 func TestForeignResource(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	ctx, robot := setupRobotCtx(t)
 
 	svc := web.New(robot, logger)
@@ -842,7 +1004,9 @@ func TestForeignResource(t *testing.T) {
 	err := svc.Start(ctx, options)
 	test.That(t, err, test.ShouldBeNil)
 
-	conn, err := rgrpc.Dial(context.Background(), addr, logger)
+	// TODO(RSDK-4473) Reenable WebRTC when we figure out why multiple
+	// WebRTC connections across unix sockets can create deadlock in CI.
+	conn, err := rgrpc.Dial(context.Background(), addr, logger, rpc.WithForceDirectGRPC())
 	test.That(t, err, test.ShouldBeNil)
 
 	myCompClient := gizmopb.NewGizmoServiceClient(conn)
@@ -863,7 +1027,10 @@ func TestForeignResource(t *testing.T) {
 	go remoteServer.Serve(listenerR)
 	defer remoteServer.Stop()
 
-	remoteConn, err := rgrpc.Dial(context.Background(), listenerR.Addr().String(), logger)
+	// TODO(RSDK-4473) Reenable WebRTC when we figure out why multiple
+	// WebRTC connections across unix sockets can create deadlock in CI.
+	remoteConn, err := rgrpc.Dial(context.Background(), listenerR.Addr().String(),
+		logger, rpc.WithForceDirectGRPC())
 	test.That(t, err, test.ShouldBeNil)
 
 	resourceAPI := resource.NewAPI(
@@ -879,7 +1046,7 @@ func TestForeignResource(t *testing.T) {
 	test.That(t, err, test.ShouldBeNil)
 
 	injectRobot := &inject.Robot{}
-	injectRobot.LoggerFunc = func() golog.Logger { return logger }
+	injectRobot.LoggerFunc = func() logging.Logger { return logger }
 	injectRobot.ConfigFunc = func() *config.Config { return &config.Config{} }
 	injectRobot.ResourceNamesFunc = func() []resource.Name {
 		return []resource.Name{
@@ -893,12 +1060,13 @@ func TestForeignResource(t *testing.T) {
 	listener := testutils.ReserveRandomListener(t)
 	addr = listener.Addr().String()
 	options.Network.Listener = listener
-	options.Debug = true
 	svc = web.New(injectRobot, logger)
 	err = svc.Start(ctx, options)
 	test.That(t, err, test.ShouldBeNil)
 
-	conn, err = rgrpc.Dial(context.Background(), addr, logger, rpc.WithDialDebug())
+	// TODO(RSDK-4473) Reenable WebRTC when we figure out why multiple
+	// WebRTC connections across unix sockets can create deadlock in CI.
+	conn, err = rgrpc.Dial(context.Background(), addr, logger, rpc.WithForceDirectGRPC())
 	test.That(t, err, test.ShouldBeNil)
 
 	myCompClient = gizmopb.NewGizmoServiceClient(conn)
@@ -951,8 +1119,9 @@ func TestRawClientOperation(t *testing.T) {
 		RPCServiceHandler:           echopb.RegisterTestEchoServiceHandlerFromEndpoint,
 		RPCServiceDesc:              &echopb.TestEchoService_ServiceDesc,
 	})
+	defer resource.DeregisterAPI(echoAPI)
 
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	ctx, iRobot := setupRobotCtx(t)
 
 	svc := web.New(iRobot, logger)
@@ -961,8 +1130,8 @@ func TestRawClientOperation(t *testing.T) {
 	err := svc.Start(ctx, options)
 	test.That(t, err, test.ShouldBeNil)
 
-	iRobot.(*inject.Robot).StatusFunc = func(ctx context.Context, resourceNames []resource.Name) ([]robot.Status, error) {
-		return []robot.Status{}, nil
+	iRobot.(*inject.Robot).MachineStatusFunc = func(ctx context.Context) (robot.MachineStatus, error) {
+		return robot.MachineStatus{}, nil
 	}
 
 	checkOpID := func(md metadata.MD, expected bool) {
@@ -982,15 +1151,10 @@ func TestRawClientOperation(t *testing.T) {
 	client := robotpb.NewRobotServiceClient(conn)
 
 	var hdr metadata.MD
-	_, err = client.GetStatus(ctx, &robotpb.GetStatusRequest{}, grpc.Header(&hdr))
+	_, err = client.GetMachineStatus(ctx, &robotpb.GetMachineStatusRequest{}, grpc.Header(&hdr))
 	test.That(t, err, test.ShouldBeNil)
 	checkOpID(hdr, true)
 
-	streamClient, err := client.StreamStatus(ctx, &robotpb.StreamStatusRequest{})
-	test.That(t, err, test.ShouldBeNil)
-	md, err := streamClient.Header()
-	test.That(t, err, test.ShouldBeNil)
-	checkOpID(md, false) // StreamStatus is in the filtered method list, so doesn't get an opID
 	test.That(t, conn.Close(), test.ShouldBeNil)
 
 	// test with a simple echo proto as well
@@ -1006,7 +1170,7 @@ func TestRawClientOperation(t *testing.T) {
 
 	echoStreamClient, err := echoclient.EchoMultiple(ctx, &echopb.EchoMultipleRequest{})
 	test.That(t, err, test.ShouldBeNil)
-	md, err = echoStreamClient.Header()
+	md, err := echoStreamClient.Header()
 	test.That(t, err, test.ShouldBeNil)
 	checkOpID(md, true) // EchoMultiple is NOT filtered, so should have an opID
 	test.That(t, conn.Close(), test.ShouldBeNil)
@@ -1015,7 +1179,7 @@ func TestRawClientOperation(t *testing.T) {
 }
 
 func TestInboundMethodTimeout(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	ctx, iRobot := setupRobotCtx(t)
 
 	t.Run("web start", func(t *testing.T) {
@@ -1028,9 +1192,7 @@ func TestInboundMethodTimeout(t *testing.T) {
 
 			// Use an injected status function to check that the default deadline was added
 			// to the context.
-			iRobot.(*inject.Robot).StatusFunc = func(ctx context.Context,
-				resourceNames []resource.Name,
-			) ([]robot.Status, error) {
+			iRobot.(*inject.Robot).MachineStatusFunc = func(ctx context.Context) (robot.MachineStatus, error) {
 				deadline, deadlineSet := ctx.Deadline()
 				test.That(t, deadlineSet, test.ShouldBeTrue)
 				// Assert that deadline is between 9 and 10 minutes from now (some time will
@@ -1038,7 +1200,7 @@ func TestInboundMethodTimeout(t *testing.T) {
 				test.That(t, deadline, test.ShouldHappenBetween,
 					time.Now().Add(time.Minute*9), time.Now().Add(time.Minute*10))
 
-				return []robot.Status{}, nil
+				return robot.MachineStatus{}, nil
 			}
 
 			conn, err := rgrpc.Dial(context.Background(), addr, logger,
@@ -1046,8 +1208,8 @@ func TestInboundMethodTimeout(t *testing.T) {
 			test.That(t, err, test.ShouldBeNil)
 			client := robotpb.NewRobotServiceClient(conn)
 
-			// Use GetStatus to call injected status function.
-			_, err = client.GetStatus(ctx, &robotpb.GetStatusRequest{})
+			// Use GetMachineStatus to call injected status function.
+			_, err = client.GetMachineStatus(ctx, &robotpb.GetMachineStatusRequest{})
 			test.That(t, err, test.ShouldBeNil)
 
 			test.That(t, conn.Close(), test.ShouldBeNil)
@@ -1061,17 +1223,16 @@ func TestInboundMethodTimeout(t *testing.T) {
 			test.That(t, err, test.ShouldBeNil)
 
 			// Use an injected status function to check that the default deadline was not
-			// added to the context, and the deadline passed to GetStatus was used instead.
-			iRobot.(*inject.Robot).StatusFunc = func(ctx context.Context,
-				resourceNames []resource.Name,
-			) ([]robot.Status, error) {
+			// added to the context, and the deadline passed to GetMachineStatus was used instead.
+			iRobot.(*inject.Robot).MachineStatusFunc = func(ctx context.Context,
+			) (robot.MachineStatus, error) {
 				deadline, deadlineSet := ctx.Deadline()
 				test.That(t, deadlineSet, test.ShouldBeTrue)
 				// Assert that deadline is between 4 and 5 minutes from now (some time will
 				// have elapsed).
 				test.That(t, deadline, test.ShouldHappenBetween,
 					time.Now().Add(time.Minute*4), time.Now().Add(time.Minute*5))
-				return []robot.Status{}, nil
+				return robot.MachineStatus{}, nil
 			}
 
 			conn, err := rgrpc.Dial(context.Background(), addr, logger,
@@ -1079,10 +1240,10 @@ func TestInboundMethodTimeout(t *testing.T) {
 			test.That(t, err, test.ShouldBeNil)
 			client := robotpb.NewRobotServiceClient(conn)
 
-			// Use GetStatus and a context with a deadline to call injected status function.
+			// Use GetMachineStatus and a context with a deadline to call injected status function.
 			overrideCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
-			_, err = client.GetStatus(overrideCtx, &robotpb.GetStatusRequest{})
+			_, err = client.GetMachineStatus(overrideCtx, &robotpb.GetMachineStatusRequest{})
 			test.That(t, err, test.ShouldBeNil)
 
 			test.That(t, conn.Close(), test.ShouldBeNil)
@@ -1098,9 +1259,8 @@ func TestInboundMethodTimeout(t *testing.T) {
 
 			// Use an injected status function to check that the default deadline was added
 			// to the context.
-			iRobot.(*inject.Robot).StatusFunc = func(ctx context.Context,
-				resourceNames []resource.Name,
-			) ([]robot.Status, error) {
+			iRobot.(*inject.Robot).MachineStatusFunc = func(ctx context.Context,
+			) (robot.MachineStatus, error) {
 				deadline, deadlineSet := ctx.Deadline()
 				test.That(t, deadlineSet, test.ShouldBeTrue)
 				// Assert that deadline is between 9 and 10 minutes from now (some time will
@@ -1108,7 +1268,7 @@ func TestInboundMethodTimeout(t *testing.T) {
 				test.That(t, deadline, test.ShouldHappenBetween,
 					time.Now().Add(time.Minute*9), time.Now().Add(time.Minute*10))
 
-				return []robot.Status{}, nil
+				return robot.MachineStatus{}, nil
 			}
 
 			conn, err := rgrpc.Dial(context.Background(), "unix://"+svc.ModuleAddress(),
@@ -1116,8 +1276,8 @@ func TestInboundMethodTimeout(t *testing.T) {
 			test.That(t, err, test.ShouldBeNil)
 			client := robotpb.NewRobotServiceClient(conn)
 
-			// Use GetStatus to call injected status function.
-			_, err = client.GetStatus(ctx, &robotpb.GetStatusRequest{})
+			// Use GetMachineStatus to call injected status function.
+			_, err = client.GetMachineStatus(ctx, &robotpb.GetMachineStatusRequest{})
 			test.That(t, err, test.ShouldBeNil)
 
 			test.That(t, conn.Close(), test.ShouldBeNil)
@@ -1130,17 +1290,16 @@ func TestInboundMethodTimeout(t *testing.T) {
 			test.That(t, err, test.ShouldBeNil)
 
 			// Use an injected status function to check that the default deadline was not
-			// added to the context, and the deadline passed to GetStatus was used instead.
-			iRobot.(*inject.Robot).StatusFunc = func(ctx context.Context,
-				resourceNames []resource.Name,
-			) ([]robot.Status, error) {
+			// added to the context, and the deadline passed to GetMachineStatus was used instead.
+			iRobot.(*inject.Robot).MachineStatusFunc = func(ctx context.Context,
+			) (robot.MachineStatus, error) {
 				deadline, deadlineSet := ctx.Deadline()
 				test.That(t, deadlineSet, test.ShouldBeTrue)
 				// Assert that deadline is between 4 and 5 minutes from now (some time will
 				// have elapsed).
 				test.That(t, deadline, test.ShouldHappenBetween,
 					time.Now().Add(time.Minute*4), time.Now().Add(time.Minute*5))
-				return []robot.Status{}, nil
+				return robot.MachineStatus{}, nil
 			}
 
 			conn, err := rgrpc.Dial(context.Background(), "unix://"+svc.ModuleAddress(),
@@ -1148,10 +1307,10 @@ func TestInboundMethodTimeout(t *testing.T) {
 			test.That(t, err, test.ShouldBeNil)
 			client := robotpb.NewRobotServiceClient(conn)
 
-			// Use GetStatus and a context with a deadline to call injected status function.
+			// Use GetMachineStatus and a context with a deadline to call injected status function.
 			overrideCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
-			_, err = client.GetStatus(overrideCtx, &robotpb.GetStatusRequest{})
+			_, err = client.GetMachineStatus(overrideCtx, &robotpb.GetMachineStatusRequest{})
 			test.That(t, err, test.ShouldBeNil)
 
 			test.That(t, conn.Close(), test.ShouldBeNil)

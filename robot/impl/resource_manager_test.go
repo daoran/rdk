@@ -5,11 +5,12 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
+	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/google/go-cmp/cmp"
 	"github.com/jhump/protoreflect/desc"
 	"github.com/jhump/protoreflect/grpcreflect"
@@ -19,14 +20,15 @@ import (
 	boardpb "go.viam.com/api/component/board/v1"
 	camerapb "go.viam.com/api/component/camera/v1"
 	gripperpb "go.viam.com/api/component/gripper/v1"
-	motionpb "go.viam.com/api/service/motion/v1"
 	"go.viam.com/test"
 	"go.viam.com/utils"
 	"go.viam.com/utils/pexec"
 	"go.viam.com/utils/rpc"
 	"go.viam.com/utils/testutils"
+	"gonum.org/v1/gonum/stat/combin"
 	"google.golang.org/protobuf/testing/protocmp"
 
+	"go.viam.com/rdk/cloud"
 	"go.viam.com/rdk/components/arm"
 	fakearm "go.viam.com/rdk/components/arm/fake"
 	"go.viam.com/rdk/components/base"
@@ -46,6 +48,7 @@ import (
 	fakeservo "go.viam.com/rdk/components/servo/fake"
 	"go.viam.com/rdk/config"
 	"go.viam.com/rdk/grpc"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/module/modmaninterface"
 	"go.viam.com/rdk/operation"
 	"go.viam.com/rdk/pointcloud"
@@ -55,6 +58,7 @@ import (
 	"go.viam.com/rdk/robot/client"
 	"go.viam.com/rdk/robot/framesystem"
 	"go.viam.com/rdk/robot/packages"
+	weboptions "go.viam.com/rdk/robot/web/options"
 	"go.viam.com/rdk/services/motion"
 	"go.viam.com/rdk/services/shell"
 	"go.viam.com/rdk/services/vision"
@@ -66,7 +70,7 @@ import (
 	viz "go.viam.com/rdk/vision"
 )
 
-func setupInjectRobot(logger golog.Logger) *inject.Robot {
+func setupInjectRobot(logger logging.Logger) *inject.Robot {
 	injectRobot := &inject.Robot{}
 	armNames := []resource.Name{
 		arm.Named("arm1"),
@@ -118,7 +122,7 @@ func setupInjectRobot(logger golog.Logger) *inject.Robot {
 		)
 	}
 	injectRobot.ResourceRPCAPIsFunc = func() []resource.RPCAPI { return nil }
-	injectRobot.LoggerFunc = func() golog.Logger {
+	injectRobot.LoggerFunc = func() logging.Logger {
 		return logger
 	}
 
@@ -141,7 +145,7 @@ func setupInjectRobot(logger golog.Logger) *inject.Robot {
 					fakeBoard, err := fakeboard.NewBoard(context.Background(), resource.Config{
 						Name: name.String(),
 						ConvertedAttributes: &fakeboard.Config{
-							Analogs: []board.AnalogConfig{
+							AnalogReaders: []board.AnalogReaderConfig{
 								{Name: "analog1"},
 								{Name: "analog2"},
 							},
@@ -158,7 +162,7 @@ func setupInjectRobot(logger golog.Logger) *inject.Robot {
 				case camera.API:
 					conf := resource.NewEmptyConfig(name, resource.DefaultModelFamily.WithModel("fake"))
 					conf.ConvertedAttributes = &fakecamera.Config{}
-					return fakecamera.NewCamera(context.Background(), conf)
+					return fakecamera.NewCamera(context.Background(), resource.Dependencies{}, conf, logger)
 				case gripper.API:
 					return &fakegripper.Gripper{Named: name.AsNamed()}, nil
 				case input.API:
@@ -180,13 +184,10 @@ func setupInjectRobot(logger golog.Logger) *inject.Robot {
 }
 
 func TestManagerForRemoteRobot(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	injectRobot := setupInjectRobot(logger)
 
-	manager := managerForDummyRobot(injectRobot)
-	defer func() {
-		test.That(t, manager.Close(context.Background()), test.ShouldBeNil)
-	}()
+	manager := managerForDummyRobot(t, injectRobot)
 
 	armNames := []resource.Name{arm.Named("arm1"), arm.Named("arm2")}
 	baseNames := []resource.Name{base.Named("base1"), base.Named("base2")}
@@ -198,11 +199,10 @@ func TestManagerForRemoteRobot(t *testing.T) {
 	servoNames := []resource.Name{servo.Named("servo1"), servo.Named("servo2")}
 
 	test.That(t, manager.RemoteNames(), test.ShouldBeEmpty)
-	test.That(
+	rdktestutils.VerifySameResourceNames(
 		t,
-		rdktestutils.NewResourceNameSet(manager.ResourceNames()...),
-		test.ShouldResemble,
-		rdktestutils.NewResourceNameSet(rdktestutils.ConcatResourceNames(
+		manager.ResourceNames(),
+		rdktestutils.ConcatResourceNames(
 			armNames,
 			baseNames,
 			boardNames,
@@ -211,7 +211,7 @@ func TestManagerForRemoteRobot(t *testing.T) {
 			inputNames,
 			motorNames,
 			servoNames,
-		)...),
+		),
 	)
 
 	_, err := manager.ResourceByName(arm.Named("arm1"))
@@ -245,22 +245,19 @@ func TestManagerForRemoteRobot(t *testing.T) {
 }
 
 func TestManagerMergeNamesWithRemotes(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	injectRobot := setupInjectRobot(logger)
 
-	manager := managerForDummyRobot(injectRobot)
-	defer func() {
-		test.That(t, manager.Close(context.Background()), test.ShouldBeNil)
-	}()
+	manager := managerForDummyRobot(t, injectRobot)
 	manager.addRemote(
 		context.Background(),
-		newDummyRobot(setupInjectRobot(logger)),
+		newDummyRobot(t, setupInjectRobot(logger)),
 		nil,
 		config.Remote{Name: "remote1"},
 	)
 	manager.addRemote(
 		context.Background(),
-		newDummyRobot(setupInjectRobot(logger)),
+		newDummyRobot(t, setupInjectRobot(logger)),
 		nil,
 		config.Remote{Name: "remote2"},
 	)
@@ -282,17 +279,11 @@ func TestManagerMergeNamesWithRemotes(t *testing.T) {
 	servoNames := []resource.Name{servo.Named("servo1"), servo.Named("servo2")}
 	servoNames = append(servoNames, rdktestutils.AddRemotes(servoNames, "remote1", "remote2")...)
 
-	test.That(
+	rdktestutils.VerifySameElements(t, manager.RemoteNames(), []string{"remote1", "remote2"})
+	rdktestutils.VerifySameResourceNames(
 		t,
-		utils.NewStringSet(manager.RemoteNames()...),
-		test.ShouldResemble,
-		utils.NewStringSet("remote1", "remote2"),
-	)
-	test.That(
-		t,
-		rdktestutils.NewResourceNameSet(manager.ResourceNames()...),
-		test.ShouldResemble,
-		rdktestutils.NewResourceNameSet(rdktestutils.ConcatResourceNames(
+		manager.ResourceNames(),
+		rdktestutils.ConcatResourceNames(
 			armNames,
 			baseNames,
 			boardNames,
@@ -301,7 +292,7 @@ func TestManagerMergeNamesWithRemotes(t *testing.T) {
 			inputNames,
 			motorNames,
 			servoNames,
-		)...),
+		),
 	)
 	_, err := manager.ResourceByName(arm.Named("arm1"))
 	test.That(t, err, test.ShouldBeNil)
@@ -368,7 +359,7 @@ func TestManagerMergeNamesWithRemotes(t *testing.T) {
 }
 
 func TestManagerResourceRemoteName(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	injectRobot := &inject.Robot{}
 	armNames := []resource.Name{arm.Named("arm1"), arm.Named("arm2")}
 	injectRobot.ResourceNamesFunc = func() []resource.Name { return armNames }
@@ -376,12 +367,9 @@ func TestManagerResourceRemoteName(t *testing.T) {
 	injectRobot.ResourceByNameFunc = func(name resource.Name) (resource.Resource, error) {
 		return rdktestutils.NewUnimplementedResource(name), nil
 	}
-	injectRobot.LoggerFunc = func() golog.Logger { return logger }
+	injectRobot.LoggerFunc = func() logging.Logger { return logger }
 
-	manager := managerForDummyRobot(injectRobot)
-	defer func() {
-		test.That(t, manager.Close(context.Background()), test.ShouldBeNil)
-	}()
+	manager := managerForDummyRobot(t, injectRobot)
 
 	injectRemote := &inject.Robot{}
 	injectRemote.ResourceNamesFunc = func() []resource.Name { return rdktestutils.AddSuffixes(armNames, "") }
@@ -389,43 +377,37 @@ func TestManagerResourceRemoteName(t *testing.T) {
 	injectRemote.ResourceByNameFunc = func(name resource.Name) (resource.Resource, error) {
 		return rdktestutils.NewUnimplementedResource(name), nil
 	}
-	injectRemote.LoggerFunc = func() golog.Logger { return logger }
+	injectRemote.LoggerFunc = func() logging.Logger { return logger }
 	manager.addRemote(
 		context.Background(),
-		newDummyRobot(injectRemote),
+		newDummyRobot(t, injectRemote),
 		nil,
 		config.Remote{Name: "remote1"},
 	)
 
 	manager.updateRemotesResourceNames(context.Background())
 
-	res := manager.remoteResourceNames(fromRemoteNameToRemoteNodeName("remote1"))
-
-	test.That(
+	rdktestutils.VerifySameResourceNames(
 		t,
-		rdktestutils.NewResourceNameSet(res...),
-		test.ShouldResemble,
-		rdktestutils.NewResourceNameSet([]resource.Name{arm.Named("remote1:arm1"), arm.Named("remote1:arm2")}...),
+		manager.remoteResourceNames(fromRemoteNameToRemoteNodeName("remote1")),
+		[]resource.Name{arm.Named("remote1:arm1"), arm.Named("remote1:arm2")},
 	)
 }
 
 func TestManagerWithSameNameInRemoteNoPrefix(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	injectRobot := setupInjectRobot(logger)
 
-	manager := managerForDummyRobot(injectRobot)
-	defer func() {
-		test.That(t, manager.Close(context.Background()), test.ShouldBeNil)
-	}()
+	manager := managerForDummyRobot(t, injectRobot)
 	manager.addRemote(
 		context.Background(),
-		newDummyRobot(setupInjectRobot(logger)),
+		newDummyRobot(t, setupInjectRobot(logger)),
 		nil,
 		config.Remote{Name: "remote1"},
 	)
 	manager.addRemote(
 		context.Background(),
-		newDummyRobot(setupInjectRobot(logger)),
+		newDummyRobot(t, setupInjectRobot(logger)),
 		nil,
 		config.Remote{Name: "remote2"},
 	)
@@ -437,16 +419,13 @@ func TestManagerWithSameNameInRemoteNoPrefix(t *testing.T) {
 }
 
 func TestManagerWithSameNameInBaseAndRemote(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	injectRobot := setupInjectRobot(logger)
 
-	manager := managerForDummyRobot(injectRobot)
-	defer func() {
-		test.That(t, manager.Close(context.Background()), test.ShouldBeNil)
-	}()
+	manager := managerForDummyRobot(t, injectRobot)
 	manager.addRemote(
 		context.Background(),
-		newDummyRobot(setupInjectRobot(logger)),
+		newDummyRobot(t, setupInjectRobot(logger)),
 		nil,
 		config.Remote{Name: "remote1"},
 	)
@@ -458,7 +437,7 @@ func TestManagerWithSameNameInBaseAndRemote(t *testing.T) {
 }
 
 func TestManagerAdd(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	manager := newResourceManager(resourceManagerOptions{}, logger)
 
 	injectArm := &inject.Arm{}
@@ -470,31 +449,6 @@ func TestManagerAdd(t *testing.T) {
 	test.That(t, arm1, test.ShouldEqual, injectArm)
 
 	injectBoard := &inject.Board{}
-	injectBoard.SPINamesFunc = func() []string {
-		return []string{"spi1"}
-	}
-	injectBoard.I2CNamesFunc = func() []string {
-		return []string{"i2c1"}
-	}
-	injectBoard.AnalogReaderNamesFunc = func() []string {
-		return []string{"analog1"}
-	}
-	injectBoard.DigitalInterruptNamesFunc = func() []string {
-		return []string{"digital1"}
-	}
-	injectBoard.SPIByNameFunc = func(name string) (board.SPI, bool) {
-		return &inject.SPI{}, true
-	}
-	injectBoard.I2CByNameFunc = func(name string) (board.I2C, bool) {
-		return &inject.I2C{}, true
-	}
-	injectBoard.AnalogReaderByNameFunc = func(name string) (board.AnalogReader, bool) {
-		return &fakeboard.Analog{}, true
-	}
-	injectBoard.DigitalInterruptByNameFunc = func(name string) (board.DigitalInterrupt, bool) {
-		return &board.BasicDigitalInterrupt{}, true
-	}
-
 	cfg = &resource.Config{
 		API:  board.API,
 		Name: "board1",
@@ -509,16 +463,6 @@ func TestManagerAdd(t *testing.T) {
 	test.That(t, resource1, test.ShouldEqual, injectBoard)
 
 	injectMotionService := &inject.MotionService{}
-	injectMotionService.MoveFunc = func(
-		ctx context.Context,
-		componentName resource.Name,
-		grabPose *referenceframe.PoseInFrame,
-		worldState *referenceframe.WorldState,
-		constraints *motionpb.Constraints,
-		extra map[string]interface{},
-	) (bool, error) {
-		return false, nil
-	}
 	objectMResName := motion.Named("motion1")
 	manager.resources.AddNode(objectMResName, resource.NewConfiguredGraphNode(resource.Config{}, injectMotionService, unknownModel))
 	motionService, err := manager.ResourceByName(objectMResName)
@@ -717,7 +661,7 @@ func TestManagerNewComponent(t *testing.T) {
 			},
 		},
 	}
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	robotForRemote := &localRobot{
 		manager: newResourceManager(resourceManagerOptions{}, logger),
 	}
@@ -748,20 +692,20 @@ func TestManagerNewComponent(t *testing.T) {
 	test.That(t, err.Error(), test.ShouldContainSubstring, "board3")
 }
 
-func managerForTest(ctx context.Context, t *testing.T, l golog.Logger) *resourceManager {
+func managerForTest(ctx context.Context, t *testing.T, l logging.Logger) *resourceManager {
 	t.Helper()
 	injectRobot := setupInjectRobot(l)
-	manager := managerForDummyRobot(injectRobot)
+	manager := managerForDummyRobot(t, injectRobot)
 
 	manager.addRemote(
 		context.Background(),
-		newDummyRobot(setupInjectRobot(l)),
+		newDummyRobot(t, setupInjectRobot(l)),
 		nil,
 		config.Remote{Name: "remote1"},
 	)
 	manager.addRemote(
 		context.Background(),
-		newDummyRobot(setupInjectRobot(l)),
+		newDummyRobot(t, setupInjectRobot(l)),
 		nil,
 		config.Remote{Name: "remote2"},
 	)
@@ -773,7 +717,7 @@ func managerForTest(ctx context.Context, t *testing.T, l golog.Logger) *resource
 }
 
 func TestManagerMarkRemoved(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	manager := managerForTest(ctx, t, logger)
@@ -787,7 +731,7 @@ func TestManagerMarkRemoved(t *testing.T) {
 		t.Helper()
 		test.That(t, names, test.ShouldBeEmpty)
 		test.That(t, resourcesToCloseBeforeComplete, test.ShouldBeEmpty)
-		test.That(t, utils.NewStringSet(procMan.ProcessIDs()...), test.ShouldBeEmpty)
+		test.That(t, procMan.ProcessIDs(), test.ShouldBeEmpty)
 	}
 
 	processesToRemove, resourcesToCloseBeforeComplete, markedResourceNames := manager.markRemoved(ctx, &config.Config{}, logger)
@@ -930,12 +874,7 @@ func TestManagerMarkRemoved(t *testing.T) {
 			servoNames,
 		)...),
 	)
-	test.That(
-		t,
-		utils.NewStringSet(processesToRemove.ProcessIDs()...),
-		test.ShouldResemble,
-		utils.NewStringSet("2"),
-	)
+	rdktestutils.VerifySameElements(t, processesToRemove.ProcessIDs(), []string{"2"})
 
 	test.That(t, manager.Close(ctx), test.ShouldBeNil)
 	cancel()
@@ -1049,12 +988,7 @@ func TestManagerMarkRemoved(t *testing.T) {
 			[]resource.Name{fromRemoteNameToRemoteNodeName("remote2")},
 		)...),
 	)
-	test.That(
-		t,
-		utils.NewStringSet(processesToRemove.ProcessIDs()...),
-		test.ShouldResemble,
-		utils.NewStringSet("2"),
-	)
+	rdktestutils.VerifySameElements(t, processesToRemove.ProcessIDs(), []string{"2"})
 
 	test.That(t, manager.Close(ctx), test.ShouldBeNil)
 	cancel()
@@ -1237,28 +1171,19 @@ func TestManagerMarkRemoved(t *testing.T) {
 			},
 		)...),
 	)
-	test.That(
-		t,
-		utils.NewStringSet(processesToRemove.ProcessIDs()...),
-		test.ShouldResemble,
-		utils.NewStringSet("1", "2"),
-	)
+	rdktestutils.VerifySameElements(t, processesToRemove.ProcessIDs(), []string{"1", "2"})
 	test.That(t, manager.Close(ctx), test.ShouldBeNil)
 	cancel()
 }
 
 func TestConfigRemoteAllowInsecureCreds(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	cfg, err := config.Read(context.Background(), "data/fake.json", logger)
 	test.That(t, err, test.ShouldBeNil)
 
 	ctx := context.Background()
 
-	r, err := New(ctx, cfg, logger)
-	test.That(t, err, test.ShouldBeNil)
-	defer func() {
-		test.That(t, r.Close(context.Background()), test.ShouldBeNil)
-	}()
+	r := setupLocalRobot(t, ctx, cfg, logger)
 
 	altName := primitive.NewObjectID().Hex()
 	cert, certFile, keyFile, certPool, err := testutils.GenerateSelfSignedCertificate("somename", altName)
@@ -1313,23 +1238,25 @@ func TestConfigRemoteAllowInsecureCreds(t *testing.T) {
 		tlsConfig: remoteTLSConfig,
 	}, logger)
 
-	_, err = manager.processRemote(context.Background(), remote)
+	gNode := resource.NewUninitializedNode()
+	gNode.InitializeLogger(logger, "remote")
+	_, err = manager.processRemote(context.Background(), remote, gNode)
 	test.That(t, err, test.ShouldNotBeNil)
 	test.That(t, err.Error(), test.ShouldContainSubstring, "authentication required")
 
 	remote.Auth.Entity = "wrong"
-	_, err = manager.processRemote(context.Background(), remote)
+	_, err = manager.processRemote(context.Background(), remote, gNode)
 	test.That(t, err, test.ShouldNotBeNil)
 	test.That(t, err.Error(), test.ShouldContainSubstring, "authentication required")
 
 	remote.Auth.Entity = options.FQDN
-	_, err = manager.processRemote(context.Background(), remote)
+	_, err = manager.processRemote(context.Background(), remote, gNode)
 	test.That(t, err, test.ShouldNotBeNil)
 	test.That(t, err.Error(), test.ShouldContainSubstring, "authentication required")
 }
 
 func TestConfigUntrustedEnv(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	ctx := context.Background()
 
 	manager := newResourceManager(resourceManagerOptions{
@@ -1397,11 +1324,20 @@ func (fp *fakeProcess) Start(ctx context.Context) error {
 func (fp *fakeProcess) Stop() error {
 	return nil
 }
+func (fp *fakeProcess) KillGroup() {}
+
+func (fp *fakeProcess) Status() error {
+	return nil
+}
+
+func (fp *fakeProcess) UnixPid() (int, error) {
+	return 0, errors.New("unimplemented")
+}
 
 func TestManagerResourceRPCAPIs(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	injectRobot := &inject.Robot{}
-	injectRobot.LoggerFunc = func() golog.Logger {
+	injectRobot.LoggerFunc = func() logging.Logger {
 		return logger
 	}
 	injectRobot.ResourceNamesFunc = func() []resource.Name {
@@ -1426,10 +1362,7 @@ func TestManagerResourceRPCAPIs(t *testing.T) {
 		return nil, resource.NewNotFoundError(name)
 	}
 
-	manager := managerForDummyRobot(injectRobot)
-	defer func() {
-		test.That(t, manager.Close(context.Background()), test.ShouldBeNil)
-	}()
+	manager := managerForDummyRobot(t, injectRobot)
 
 	api1 := resource.APINamespace("acme").WithComponentType("huwat")
 	api2 := resource.APINamespace("acme").WithComponentType("wat")
@@ -1438,7 +1371,7 @@ func TestManagerResourceRPCAPIs(t *testing.T) {
 	resName2 := resource.NewName(api2, "thing2")
 
 	injectRobotRemote1 := &inject.Robot{}
-	injectRobotRemote1.LoggerFunc = func() golog.Logger {
+	injectRobotRemote1.LoggerFunc = func() logging.Logger {
 		return logger
 	}
 	injectRobotRemote1.ResourceNamesFunc = func() []resource.Name {
@@ -1483,13 +1416,13 @@ func TestManagerResourceRPCAPIs(t *testing.T) {
 
 	manager.addRemote(
 		context.Background(),
-		newDummyRobot(injectRobotRemote1),
+		newDummyRobot(t, injectRobotRemote1),
 		nil,
 		config.Remote{Name: "remote1"},
 	)
 
 	injectRobotRemote2 := &inject.Robot{}
-	injectRobotRemote2.LoggerFunc = func() golog.Logger {
+	injectRobotRemote2.LoggerFunc = func() logging.Logger {
 		return logger
 	}
 	injectRobotRemote2.ResourceNamesFunc = func() []resource.Name {
@@ -1525,7 +1458,7 @@ func TestManagerResourceRPCAPIs(t *testing.T) {
 
 	manager.addRemote(
 		context.Background(),
-		newDummyRobot(injectRobotRemote2),
+		newDummyRobot(t, injectRobotRemote2),
 		nil,
 		config.Remote{Name: "remote2"},
 	)
@@ -1557,9 +1490,9 @@ func TestManagerResourceRPCAPIs(t *testing.T) {
 }
 
 func TestManagerEmptyResourceDesc(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	injectRobot := &inject.Robot{}
-	injectRobot.LoggerFunc = func() golog.Logger {
+	injectRobot.LoggerFunc = func() logging.Logger {
 		return logger
 	}
 	api := resource.APINamespaceRDK.WithComponentType("mockDesc")
@@ -1578,10 +1511,7 @@ func TestManagerEmptyResourceDesc(t *testing.T) {
 		return rdktestutils.NewUnimplementedResource(name), nil
 	}
 
-	manager := managerForDummyRobot(injectRobot)
-	defer func() {
-		test.That(t, manager.Close(context.Background()), test.ShouldBeNil)
-	}()
+	manager := managerForDummyRobot(t, injectRobot)
 
 	apis := manager.ResourceRPCAPIs()
 	test.That(t, apis, test.ShouldHaveLength, 0)
@@ -1592,15 +1522,12 @@ func TestReconfigure(t *testing.T) {
 
 	api := resource.APINamespaceRDK.WithServiceType(subtypeName)
 
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	cfg, err := config.Read(context.Background(), "data/fake.json", logger)
 	test.That(t, err, test.ShouldBeNil)
 
 	ctx := context.Background()
-
-	r, err := New(ctx, cfg, logger)
-	test.That(t, err, test.ShouldBeNil)
-	test.That(t, r, test.ShouldNotBeNil)
+	r := setupLocalRobot(t, ctx, cfg, logger)
 
 	resource.RegisterAPI(api, resource.APIRegistration[resource.Resource]{})
 	defer func() {
@@ -1612,7 +1539,7 @@ func TestReconfigure(t *testing.T) {
 			ctx context.Context,
 			deps resource.Dependencies,
 			conf resource.Config,
-			logger golog.Logger,
+			logger logging.Logger,
 		) (resource.Resource, error) {
 			return &mock{
 				Named: conf.ResourceName().AsNamed(),
@@ -1623,10 +1550,7 @@ func TestReconfigure(t *testing.T) {
 		resource.Deregister(api, resource.DefaultServiceModel)
 	}()
 
-	manager := managerForDummyRobot(r)
-	defer func() {
-		test.That(t, manager.Close(ctx), test.ShouldBeNil)
-	}()
+	manager := managerForDummyRobot(t, r)
 
 	svc1 := resource.Config{
 		Name:  "somesvc",
@@ -1655,18 +1579,186 @@ func TestReconfigure(t *testing.T) {
 	}()
 }
 
-func TestResourceCreationPanic(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+func TestRemoteConnClosedOnReconfigure(t *testing.T) {
+	logger := logging.NewTestLogger(t)
+
 	ctx := context.Background()
 
-	r, err := New(ctx, &config.Config{}, logger)
-	test.That(t, err, test.ShouldBeNil)
+	fakeMotor := resource.Config{
+		Name:                "motor",
+		Model:               resource.DefaultModelFamily.WithModel("fake"),
+		API:                 motor.API,
+		ConvertedAttributes: &fakemotor.Config{},
+	}
 
-	manager := managerForDummyRobot(r)
-	defer func() {
-		test.That(t, manager.Close(ctx), test.ShouldBeNil)
-		test.That(t, r.Close(ctx), test.ShouldBeNil)
-	}()
+	fakeArm := resource.Config{
+		Name:                "arm",
+		Model:               resource.DefaultModelFamily.WithModel("fake"),
+		API:                 arm.API,
+		ConvertedAttributes: &fakearm.Config{},
+	}
+
+	remoteCfg1 := &config.Config{
+		Components: []resource.Config{fakeMotor},
+	}
+
+	remoteCfg2 := &config.Config{
+		Components: []resource.Config{fakeArm},
+	}
+
+	t.Run("remotes with same exact resources", func(t *testing.T) {
+		remote1 := setupLocalRobot(t, ctx, remoteCfg1, logger.Sublogger("remote1"))
+		remote2 := setupLocalRobot(t, ctx, remoteCfg1, logger.Sublogger("remote2"))
+
+		options1, _, addr1 := robottestutils.CreateBaseOptionsAndListener(t)
+		err := remote1.StartWeb(ctx, options1)
+		test.That(t, err, test.ShouldBeNil)
+
+		options2, _, addr2 := robottestutils.CreateBaseOptionsAndListener(t)
+		err = remote2.StartWeb(ctx, options2)
+		test.That(t, err, test.ShouldBeNil)
+
+		// Set up a local main robot which is connected to remote1
+		remoteConf := config.Remote{
+			Name:    "remote",
+			Address: addr1,
+		}
+
+		mainRobotCfg := &config.Config{
+			Remotes: []config.Remote{remoteConf},
+		}
+
+		// Make a copy of the main robot config as reconfigure will directly modify it
+		mainCfgCopy := *mainRobotCfg
+		mainRobot := setupLocalRobot(t, ctx, mainRobotCfg, logger.Sublogger("main"))
+
+		// Grab motor of remote1 to check that it won't work after switching remotes
+		motor1, err := motor.FromRobot(mainRobot, "motor")
+		test.That(t, err, test.ShouldBeNil)
+
+		moving, speed, err := motor1.IsPowered(ctx, nil)
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, moving, test.ShouldBeFalse)
+		test.That(t, speed, test.ShouldEqual, 0.0)
+
+		// Change address in config copy to reference address of the remote2, make a copy of the config, and reconfigure
+		mainCfgCopy.Remotes[0].Address = addr2
+		mainCfgCopy2 := mainCfgCopy
+		mainRobot.Reconfigure(ctx, &mainCfgCopy)
+
+		// Verify that motor of remote1 no longer works
+		_, _, err = motor1.IsPowered(ctx, nil)
+		test.That(t, err, test.ShouldNotBeNil)
+
+		// Grab motor of remote2 to check that it won't work after switching remotes
+		motor2, err := motor.FromRobot(mainRobot, "motor")
+		test.That(t, err, test.ShouldBeNil)
+
+		moving, speed, _ = motor2.IsPowered(ctx, nil)
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, moving, test.ShouldBeFalse)
+		test.That(t, speed, test.ShouldEqual, 0.0)
+
+		// Change address back to remote1, and reconfigure
+		mainCfgCopy2.Remotes[0].Address = addr1
+		mainRobot.Reconfigure(ctx, &mainCfgCopy2)
+
+		// Close second remote robot
+		remote2.Close(ctx)
+
+		// Verify that motor of remote2 no longer works
+		_, _, err = motor2.IsPowered(ctx, nil)
+		test.That(t, err, test.ShouldNotBeNil)
+
+		// Check that we were able to grab the motor from remote1 through the main robot and successfully call IsPowered()
+		motor1, err = motor.FromRobot(mainRobot, "motor")
+		test.That(t, err, test.ShouldBeNil)
+
+		moving, speed, err = motor1.IsPowered(ctx, nil)
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, moving, test.ShouldBeFalse)
+		test.That(t, speed, test.ShouldEqual, 0.0)
+	})
+
+	t.Run("remotes with different resources", func(t *testing.T) {
+		remote1 := setupLocalRobot(t, ctx, remoteCfg2, logger.Sublogger("remote1"))
+		remote2 := setupLocalRobot(t, ctx, remoteCfg1, logger.Sublogger("remote2"))
+
+		options1, _, addr1 := robottestutils.CreateBaseOptionsAndListener(t)
+		err := remote1.StartWeb(ctx, options1)
+		test.That(t, err, test.ShouldBeNil)
+
+		options2, _, addr2 := robottestutils.CreateBaseOptionsAndListener(t)
+		err = remote2.StartWeb(ctx, options2)
+		test.That(t, err, test.ShouldBeNil)
+
+		// Set up a local main robot which is connected to remote1
+		remoteConf := config.Remote{
+			Name:    "remote",
+			Address: addr1,
+		}
+
+		mainRobotCfg := &config.Config{
+			Remotes: []config.Remote{remoteConf},
+		}
+
+		// Make a copy of the main robot config as reconfigure will directly modify it
+		mainCfgCopy := *mainRobotCfg
+		mainRobot := setupLocalRobot(t, ctx, mainRobotCfg, logger.Sublogger("main"))
+
+		// Grab arm of remote1 to check that it won't work after switching remotes
+		arm1, err := arm.FromRobot(mainRobot, "arm")
+		test.That(t, err, test.ShouldBeNil)
+
+		moving, err := arm1.IsMoving(ctx)
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, moving, test.ShouldBeFalse)
+
+		// Change address in config copy to reference address of the remote2, make a copy of the config, and reconfigure
+		mainCfgCopy.Remotes[0].Address = addr2
+		mainCfgCopy2 := mainCfgCopy
+		mainRobot.Reconfigure(ctx, &mainCfgCopy)
+
+		// Verify that arm of remote1 no longer works
+		_, err = arm1.IsMoving(ctx)
+		test.That(t, err, test.ShouldNotBeNil)
+
+		// Grab motor of remote2 to check that it won't work after switching remotes
+		motor1, err := motor.FromRobot(mainRobot, "motor")
+		test.That(t, err, test.ShouldBeNil)
+
+		moving, speed, _ := motor1.IsPowered(ctx, nil)
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, moving, test.ShouldBeFalse)
+		test.That(t, speed, test.ShouldEqual, 0.0)
+
+		// Change address back to remote1, and reconfigure
+		mainCfgCopy2.Remotes[0].Address = addr1
+		mainRobot.Reconfigure(ctx, &mainCfgCopy2)
+
+		// Close second remote robot
+		remote2.Close(ctx)
+
+		// Verify that motor of remote2 no longer works
+		_, _, err = motor1.IsPowered(ctx, nil)
+		test.That(t, err, test.ShouldNotBeNil)
+
+		// Check that we were able to grab the arm from remote1 through the main robot and successfully call IsMoving()
+		arm1, err = arm.FromRobot(mainRobot, "arm")
+		test.That(t, err, test.ShouldBeNil)
+
+		moving, err = arm1.IsMoving(ctx)
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, moving, test.ShouldBeFalse)
+	})
+}
+
+func TestResourceCreationPanic(t *testing.T) {
+	logger := logging.NewTestLogger(t)
+	ctx := context.Background()
+
+	r := setupLocalRobot(t, ctx, &config.Config{}, logger)
+	manager := managerForDummyRobot(t, r)
 
 	t.Run("component", func(t *testing.T) {
 		subtypeName := "testComponentAPI"
@@ -1674,7 +1766,9 @@ func TestResourceCreationPanic(t *testing.T) {
 		model := resource.DefaultModelFamily.WithModel("test")
 
 		resource.RegisterComponent(api, model, resource.Registration[resource.Resource, resource.NoNativeConfig]{
-			Constructor: func(ctx context.Context, deps resource.Dependencies, c resource.Config, logger golog.Logger) (resource.Resource, error) {
+			Constructor: func(
+				ctx context.Context, deps resource.Dependencies, c resource.Config, logger logging.Logger,
+			) (resource.Resource, error) {
 				panic("hello")
 			},
 		})
@@ -1690,7 +1784,7 @@ func TestResourceCreationPanic(t *testing.T) {
 
 		local, ok := r.(*localRobot)
 		test.That(t, ok, test.ShouldBeTrue)
-		_, _, err = manager.processResource(ctx, svc1, resource.NewUninitializedNode(), local)
+		_, _, err := manager.processResource(ctx, svc1, resource.NewUninitializedNode(), local)
 		test.That(t, err.Error(), test.ShouldContainSubstring, "hello")
 	})
 
@@ -1703,7 +1797,7 @@ func TestResourceCreationPanic(t *testing.T) {
 				ctx context.Context,
 				deps resource.Dependencies,
 				c resource.Config,
-				logger golog.Logger,
+				logger logging.Logger,
 			) (resource.Resource, error) {
 				panic("hello")
 			},
@@ -1725,7 +1819,7 @@ func TestResourceCreationPanic(t *testing.T) {
 
 		local, ok := r.(*localRobot)
 		test.That(t, ok, test.ShouldBeTrue)
-		_, _, err = manager.processResource(ctx, svc1, resource.NewUninitializedNode(), local)
+		_, _, err := manager.processResource(ctx, svc1, resource.NewUninitializedNode(), local)
 		test.That(t, err.Error(), test.ShouldContainSubstring, "hello")
 	})
 }
@@ -1748,12 +1842,16 @@ type dummyRobot struct {
 	robot      robot.Robot
 	manager    *resourceManager
 	modmanager modmaninterface.ModuleManager
+
+	offline bool
 }
 
 // newDummyRobot returns a new dummy robot wrapping a given robot.Robot
 // and its configuration.
-func newDummyRobot(robot robot.Robot) *dummyRobot {
-	remoteManager := managerForDummyRobot(robot)
+func newDummyRobot(t *testing.T, robot robot.Robot) *dummyRobot {
+	t.Helper()
+
+	remoteManager := managerForDummyRobot(t, robot)
 	remote := &dummyRobot{
 		Named:   resource.NewName(client.RemoteAPI, "something").AsNamed(),
 		robot:   robot,
@@ -1762,14 +1860,39 @@ func newDummyRobot(robot robot.Robot) *dummyRobot {
 	return remote
 }
 
+func (rr *dummyRobot) SetOffline(offline bool) {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	rr.offline = offline
+}
+
 func (rr *dummyRobot) Reconfigure(ctx context.Context, deps resource.Dependencies, conf resource.Config) error {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	if rr.offline {
+		return errors.New("offline")
+	}
 	return errors.New("unsupported")
 }
 
 // DiscoverComponents takes a list of discovery queries and returns corresponding
 // component configurations.
 func (rr *dummyRobot) DiscoverComponents(ctx context.Context, qs []resource.DiscoveryQuery) ([]resource.Discovery, error) {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	if rr.offline {
+		return nil, errors.New("offline")
+	}
 	return rr.robot.DiscoverComponents(ctx, qs)
+}
+
+func (rr *dummyRobot) GetModelsFromModules(ctx context.Context) ([]resource.ModuleModelDiscovery, error) {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	if rr.offline {
+		return nil, errors.New("offline")
+	}
+	return rr.robot.GetModelsFromModules(ctx)
 }
 
 func (rr *dummyRobot) RemoteNames() []string {
@@ -1777,8 +1900,12 @@ func (rr *dummyRobot) RemoteNames() []string {
 }
 
 func (rr *dummyRobot) ResourceNames() []resource.Name {
+	// NOTE: The offline behavior here should resemble behavior in the robot client
 	rr.mu.Lock()
 	defer rr.mu.Unlock()
+	if rr.offline {
+		return nil
+	}
 	names := rr.manager.ResourceNames()
 	newNames := make([]resource.Name, 0, len(names))
 	newNames = append(newNames, names...)
@@ -1786,6 +1913,12 @@ func (rr *dummyRobot) ResourceNames() []resource.Name {
 }
 
 func (rr *dummyRobot) ResourceRPCAPIs() []resource.RPCAPI {
+	// NOTE: The offline behavior here should resemble behavior in the robot client
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	if rr.offline {
+		return nil
+	}
 	return rr.robot.ResourceRPCAPIs()
 }
 
@@ -1796,6 +1929,9 @@ func (rr *dummyRobot) RemoteByName(name string) (robot.Robot, bool) {
 func (rr *dummyRobot) ResourceByName(name resource.Name) (resource.Resource, error) {
 	rr.mu.Lock()
 	defer rr.mu.Unlock()
+	if rr.offline {
+		return nil, errors.New("offline")
+	}
 	return rr.manager.ResourceByName(name)
 }
 
@@ -1815,10 +1951,6 @@ func (rr *dummyRobot) TransformPose(
 
 func (rr *dummyRobot) TransformPointCloud(ctx context.Context, srcpc pointcloud.PointCloud, srcName, dstName string,
 ) (pointcloud.PointCloud, error) {
-	panic("change to return nil")
-}
-
-func (rr *dummyRobot) Status(ctx context.Context, resourceNames []resource.Name) ([]robot.Status, error) {
 	panic("change to return nil")
 }
 
@@ -1842,8 +1974,17 @@ func (rr *dummyRobot) PackageManager() packages.Manager {
 	panic("change to return nil")
 }
 
-func (rr *dummyRobot) Logger() golog.Logger {
+func (rr *dummyRobot) Logger() logging.Logger {
 	return rr.robot.Logger()
+}
+
+func (rr *dummyRobot) CloudMetadata(ctx context.Context) (cloud.Metadata, error) {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	if rr.offline {
+		return cloud.Metadata{}, errors.New("offline")
+	}
+	return rr.robot.CloudMetadata(ctx)
 }
 
 func (rr *dummyRobot) Close(ctx context.Context) error {
@@ -1851,17 +1992,63 @@ func (rr *dummyRobot) Close(ctx context.Context) error {
 }
 
 func (rr *dummyRobot) StopAll(ctx context.Context, extra map[resource.Name]map[string]interface{}) error {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	if rr.offline {
+		return errors.New("offline")
+	}
 	return rr.robot.StopAll(ctx, extra)
 }
 
-// managerForDummyRobot integrates all parts from a given robot
-// except for its remotes.
-func managerForDummyRobot(robot robot.Robot) *resourceManager {
-	manager := newResourceManager(resourceManagerOptions{}, robot.Logger().Named("manager"))
+func (rr *dummyRobot) RestartModule(ctx context.Context, req robot.RestartModuleRequest) error {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	if rr.offline {
+		return errors.New("offline")
+	}
+	return rr.robot.RestartModule(ctx, req)
+}
+
+func (rr *dummyRobot) Shutdown(ctx context.Context) error {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	if rr.offline {
+		return errors.New("offline")
+	}
+	return rr.robot.Shutdown(ctx)
+}
+
+func (rr *dummyRobot) MachineStatus(ctx context.Context) (robot.MachineStatus, error) {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	if rr.offline {
+		return robot.MachineStatus{}, errors.New("offline")
+	}
+	return rr.robot.MachineStatus(ctx)
+}
+
+func (rr *dummyRobot) Version(ctx context.Context) (robot.VersionResponse, error) {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	if rr.offline {
+		return robot.VersionResponse{}, errors.New("offline")
+	}
+	return rr.robot.Version(ctx)
+}
+
+// managerForDummyRobot integrates all parts from a given robot except for its remotes.
+// It also close itself when the test and all subtests complete.
+func managerForDummyRobot(t *testing.T, robot robot.Robot) *resourceManager {
+	t.Helper()
+
+	manager := newResourceManager(resourceManagerOptions{}, robot.Logger().Sublogger("manager"))
+	t.Cleanup(func() {
+		test.That(t, manager.Close(context.Background()), test.ShouldBeNil)
+	})
 
 	// start a dummy module manager so calls to moduleManager.Provides() do not
 	// panic.
-	manager.startModuleManager("", false, robot.Logger())
+	manager.startModuleManager(context.Background(), "", nil, false, "", "", robot.Logger(), t.TempDir())
 
 	for _, name := range robot.ResourceNames() {
 		res, err := robot.ResourceByName(name)
@@ -1870,7 +2057,202 @@ func managerForDummyRobot(robot robot.Robot) *resourceManager {
 			continue
 		}
 		gNode := resource.NewConfiguredGraphNode(resource.Config{}, res, unknownModel)
-		manager.resources.AddNode(name, gNode)
+		test.That(t, manager.resources.AddNode(name, gNode), test.ShouldBeNil)
 	}
 	return manager
+}
+
+// TestReconfigureParity validates that calling the synchronous and asynchronous version
+// of `Reconfigure` results in the same resource state on a local robot for all
+// combinations of an initial and updated configuration.
+func TestReconfigureParity(t *testing.T) {
+	// TODO(RSDK-7716): add some configurations with modules.
+	// TODO(RSDK-8065): define configurations in-line instead of reading from files.
+	files := []string{
+		"data/diff_config_deps1.json",
+		"data/diff_config_deps2.json",
+		"data/diff_config_deps3.json",
+		"data/diff_config_deps4.json",
+		"data/diff_config_deps5.json",
+		"data/diff_config_deps6.json",
+		"data/diff_config_deps7.json",
+		"data/diff_config_deps8.json",
+		"data/diff_config_deps9_good.json",
+		"data/diff_config_deps9_bad.json",
+		"data/diff_config_deps10.json",
+		"data/diff_config_deps11.json",
+		"data/diff_config_deps12.json",
+	}
+	ctx := context.Background()
+
+	testReconfigureParity := func(t *testing.T, initCfg, updateCfg string) {
+		name := fmt.Sprintf("%s -> %s", initCfg, updateCfg)
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			// Capture logs for this sub-test run. Only output the logs if the test fails.
+			logger := logging.NewInMemoryLogger(t)
+
+			// Configuration may mutate `*config.Config`, so we read it from
+			// file each time.
+			cfg := ConfigFromFile(t, initCfg)
+			r1 := setupLocalRobot(t, ctx, cfg, logger).(*localRobot)
+			cfg = ConfigFromFile(t, initCfg)
+			r2 := setupLocalRobot(t, ctx, cfg, logger).(*localRobot)
+
+			rdktestutils.VerifySameResourceNames(t, r1.ResourceNames(), r2.ResourceNames())
+
+			cfg = ConfigFromFile(t, updateCfg)
+			r1.Reconfigure(ctx, cfg)
+			cfg = ConfigFromFile(t, updateCfg)
+			// force robot to reconfigure resources serially
+			r2.reconfigure(ctx, cfg, true)
+
+			rdktestutils.VerifySameResourceNames(t, r1.ResourceNames(), r2.ResourceNames())
+		})
+	}
+
+	gen := combin.NewCombinationGenerator(len(files), 2)
+
+	pair := []int{0, 0}
+	for gen.Next() {
+		gen.Combination(pair)
+
+		i, j := pair[0], pair[1]
+		testReconfigureParity(t, files[i], files[j])
+
+		i, j = pair[1], pair[0]
+		testReconfigureParity(t, files[i], files[j])
+	}
+}
+
+// Consider a case where a main part viam-server is configured with a remote part viam-server. We
+// want to ensure that once calling `ResourceNames` on the main part returns some remote resource --
+// that remote resource will always be returned until it is configured away. When either the remote
+// robot removes it from its config. Or when the main part removes the remote.
+func TestOfflineRemoteResources(t *testing.T) {
+	logger, _ := logging.NewObservedTestLogger(t)
+	ctx := context.Background()
+
+	motorName := "remoteMotorFoo"
+	motorResourceName := resource.NewName(motor.API, motorName)
+
+	remoteCfg := &config.Config{
+		Components: []resource.Config{
+			{
+				Name:                motorName,
+				Model:               resource.DefaultModelFamily.WithModel("fake"),
+				API:                 motor.API,
+				ConvertedAttributes: &fakemotor.Config{},
+			},
+		},
+	}
+
+	remoteRobot := setupLocalRobot(t, ctx, remoteCfg, logger.Sublogger("remote"))
+	remoteOptions, _, remoteAddr := robottestutils.CreateBaseOptionsAndListener(t)
+	err := remoteRobot.StartWeb(ctx, remoteOptions)
+	test.That(t, err, test.ShouldBeNil)
+
+	// Set up a local main robot which is connected to the remote.
+	mainRobotCfg := &config.Config{
+		Remotes: []config.Remote{
+			{
+				Name:    "remote",
+				Address: remoteAddr,
+				// These values dictate how quickly we'll observe the remote going offline. And how
+				// quickly we'll observe it coming back online.
+				ConnectionCheckInterval: 10 * time.Millisecond,
+				ReconnectInterval:       10 * time.Millisecond,
+			},
+		},
+	}
+	mainRobotI := setupLocalRobot(t, ctx, mainRobotCfg, logger.Sublogger("main"))
+	// We'll manually access the resource manager to move the test forward.
+	mainRobot := mainRobotI.(*localRobot)
+	mainOptions, _, mainAddr := robottestutils.CreateBaseOptionsAndListener(t)
+	mainRobot.StartWeb(ctx, mainOptions)
+
+	// Create an "application" client to the robot.
+	mainClient, err := client.New(ctx, mainAddr, logger.Sublogger("client"))
+	test.That(t, err, test.ShouldBeNil)
+	defer mainClient.Close(ctx)
+	resourceNames := mainClient.ResourceNames()
+
+	// When the `mainClient` requests `ResourceNames`, the motor will be annotated to include its
+	// remote.
+	motorResourceNameFromMain := motorResourceName.PrependRemote("remote")
+	// Search the list of "main" resources for the remote motor. Sanity check that we find it.
+	test.That(t, resourceNames, test.ShouldContain, motorResourceNameFromMain)
+
+	// Grab the RobotClient resource graph node from the main robot that is connected to the
+	// remote. We'll use this to know when the main robot observes the remote has gone offline.
+	mainToRemoteClientRes, _ := mainRobot.RemoteByName("remote")
+	test.That(t, mainToRemoteClientRes, test.ShouldNotBeNil)
+	mainToRemoteClient := mainToRemoteClientRes.(*client.RobotClient)
+	test.That(t, mainToRemoteClient.Connected(), test.ShouldBeTrue)
+
+	// Stop the remote's web server. Wait for the main robot to observe there's a connection problem.
+	logger.Info("Stopping web")
+	remoteRobot.StopWeb()
+	testutils.WaitForAssertion(t, func(tb testing.TB) {
+		tb.Helper()
+		test.That(tb, mainToRemoteClient.Connected(), test.ShouldBeFalse)
+	})
+
+	// Manually kick the resource manager to update remote resource names.
+	logger.Info("Updating remote resource names")
+	mainRobot.manager.updateRemotesResourceNames(logging.EnableDebugModeWithKey(ctx, "testOfflineRemoteResources.nodeOffline"))
+
+	// The robot client keeps a cache of resource names. Manually refresh before re-asking the main
+	// robot what resources it hsa.
+	mainClient.Refresh(ctx)
+	resourceNames = mainClient.ResourceNames()
+
+	// Scan again for the remote motor. Assert it still exists.
+	test.That(t, resourceNames, test.ShouldContain, motorResourceNameFromMain)
+
+	// Restart the remote web server. We closed the old listener, so just pass in the web address as
+	// part of the web options.
+	logger.Info("Restarting web server")
+	err = remoteRobot.StartWeb(ctx, weboptions.Options{
+		Network: config.NetworkConfig{
+			NetworkConfigData: config.NetworkConfigData{
+				BindAddress: remoteAddr,
+			},
+		},
+	})
+	test.That(t, err, test.ShouldBeNil)
+
+	// Wait until the main robot sees the remote is online. This gets stuck behind a 10 second dial
+	// timeout. So we must manually increase the time we're willing to wait.
+	testutils.WaitForAssertionWithSleep(t, 50*time.Millisecond, 1000, func(tb testing.TB) {
+		tb.Helper()
+		test.That(tb, mainToRemoteClient.Connected(), test.ShouldBeTrue)
+	})
+
+	// Again, manually refresh the list of resources to clear the cache. Assert the remote motor
+	// still exists.
+	mainToRemoteClient.Refresh(logging.EnableDebugModeWithKey(ctx, "refresh"))
+	test.That(t, resourceNames, test.ShouldContain, motorResourceNameFromMain)
+
+	// Reconfigure away the motor on the remote robot.
+	remoteCfg.Components = []resource.Config{}
+	remoteRobot.Reconfigure(ctx, remoteCfg)
+
+	// Assert the main robot's client object eventually observes that the motor is no longer a
+	// component.
+	testutils.WaitForAssertion(t, func(tb testing.TB) {
+		tb.Helper()
+		mainToRemoteClient.Refresh(ctx)
+		resourceNames := mainToRemoteClient.ResourceNames()
+		test.That(t, resourceNames, test.ShouldNotContain, motorResourceNameFromMain)
+	})
+
+	// Manually update remote resource names. Knowing the robot client servicing the information has
+	// the updated view.
+	mainRobot.manager.updateRemotesResourceNames(ctx)
+
+	// Force a refresh of resource names on the application client connection. Assert the motor no
+	// longer appears.
+	mainClient.Refresh(ctx)
+	test.That(t, resourceNames, test.ShouldNotContain, mainClient.ResourceNames())
 }

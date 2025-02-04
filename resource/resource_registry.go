@@ -7,7 +7,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/edaniels/golog"
 	"github.com/jhump/protoreflect/desc"
 	"github.com/jhump/protoreflect/grpcreflect"
 	"github.com/pkg/errors"
@@ -15,7 +14,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 
-	"go.viam.com/rdk/internal"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/utils"
 )
 
@@ -31,7 +30,7 @@ type (
 		ctx context.Context,
 		deps Dependencies,
 		conf Config,
-		logger golog.Logger,
+		logger logging.Logger,
 	) (ResourceT, error)
 
 	// A DeprecatedCreateWithRobot creates a resource from a robot and a given config.
@@ -41,14 +40,8 @@ type (
 		// but it's deprecated :).
 		r any,
 		conf Config,
-		logger golog.Logger,
+		logger logging.Logger,
 	) (ResourceT, error)
-
-	// CreateStatus creates a status from a given resource. The return type is expected to be comprised of string keys
-	// (or it should be possible to decompose it into string keys) and values comprised of primitives, list of primitives,
-	// maps with string keys (or at least can be decomposed into one), or lists of the aforementioned type of maps.
-	// Results with other types of data are not guaranteed.
-	CreateStatus[ResourceT Resource] func(ctx context.Context, res ResourceT) (interface{}, error)
 
 	// A CreateRPCClient will create the client for the resource.
 	CreateRPCClient[ResourceT Resource] func(
@@ -56,15 +49,11 @@ type (
 		conn rpc.ClientConn,
 		remoteName string,
 		name Name,
-		logger golog.Logger,
+		logger logging.Logger,
 	) (ResourceT, error)
 
 	// An AttributeMapConverter converts an attribute map into a native config type for a resource.
 	AttributeMapConverter[ConfigT any] func(attributes utils.AttributeMap) (ConfigT, error)
-
-	// LinkAssocationConfig allows one resource to associate a specific association config
-	// to its own config. This is generally done by a specific resource (e.g. data capture of many components).
-	LinkAssocationConfig[ConfigT any] func(conf ConfigT, resAssociation interface{}) error
 )
 
 // A DependencyNotReadyError is used whenever we reference a dependency that has not been
@@ -124,14 +113,13 @@ type Registration[ResourceT Resource, ConfigT any] struct {
 	// AttributeMapConverter is used to convert raw attributes to the resource's native config.
 	AttributeMapConverter AttributeMapConverter[ConfigT]
 
-	// An AssocationConfigLinker describes how to associate a
-	// resource association config to a specific resource model (e.g. builtin data capture).
-	AssociatedConfigLinker LinkAssocationConfig[ConfigT]
-
 	// TODO(RSDK-418): remove this legacy constructor once all resources that use it no longer need to receive the entire robot.
 	DeprecatedRobotConstructor DeprecatedCreateWithRobot[ResourceT]
-	// Not for public use yet; currently experimental
-	WeakDependencies []internal.ResourceMatcher
+
+	// WeakDependencies is a list of Matchers that find resources on the robot that fit the criteria they are looking for
+	// and register them as dependencies on the resource being registered.
+	// NOTE: This is currently an experimental feature and subject to change.
+	WeakDependencies []Matcher
 
 	// Discover looks around for information about this specific model.
 	Discover DiscoveryFunc
@@ -150,7 +138,6 @@ func (r Registration[ResourceT, ConfigT]) ConfigReflectType() reflect.Type {
 
 // APIRegistration stores api-specific functions and clients.
 type APIRegistration[ResourceT Resource] struct {
-	Status                      CreateStatus[ResourceT]
 	RPCServiceServerConstructor func(apiColl APIResourceCollection[ResourceT]) interface{}
 	RPCServiceHandler           rpc.RegisterServiceHandlerFromEndpointFunc
 	RPCServiceDesc              *grpc.ServiceDesc
@@ -183,14 +170,21 @@ func (rs APIRegistration[ResourceT]) RegisterRPCService(
 	)
 }
 
-// AssociatedNameUpdater allows an associated config to have its names updated externally.
-type AssociatedNameUpdater interface {
+// AssociatedConfig defines the contract for a config that is associated with another config.
+type AssociatedConfig interface {
+	// Equals is a function that describes if an AssociatedConfig is the same as another
+	Equals(AssociatedConfig) bool
+
+	// UpdateResourceNames allows an AssociatedConfig to have its names updated externally.
 	UpdateResourceNames(func(n Name) Name)
+
+	// Link associates an AssociatedConfig to a specific resource model (e.g. builtin data capture).
+	Link(conf *Config)
 }
 
 // An AssociatedConfigRegistration describes how to convert all attributes
 // for a type of resource associated with another resource (e.g. data capture on a resource).
-type AssociatedConfigRegistration[AssocT AssociatedNameUpdater] struct {
+type AssociatedConfigRegistration[AssocT AssociatedConfig] struct {
 	// AttributeMapConverter is used to convert raw attributes to the resource's native associated config.
 	AttributeMapConverter AttributeMapConverter[AssocT]
 
@@ -202,7 +196,7 @@ var (
 	registryMu                    sync.RWMutex
 	registry                      = map[APIModel]Registration[Resource, ConfigValidator]{}
 	apiRegistry                   = map[API]APIRegistration[Resource]{}
-	associatedConfigRegistrations = []AssociatedConfigRegistration[AssociatedNameUpdater]{}
+	associatedConfigRegistrations = []AssociatedConfigRegistration[AssociatedConfig]{}
 )
 
 // DefaultServices returns all servies that will be constructed by default if not
@@ -269,7 +263,8 @@ func Register[ResourceT Resource, ConfigT ConfigValidator](
 	apiModel := APIModel{api, model}
 	_, old := registry[apiModel]
 	if old {
-		panic(errors.Errorf("trying to register two resources with same api: %q, model: %q", api, model))
+		logging.Global().Errorw("An api, model pair is being double registered. Overwriting the old with the new.",
+			"api", api, "model", model)
 	}
 	if reg.Constructor == nil && reg.DeprecatedRobotConstructor == nil {
 		panic(errors.Errorf("cannot register a nil constructor for api: %q, model: %q", api, model))
@@ -308,7 +303,7 @@ func makeGenericResourceRegistration[ResourceT Resource, ConfigT ConfigValidator
 			ctx context.Context,
 			deps Dependencies,
 			conf Config,
-			logger golog.Logger,
+			logger logging.Logger,
 		) (Resource, error) {
 			return typed.Constructor(ctx, deps, conf, logger)
 		}
@@ -318,7 +313,7 @@ func makeGenericResourceRegistration[ResourceT Resource, ConfigT ConfigValidator
 			ctx context.Context,
 			r any,
 			conf Config,
-			logger golog.Logger,
+			logger logging.Logger,
 		) (Resource, error) {
 			return typed.DeprecatedRobotConstructor(ctx, r, conf, logger)
 		}
@@ -326,15 +321,6 @@ func makeGenericResourceRegistration[ResourceT Resource, ConfigT ConfigValidator
 	if typed.AttributeMapConverter != nil {
 		reg.AttributeMapConverter = func(attributes utils.AttributeMap) (ConfigValidator, error) {
 			return typed.AttributeMapConverter(attributes)
-		}
-	}
-	if typed.AssociatedConfigLinker != nil {
-		reg.AssociatedConfigLinker = func(conf ConfigValidator, resAssociation interface{}) error {
-			typedConf, err := utils.AssertType[ConfigT](conf)
-			if err != nil {
-				return err
-			}
-			return typed.AssociatedConfigLinker(typedConf, resAssociation)
 		}
 	}
 
@@ -367,7 +353,8 @@ func RegisterAPI[ResourceT Resource](api API, creator APIRegistration[ResourceT]
 	defer registryMu.Unlock()
 	_, old := apiRegistry[api]
 	if old {
-		panic(errors.Errorf("trying to register two of the same resource api: %s", api))
+		logging.Global().Errorw("An api name is being double registered. Overwriting the old with the new.",
+			"api", api)
 	}
 	if creator.RPCServiceServerConstructor != nil &&
 		(creator.RPCServiceDesc == nil || creator.RPCServiceHandler == nil) {
@@ -386,7 +373,7 @@ func RegisterAPI[ResourceT Resource](api API, creator APIRegistration[ResourceT]
 
 // RegisterAPIWithAssociation register a ResourceAPI to its corresponding resource api
 // along with a way to allow other resources to associate into its config.
-func RegisterAPIWithAssociation[ResourceT Resource, AssocT AssociatedNameUpdater](
+func RegisterAPIWithAssociation[ResourceT Resource, AssocT AssociatedConfig](
 	api API,
 	creator APIRegistration[ResourceT],
 	association AssociatedConfigRegistration[AssocT],
@@ -407,26 +394,26 @@ func RegisterAPIWithAssociation[ResourceT Resource, AssocT AssociatedNameUpdater
 }
 
 // LookupAssociatedConfigRegistration finds the resource association config registration for the given api.
-func LookupAssociatedConfigRegistration(api API) (AssociatedConfigRegistration[AssociatedNameUpdater], bool) {
+func LookupAssociatedConfigRegistration(api API) (AssociatedConfigRegistration[AssociatedConfig], bool) {
 	for _, conv := range associatedConfigRegistrations {
 		if conv.api == api {
 			return conv, true
 		}
 	}
-	return AssociatedConfigRegistration[AssociatedNameUpdater]{}, false
+	return AssociatedConfigRegistration[AssociatedConfig]{}, false
 }
 
 // makeGenericAssociatedConfigRegistration allows an association to be generic and ensures all input/output types
 // are actually T's.
-func makeGenericAssociatedConfigRegistration[AssocT AssociatedNameUpdater](
+func makeGenericAssociatedConfigRegistration[AssocT AssociatedConfig](
 	typed AssociatedConfigRegistration[AssocT],
-) AssociatedConfigRegistration[AssociatedNameUpdater] {
-	reg := AssociatedConfigRegistration[AssociatedNameUpdater]{
+) AssociatedConfigRegistration[AssociatedConfig] {
+	reg := AssociatedConfigRegistration[AssociatedConfig]{
 		// NOTE: any fields added to AssociatedConfigRegistration must be copied/adapted here.
 		api: typed.api,
 	}
 	if typed.AttributeMapConverter != nil {
-		reg.AttributeMapConverter = func(attributes utils.AttributeMap) (AssociatedNameUpdater, error) {
+		reg.AttributeMapConverter = func(attributes utils.AttributeMap) (AssociatedConfig, error) {
 			return typed.AttributeMapConverter(attributes)
 		}
 	}
@@ -445,9 +432,6 @@ func (g genericSubypeCollection[ResourceT]) Resource(name string) (Resource, err
 }
 
 func (g genericSubypeCollection[ResourceT]) ReplaceAll(resources map[Name]Resource) error {
-	if len(resources) == 0 {
-		return nil
-	}
 	copied := make(map[Name]ResourceT, len(resources))
 	for k, v := range resources {
 		typed, err := AsType[ResourceT](v)
@@ -496,15 +480,7 @@ func makeGenericAPIRegistration[ResourceT Resource](
 			return genericSubypeCollection[ResourceT]{NewEmptyAPIResourceCollection[ResourceT](api)}
 		},
 	}
-	if typed.Status != nil {
-		reg.Status = func(ctx context.Context, res Resource) (interface{}, error) {
-			typedRes, err := AsType[ResourceT](res)
-			if err != nil {
-				return nil, err
-			}
-			return typed.Status(ctx, typedRes)
-		}
-	}
+
 	if typed.RPCServiceServerConstructor != nil {
 		reg.RPCServiceServerConstructor = func(
 			coll APIResourceCollection[Resource],
@@ -524,7 +500,7 @@ func makeGenericAPIRegistration[ResourceT Resource](
 			conn rpc.ClientConn,
 			remoteName string,
 			name Name,
-			logger golog.Logger,
+			logger logging.Logger,
 		) (Resource, error) {
 			return typed.RPCClient(ctx, conn, remoteName, name, logger)
 		}

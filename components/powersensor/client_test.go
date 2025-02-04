@@ -6,20 +6,21 @@ import (
 	"net"
 	"testing"
 
-	"github.com/edaniels/golog"
 	"go.viam.com/test"
 	"go.viam.com/utils/rpc"
 
 	"go.viam.com/rdk/components/motor"
 	"go.viam.com/rdk/components/powersensor"
+	"go.viam.com/rdk/components/sensor"
 	viamgrpc "go.viam.com/rdk/grpc"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/testutils"
 	"go.viam.com/rdk/testutils/inject"
 )
 
 func TestClient(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	listener1, err := net.Listen("tcp", "localhost:0")
 	test.That(t, err, test.ShouldBeNil)
 	rpcServer, err := rpc.NewServer(logger, rpc.WithUnauthenticated())
@@ -55,6 +56,10 @@ func TestClient(t *testing.T) {
 
 	failingPowerSensor.PowerFunc = func(ctx context.Context, extra map[string]interface{}) (float64, error) {
 		return 0, errPowerFailed
+	}
+
+	failingPowerSensor.ReadingsFunc = func(ctx context.Context, extra map[string]interface{}) (map[string]interface{}, error) {
+		return nil, nil
 	}
 
 	resourceMap := map[resource.Name]powersensor.PowerSensor{
@@ -133,6 +138,9 @@ func TestClient(t *testing.T) {
 		test.That(t, err, test.ShouldNotBeNil)
 		test.That(t, err.Error(), test.ShouldContainSubstring, errPowerFailed.Error())
 		test.That(t, watts, test.ShouldEqual, 0)
+
+		_, err = client.Readings(context.Background(), make(map[string]interface{}))
+		test.That(t, err.Error(), test.ShouldContainSubstring, sensor.ErrReadingsNil("power-sensor", failingPowerSensorName).Error())
 
 		test.That(t, client.Close(context.Background()), test.ShouldBeNil)
 		test.That(t, conn.Close(), test.ShouldBeNil)

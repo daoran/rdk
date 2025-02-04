@@ -41,7 +41,8 @@ func (s sphere) MarshalJSON() ([]byte, error) {
 
 // String returns a human readable string that represents the sphere.
 func (s *sphere) String() string {
-	return fmt.Sprintf("Type: Sphere, Radius: %.0f", s.radius)
+	return fmt.Sprintf("Type: Sphere | Position: X:%.1f, Y:%.1f, Z:%.1f | Radius: %.0f",
+		s.pose.Point().X, s.pose.Point().Y, s.pose.Point().Z, s.radius)
 }
 
 // Label returns the label of this sphere.
@@ -62,12 +63,12 @@ func (s *sphere) Pose() Pose {
 }
 
 // AlmostEqual compares the sphere with another geometry and checks if they are equivalent.
-func (s *sphere) AlmostEqual(g Geometry) bool {
+func (s *sphere) almostEqual(g Geometry) bool {
 	other, ok := g.(*sphere)
 	if !ok {
 		return false
 	}
-	return PoseAlmostEqual(s.pose, other.pose) && utils.Float64AlmostEqual(s.radius, other.radius, 1e-8)
+	return PoseAlmostEqualEps(s.pose, other.pose, 1e-6) && utils.Float64AlmostEqual(s.radius, other.radius, 1e-8)
 }
 
 // Transform premultiplies the sphere pose with a transform, allowing the sphere to be moved in space.
@@ -89,18 +90,18 @@ func (s *sphere) ToProtobuf() *commonpb.Geometry {
 }
 
 // CollidesWith checks if the given sphere collides with the given geometry and returns true if it does.
-func (s *sphere) CollidesWith(g Geometry) (bool, error) {
+func (s *sphere) CollidesWith(g Geometry, collisionBufferMM float64) (bool, error) {
 	if other, ok := g.(*sphere); ok {
-		return sphereVsSphereDistance(s, other) <= CollisionBuffer, nil
+		return sphereVsSphereDistance(s, other) <= collisionBufferMM, nil
 	}
 	if other, ok := g.(*capsule); ok {
-		return capsuleVsSphereDistance(other, s) <= CollisionBuffer, nil
+		return capsuleVsSphereDistance(other, s) <= collisionBufferMM, nil
 	}
 	if other, ok := g.(*box); ok {
-		return sphereVsBoxCollision(s, other), nil
+		return sphereVsBoxCollision(s, other, collisionBufferMM), nil
 	}
 	if other, ok := g.(*point); ok {
-		return sphereVsPointDistance(s, other.position) <= CollisionBuffer, nil
+		return sphereVsPointDistance(s, other.position) <= collisionBufferMM, nil
 	}
 	return true, newCollisionTypeUnsupportedError(s, g)
 }
@@ -155,8 +156,8 @@ func sphereVsSphereDistance(a, s *sphere) float64 {
 // sphereVsBoxDistance takes a box and a sphere as arguments and returns a bool describing if they are in collision
 // true == collision / false == no collision.
 // Reference: https://github.com/gszauer/GamePhysicsCookbook/blob/a0b8ee0c39fed6d4b90bb6d2195004dfcf5a1115/Code/Geometry3D.cpp#L326
-func sphereVsBoxCollision(s *sphere, b *box) bool {
-	return s.pose.Point().Sub(b.closestPoint(s.pose.Point())).Norm() <= s.radius+CollisionBuffer
+func sphereVsBoxCollision(s *sphere, b *box, collisionBufferMM float64) bool {
+	return s.pose.Point().Sub(b.closestPoint(s.pose.Point())).Norm() <= s.radius+collisionBufferMM
 }
 
 // sphereVsBoxDistance takes a box and a sphere as arguments and returns a floating point number.  If this number is nonpositive it

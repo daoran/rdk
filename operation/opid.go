@@ -7,9 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/google/uuid"
 
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/session"
 )
 
@@ -71,15 +71,16 @@ func (o *Operation) cleanup() {
 }
 
 // NewManager creates a new manager for holding Operations.
-func NewManager(logger golog.Logger) *Manager {
-	return &Manager{ops: map[string]*Operation{}, logger: logger}
+func NewManager(logger logging.Logger) *Manager {
+	opLogger := logger.Sublogger("operation_manager")
+	return &Manager{ops: map[string]*Operation{}, logger: opLogger}
 }
 
 // Manager holds Operations.
 type Manager struct {
 	ops    map[string]*Operation
 	lock   sync.Mutex
-	logger golog.Logger
+	logger logging.Logger
 }
 
 func (m *Manager) remove(id uuid.UUID) {
@@ -137,7 +138,22 @@ func (m *Manager) createWithID(ctx context.Context, id uuid.UUID, method string,
 
 	o := m.Find(id)
 	if o != nil {
-		m.logger.Warnw("attempt to create duplicate operation", "id", id.String(), "method", method)
+		// Given the exceedingly low chance of a randomly generated UUID colliding, unless it was purposeful, the only way
+		// opids will collide is if an operation goes to a module and then back to a dependency as a child operation
+		// (e.g. SetPower on a modular base calling into SetPower on a builtin motor). In those cases, we would want to
+		// keep track of the original operation, not the incoming one.
+		// The parent operation is attached to the context before returning so that the behavior mimicks what happens for operations
+		// that stay within the robot.
+		m.logger.CDebugw(
+			ctx,
+			"attempt to create duplicate operation, can ignore if caused by a modular resource calling to a dependency",
+			"id",
+			id.String(),
+			"method",
+			method,
+		)
+		ctx = context.WithValue(ctx, opidKey, o)
+		return ctx, func() {}
 	}
 
 	op := &Operation{

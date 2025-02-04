@@ -1,24 +1,22 @@
+//go:build !no_cgo
+
 // Package arm contains a gRPC based arm client.
 package arm
 
 import (
 	"context"
-	"errors"
-	"fmt"
 
-	"github.com/edaniels/golog"
 	commonpb "go.viam.com/api/common/v1"
 	pb "go.viam.com/api/component/arm/v1"
 	"go.viam.com/utils/protoutils"
 	"go.viam.com/utils/rpc"
 
+	"go.viam.com/rdk/logging"
 	rprotoutils "go.viam.com/rdk/protoutils"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/spatialmath"
 )
-
-var errArmClientModelNotValid = errors.New("unable to retrieve a valid arm model from arm client")
 
 // client implements ArmServiceClient.
 type client struct {
@@ -28,7 +26,7 @@ type client struct {
 	name   string
 	client pb.ArmServiceClient
 	model  referenceframe.Model
-	logger golog.Logger
+	logger logging.Logger
 }
 
 // NewClientFromConn constructs a new Client from connection passed in.
@@ -37,7 +35,7 @@ func NewClientFromConn(
 	conn rpc.ClientConn,
 	remoteName string,
 	name resource.Name,
-	logger golog.Logger,
+	logger logging.Logger,
 ) (Arm, error) {
 	pbClient := pb.NewArmServiceClient(conn)
 	c := &client{
@@ -48,7 +46,12 @@ func NewClientFromConn(
 	}
 	clientFrame, err := c.updateKinematics(ctx, nil)
 	if err != nil {
-		logger.Errorw("error getting model for arm; will not allow certain methods", "err", err)
+		logger.CWarnw(
+			ctx,
+			"error getting model for arm; making the assumption that joints are revolute and that their positions are specified in degrees",
+			"err",
+			err,
+		)
 	} else {
 		c.model = clientFrame
 	}
@@ -75,6 +78,9 @@ func (c *client) MoveToPosition(ctx context.Context, pose spatialmath.Pose, extr
 	if err != nil {
 		return err
 	}
+	if pose == nil {
+		c.logger.Warnf("%s MoveToPosition: pose parameter is nil", c.name)
+	}
 	_, err = c.client.MoveToPosition(ctx, &pb.MoveToPositionRequest{
 		Name:  c.name,
 		To:    spatialmath.PoseToProtobuf(pose),
@@ -83,20 +89,57 @@ func (c *client) MoveToPosition(ctx context.Context, pose spatialmath.Pose, extr
 	return err
 }
 
-func (c *client) MoveToJointPositions(ctx context.Context, positions *pb.JointPositions, extra map[string]interface{}) error {
+func (c *client) MoveToJointPositions(ctx context.Context, positions []referenceframe.Input, extra map[string]interface{}) error {
 	ext, err := protoutils.StructToStructPb(extra)
+	if err != nil {
+		return err
+	}
+	jp, err := referenceframe.JointPositionsFromInputs(c.model, positions)
 	if err != nil {
 		return err
 	}
 	_, err = c.client.MoveToJointPositions(ctx, &pb.MoveToJointPositionsRequest{
 		Name:      c.name,
-		Positions: positions,
+		Positions: jp,
 		Extra:     ext,
 	})
 	return err
 }
 
-func (c *client) JointPositions(ctx context.Context, extra map[string]interface{}) (*pb.JointPositions, error) {
+func (c *client) MoveThroughJointPositions(
+	ctx context.Context,
+	positions [][]referenceframe.Input,
+	options *MoveOptions,
+	extra map[string]interface{},
+) error {
+	ext, err := protoutils.StructToStructPb(extra)
+	if err != nil {
+		return err
+	}
+	if positions == nil {
+		c.logger.Warnf("%s MoveThroughJointPositions: position argument is nil", c.name)
+	}
+	allJPs := make([]*pb.JointPositions, 0, len(positions))
+	for _, position := range positions {
+		jp, err := referenceframe.JointPositionsFromInputs(c.model, position)
+		if err != nil {
+			return err
+		}
+		allJPs = append(allJPs, jp)
+	}
+	req := &pb.MoveThroughJointPositionsRequest{
+		Name:      c.name,
+		Positions: allJPs,
+		Extra:     ext,
+	}
+	if options != nil {
+		req.Options = options.toProtobuf()
+	}
+	_, err = c.client.MoveThroughJointPositions(ctx, req)
+	return err
+}
+
+func (c *client) JointPositions(ctx context.Context, extra map[string]interface{}) ([]referenceframe.Input, error) {
 	ext, err := protoutils.StructToStructPb(extra)
 	if err != nil {
 		return nil, err
@@ -108,7 +151,7 @@ func (c *client) JointPositions(ctx context.Context, extra map[string]interface{
 	if err != nil {
 		return nil, err
 	}
-	return resp.Positions, nil
+	return referenceframe.InputsFromJointPositions(c.model, resp.Positions)
 }
 
 func (c *client) Stop(ctx context.Context, extra map[string]interface{}) error {
@@ -128,21 +171,11 @@ func (c *client) ModelFrame() referenceframe.Model {
 }
 
 func (c *client) CurrentInputs(ctx context.Context) ([]referenceframe.Input, error) {
-	if c.model == nil {
-		return nil, errArmClientModelNotValid
-	}
-	resp, err := c.JointPositions(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	return c.model.InputFromProtobuf(resp), nil
+	return c.JointPositions(ctx, nil)
 }
 
-func (c *client) GoToInputs(ctx context.Context, goal []referenceframe.Input) error {
-	if c.model == nil {
-		return errArmClientModelNotValid
-	}
-	return c.MoveToJointPositions(ctx, c.model.ProtobufFromInput(goal), nil)
+func (c *client) GoToInputs(ctx context.Context, inputSteps ...[]referenceframe.Input) error {
+	return c.MoveThroughJointPositions(ctx, inputSteps, nil, nil)
 }
 
 func (c *client) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
@@ -185,24 +218,5 @@ func (c *client) updateKinematics(ctx context.Context, extra map[string]interfac
 		return nil, err
 	}
 
-	format := resp.GetFormat()
-	data := resp.GetKinematicsData()
-
-	switch format {
-	case commonpb.KinematicsFileFormat_KINEMATICS_FILE_FORMAT_SVA:
-		return referenceframe.UnmarshalModelJSON(data, c.name)
-	case commonpb.KinematicsFileFormat_KINEMATICS_FILE_FORMAT_URDF:
-		modelconf, err := referenceframe.ConvertURDFToConfig(data, c.name)
-		if err != nil {
-			return nil, err
-		}
-		return modelconf.ParseConfig(c.name)
-	case commonpb.KinematicsFileFormat_KINEMATICS_FILE_FORMAT_UNSPECIFIED:
-		fallthrough
-	default:
-		if formatName, ok := commonpb.KinematicsFileFormat_name[int32(format)]; ok {
-			return nil, fmt.Errorf("unable to parse file of type %s", formatName)
-		}
-		return nil, fmt.Errorf("unable to parse unknown file type %d", format)
-	}
+	return parseKinematicsResponse(c.name, resp)
 }

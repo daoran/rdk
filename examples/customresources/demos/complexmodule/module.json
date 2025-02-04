@@ -2,7 +2,7 @@
 	"modules": [
 		{
 			"name": "AcmeModule",
-			"executable_path": "./complexmodule",
+			"executable_path": "./run.sh",
 			"log_level": "debug"
 		}
 	],
@@ -21,7 +21,8 @@
 			"namespace": "acme",
 			"type": "summation",
 			"name": "adder",
-			"model": "acme:demo:mysum"
+			"model": "acme:demo:mysum",
+			"attributes" : {}
 		},
 		{
 			"namespace": "acme",

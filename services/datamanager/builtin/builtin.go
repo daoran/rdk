@@ -1,129 +1,125 @@
-// Package builtin contains a service type that can be used to capture data from a robot's components.
+// Package builtin captures data from a robot's components, persists the captured data to disk and sync it to the cloud
+// when possible.
 package builtin
+
+// Design note:
+// Builtin is a thin wrapper around builtin.capture and builtin.sync packages which manage data capture and data sync (respectively).
+// Builtin can operate with either sync, capture, both or neither enabled.
+// The main responsibility of the builtin package is to collect the dependencies required by sync and capture from resource graph
+// and to provide a thread safe interface for resource graph to call into the datasync and data capture during initialization,
+// reconfiguration, and shutdown.
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"os"
 	"path/filepath"
-	"reflect"
 	"sync"
 	"time"
 
-	clk "github.com/benbjohnson/clock"
-	"github.com/edaniels/golog"
-	"github.com/pkg/errors"
+	"github.com/benbjohnson/clock"
 	v1 "go.viam.com/api/app/datasync/v1"
-	goutils "go.viam.com/utils"
 	"go.viam.com/utils/rpc"
+	"google.golang.org/grpc"
 
-	"go.viam.com/rdk/data"
-	"go.viam.com/rdk/internal"
+	"go.viam.com/rdk/components/sensor"
 	"go.viam.com/rdk/internal/cloud"
-	"go.viam.com/rdk/protoutils"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/services/datamanager"
-	"go.viam.com/rdk/services/datamanager/datacapture"
-	"go.viam.com/rdk/services/datamanager/datasync"
+	"go.viam.com/rdk/services/datamanager/builtin/capture"
+	datasync "go.viam.com/rdk/services/datamanager/builtin/sync"
+	"go.viam.com/rdk/services/slam"
+	"go.viam.com/rdk/services/vision"
 	"go.viam.com/rdk/utils"
 )
 
+var (
+	// ErrCaptureDirectoryConfigurationDisabled happens when the viam-server is run with
+	// `-untrusted-env` and the capture directory is not `~/.viam/capture`.
+	ErrCaptureDirectoryConfigurationDisabled = errors.New("changing the capture directory is prohibited in this environment")
+	viamCaptureDotDir                        = filepath.Join(os.Getenv("HOME"), ".viam", "capture")
+	// This clock only exists for tests.
+	// At time of writing only a single test depends on it.
+	// We should endevor to not add more tests that depend on it unless absolutiely necessary.
+	clk = clock.New()
+	// diskSummaryLogInterval is the frequency a summary of the sync paths are logged.
+	diskSummaryLogInterval = time.Minute
+)
+
+// In order for a collector to be captured by Data Capture, it must be included as a weak dependency.
 func init() {
-	resource.RegisterDefaultService(
+	constructor := func(
+		ctx context.Context,
+		deps resource.Dependencies,
+		conf resource.Config,
+		logger logging.Logger,
+	) (datamanager.Service, error) {
+		// we inject v1.NewDataSyncServiceClient and datasync.ConnToConnectivityStateEnabled as dependencies for tests
+		return New(
+			ctx,
+			deps,
+			conf,
+			v1.NewDataSyncServiceClient,
+			datasync.ConnToConnectivityState,
+			logger,
+		)
+	}
+	resource.RegisterService(
 		datamanager.API,
 		resource.DefaultServiceModel,
 		resource.Registration[datamanager.Service, *Config]{
-			Constructor: NewBuiltIn,
-			AssociatedConfigLinker: func(conf *Config, resAssociation interface{}) error {
-				capConf, err := utils.AssertType[*datamanager.DataCaptureConfigs](resAssociation)
-				if err != nil {
-					return err
-				}
-				for _, method := range capConf.CaptureMethods {
-					methodCopy := method
-					conf.ResourceConfigs = append(conf.ResourceConfigs, &methodCopy)
-				}
-
-				return nil
+			Constructor: constructor,
+			WeakDependencies: []resource.Matcher{
+				resource.TypeMatcher{Type: resource.APITypeComponentName},
+				resource.SubtypeMatcher{Subtype: slam.SubtypeName},
+				resource.SubtypeMatcher{Subtype: vision.SubtypeName},
 			},
-			// NOTE(erd): this would be better as a weak dependencies returned through a more
-			// typed validate or different system.
-			WeakDependencies: []internal.ResourceMatcher{internal.ComponentDependencyWildcardMatcher, internal.SLAMDependencyWildcardMatcher},
 		})
 }
 
-// TODO: re-determine if queue size is optimal given we now support 10khz+ capture rates
-// The Collector's queue should be big enough to ensure that .capture() is never blocked by the queue being
-// written to disk. A default value of 250 was chosen because even with the fastest reasonable capture interval (1ms),
-// this would leave 250ms for a (buffered) disk write before blocking, which seems sufficient for the size of
-// writes this would be performing.
-const defaultCaptureQueueSize = 250
-
-// Default bufio.Writer buffer size in bytes.
-const defaultCaptureBufferSize = 4096
-
-var clock = clk.New()
-
-var errCaptureDirectoryConfigurationDisabled = errors.New("changing the capture directory is prohibited in this environment")
-
-// Config describes how to configure the service.
-type Config struct {
-	CaptureDir            string                           `json:"capture_dir"`
-	AdditionalSyncPaths   []string                         `json:"additional_sync_paths"`
-	SyncIntervalMins      float64                          `json:"sync_interval_mins"`
-	CaptureDisabled       bool                             `json:"capture_disabled"`
-	ScheduledSyncDisabled bool                             `json:"sync_disabled"`
-	Tags                  []string                         `json:"tags"`
-	ResourceConfigs       []*datamanager.DataCaptureConfig `json:"resource_configs"`
-}
-
-// Validate returns components which will be depended upon weakly due to the above matcher.
-func (c *Config) Validate(path string) ([]string, error) {
-	return []string{cloud.InternalServiceName.String()}, nil
-}
-
-// builtIn initializes and orchestrates data capture collectors for registered component/methods.
+// builtIn initializes and orchestrates data capture and data sync based on the config.
 type builtIn struct {
 	resource.Named
-	logger                      golog.Logger
-	captureDir                  string
-	captureDisabled             bool
-	collectors                  map[resourceMethodMetadata]*collectorAndConfig
-	lock                        sync.Mutex
-	backgroundWorkers           sync.WaitGroup
-	waitAfterLastModifiedMillis int
+	logger logging.Logger
 
-	additionalSyncPaths []string
-	tags                []string
-	syncDisabled        bool
-	syncIntervalMins    float64
-	syncRoutineCancelFn context.CancelFunc
-	syncer              datasync.Manager
-	syncerConstructor   datasync.ManagerConstructor
-	cloudConnSvc        cloud.ConnectionService
-	cloudConn           rpc.ClientConn
-	syncTicker          *clk.Ticker
+	mu                sync.Mutex
+	capture           *capture.Capture
+	sync              *datasync.Sync
+	diskSummaryLogger *diskSummaryLogger
 }
 
-var viamCaptureDotDir = filepath.Join(os.Getenv("HOME"), ".viam", "capture")
-
-// NewBuiltIn returns a new data manager service for the given robot.
-func NewBuiltIn(
+// New returns a new builtin data manager service for the given robot.
+func New(
 	ctx context.Context,
 	deps resource.Dependencies,
 	conf resource.Config,
-	logger golog.Logger,
+	cloudClientConstructor func(grpc.ClientConnInterface) v1.DataSyncServiceClient,
+	connToConnectivityStateEnabled func(conn rpc.ClientConn) datasync.ConnectivityState,
+	logger logging.Logger,
 ) (datamanager.Service, error) {
+	logger.Info("New START")
+	defer logger.Info("New END")
+	capture := capture.New(
+		clk,
+		logger.Sublogger("capture"),
+	)
+	// sync needs to be able to flush collectors so that in memory data can be flushed to disk before a given sync interval
+	// or manual sync call
+	sync := datasync.New(
+		cloudClientConstructor,
+		connToConnectivityStateEnabled,
+		capture.FlushCollectors,
+		clk,
+		logger.Sublogger("sync"),
+	)
+	diskSummaryLogger := newDiskSummaryLogger(logger)
 	svc := &builtIn{
-		Named:                       conf.ResourceName().AsNamed(),
-		logger:                      logger,
-		captureDir:                  viamCaptureDotDir,
-		collectors:                  make(map[resourceMethodMetadata]*collectorAndConfig),
-		syncIntervalMins:            0,
-		additionalSyncPaths:         []string{},
-		tags:                        []string{},
-		waitAfterLastModifiedMillis: 10000,
-		syncerConstructor:           datasync.NewManager,
+		Named:             conf.ResourceName().AsNamed(),
+		logger:            logger,
+		capture:           capture,
+		sync:              sync,
+		diskSummaryLogger: diskSummaryLogger,
 	}
 
 	if err := svc.Reconfigure(ctx, deps, conf); err != nil {
@@ -133,181 +129,14 @@ func NewBuiltIn(
 }
 
 // Close releases all resources managed by data_manager.
-func (svc *builtIn) Close(_ context.Context) error {
-	svc.lock.Lock()
-	svc.closeCollectors()
-	svc.closeSyncer()
-	svc.cancelSyncScheduler()
-
-	svc.lock.Unlock()
-	svc.backgroundWorkers.Wait()
-	return nil
-}
-
-func (svc *builtIn) closeCollectors() {
-	var wg sync.WaitGroup
-	for md, collector := range svc.collectors {
-		currCollector := collector
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			currCollector.Collector.Close()
-		}()
-		delete(svc.collectors, md)
-	}
-	wg.Wait()
-}
-
-func (svc *builtIn) flushCollectors() {
-	var wg sync.WaitGroup
-	for _, collector := range svc.collectors {
-		currCollector := collector
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			currCollector.Collector.Flush()
-		}()
-	}
-	wg.Wait()
-}
-
-// Parameters stored for each collector.
-type collectorAndConfig struct {
-	Collector data.Collector
-	Config    datamanager.DataCaptureConfig
-}
-
-// Identifier for a particular collector: component name, component model, component type,
-// method parameters, and method name.
-type resourceMethodMetadata struct {
-	ResourceName   string
-	MethodParams   string
-	MethodMetadata data.MethodMetadata
-}
-
-// Get time.Duration from hz.
-func getDurationFromHz(captureFrequencyHz float32) time.Duration {
-	if captureFrequencyHz == 0 {
-		return time.Duration(0)
-	}
-	return time.Duration(float32(time.Second) / captureFrequencyHz)
-}
-
-// Initialize a collector for the component/method or update it if it has previously been created.
-// Return the component/method metadata which is used as a key in the collectors map.
-func (svc *builtIn) initializeOrUpdateCollector(
-	md resourceMethodMetadata,
-	config *datamanager.DataCaptureConfig,
-) (
-	*collectorAndConfig, error,
-) {
-	// Build metadata.
-	captureMetadata, err := datacapture.BuildCaptureMetadata(
-		config.Name.API,
-		config.Name.ShortName(),
-		config.Method,
-		config.AdditionalParams,
-		config.Tags,
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	// TODO(DATA-451): validate method params
-
-	if storedCollectorAndConfig, ok := svc.collectors[md]; ok {
-		if storedCollectorAndConfig.Config.Equals(config) {
-			// If the attributes have not changed, do nothing and leave the existing collector.
-			return svc.collectors[md], nil
-		}
-		// If the attributes have changed, close the existing collector.
-		storedCollectorAndConfig.Collector.Close()
-	}
-
-	// Get collector constructor for the component API and method.
-	collectorConstructor := data.CollectorLookup(md.MethodMetadata)
-	if collectorConstructor == nil {
-		return nil, errors.Errorf("failed to find collector constructor for %s", md.MethodMetadata)
-	}
-
-	// Parameters to initialize collector.
-	interval := getDurationFromHz(config.CaptureFrequencyHz)
-
-	// Set queue size to defaultCaptureQueueSize if it was not set in the config.
-	captureQueueSize := config.CaptureQueueSize
-	if captureQueueSize == 0 {
-		captureQueueSize = defaultCaptureQueueSize
-	}
-
-	captureBufferSize := config.CaptureBufferSize
-	if captureBufferSize == 0 {
-		captureBufferSize = defaultCaptureBufferSize
-	}
-
-	methodParams, err := protoutils.ConvertStringMapToAnyPBMap(config.AdditionalParams)
-	if err != nil {
-		return nil, err
-	}
-
-	// Create a collector for this resource and method.
-	targetDir := filepath.Join(svc.captureDir, captureMetadata.GetComponentType(), captureMetadata.GetComponentName(),
-		captureMetadata.GetMethodName())
-	if err := os.MkdirAll(targetDir, 0o700); err != nil {
-		return nil, err
-	}
-	params := data.CollectorParams{
-		ComponentName: config.Name.ShortName(),
-		Interval:      interval,
-		MethodParams:  methodParams,
-		Target:        datacapture.NewBuffer(targetDir, captureMetadata),
-		QueueSize:     captureQueueSize,
-		BufferSize:    captureBufferSize,
-		Logger:        svc.logger,
-		Clock:         clock,
-	}
-	collector, err := (*collectorConstructor)(config.Resource, params)
-	if err != nil {
-		return nil, err
-	}
-	collector.Collect()
-
-	return &collectorAndConfig{collector, *config}, nil
-}
-
-func (svc *builtIn) closeSyncer() {
-	if svc.syncer != nil {
-		// If previously we were syncing, close the old syncer and cancel the old updateCollectors goroutine.
-		svc.syncer.Close()
-		svc.syncer = nil
-	}
-	if svc.cloudConn != nil {
-		goutils.UncheckedError(svc.cloudConn.Close())
-	}
-}
-
-var grpcConnectionTimeout = 10 * time.Second
-
-func (svc *builtIn) initSyncer(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, grpcConnectionTimeout)
-	defer cancel()
-
-	identity, conn, err := svc.cloudConnSvc.AcquireConnection(ctx)
-	if errors.Is(err, cloud.ErrNotCloudManaged) {
-		svc.logger.Debug("Using no-op sync manager when not cloud managed")
-		svc.syncer = datasync.NewNoopManager()
-	}
-	if err != nil {
-		return err
-	}
-
-	client := v1.NewDataSyncServiceClient(conn)
-
-	syncer, err := svc.syncerConstructor(identity, client, svc.logger)
-	if err != nil {
-		return errors.Wrap(err, "failed to initialize new syncer")
-	}
-	svc.syncer = syncer
-	svc.cloudConn = conn
+func (b *builtIn) Close(ctx context.Context) error {
+	b.logger.Info("Close START")
+	defer b.logger.Info("Close END")
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.diskSummaryLogger.close()
+	b.capture.Close(ctx)
+	b.sync.Close()
 	return nil
 }
 
@@ -315,236 +144,119 @@ func (svc *builtIn) initSyncer(ctx context.Context) error {
 //       If so, how could a user cancel it?
 
 // Sync performs a non-scheduled sync of the data in the capture directory.
-func (svc *builtIn) Sync(ctx context.Context, _ map[string]interface{}) error {
-	svc.lock.Lock()
-	defer svc.lock.Unlock()
-	if svc.syncer == nil {
-		err := svc.initSyncer(ctx)
-		if err != nil {
-			return err
-		}
-	}
-
-	svc.sync()
-	return nil
+// If automated sync is also enabled, calling Sync will upload the files,
+// regardless of whether or not is the scheduled time.
+func (b *builtIn) Sync(ctx context.Context, extra map[string]interface{}) error {
+	b.logger.Info("Sync START")
+	defer b.logger.Info("Sync END")
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.sync.Sync(ctx, extra)
 }
 
 // Reconfigure updates the data manager service when the config has changed.
-func (svc *builtIn) Reconfigure(
-	ctx context.Context,
-	deps resource.Dependencies,
-	conf resource.Config,
-) error {
-	svc.lock.Lock()
-	defer svc.lock.Unlock()
-	svcConfig, err := resource.NativeConfig[*Config](conf)
+// At time of writing Reconfigure only returns an error in one of the following unrecoverable error cases:
+//  1. There is some static (aka compile time) error which we currently are only able to detected at runtime:
+//     a. Config isn't a NativeConfig,
+//     b. resource graph didn't boot the internal cloud service before booting datamanager (which would be a resource graph bug)
+//     c. the resource.Config.AssociatedAttributes were not of type *datamanager.AssociatedConfig
+//     (which would be a bug in resource graph or in the collector framework code in resource graph)
+//
+// 2. The user is running data manager in an untrusted env (see the comment above ErrCaptureDirectoryConfigurationDisabled
+// for more details) and has specified a non default capture directory.
+//
+// The only time long lived resources (aka goroutines) are booted is in the calls to capture.Reconfigure and sync.Reconfigure
+// It is important that we only call those methods after we have checked for all errors, otherwise we could leak resources
+// when errors occur.
+// If an error occurs after the first Reconfigure call, data capture & data sync will continue to function using the old config
+// until a successful Reconfigure call is made or Close is called.
+func (b *builtIn) Reconfigure(ctx context.Context, deps resource.Dependencies, conf resource.Config) error {
+	b.logger.Info("Reconfigure START")
+	defer b.logger.Info("Reconfigure END")
+	c, err := resource.NativeConfig[*Config](conf)
 	if err != nil {
+		// If this error occurs it is due to the builtin.Config not being a native config which is a
+		// static error that could only be introduced at compile time.
 		return err
+	}
+
+	if !utils.IsTrustedEnvironment(ctx) && c.CaptureDir != "" && c.CaptureDir != viamCaptureDotDir {
+		// see comment above this error definition for when this happens
+		return ErrCaptureDirectoryConfigurationDisabled
 	}
 
 	cloudConnSvc, err := resource.FromDependencies[cloud.ConnectionService](deps, cloud.InternalServiceName)
 	if err != nil {
+		// If this error occurs it's a resource graph error
 		return err
 	}
 
-	reinitSyncer := cloudConnSvc != svc.cloudConnSvc
-	svc.cloudConnSvc = cloudConnSvc
-
-	svc.updateDataCaptureConfigs(deps, svcConfig.ResourceConfigs, svcConfig.CaptureDir)
-
-	if !utils.IsTrustedEnvironment(ctx) && svcConfig.CaptureDir != "" && svcConfig.CaptureDir != viamCaptureDotDir {
-		return errCaptureDirectoryConfigurationDisabled
+	captureConfig := c.captureConfig()
+	collectorConfigsByResource, err := lookupCollectorConfigsByResource(deps, conf, captureConfig.CaptureDir, b.logger)
+	if err != nil {
+		// If this error occurs it's a resource graph error
+		return err
+	}
+	if err := os.MkdirAll(captureConfig.CaptureDir, 0o700); err != nil {
+		b.logger.Warnf("failed to create capture directory: %s", captureConfig.CaptureDir)
 	}
 
-	if svcConfig.CaptureDir != "" {
-		svc.captureDir = svcConfig.CaptureDir
-	}
-	if svcConfig.CaptureDir == "" {
-		svc.captureDir = viamCaptureDotDir
-	}
-	svc.captureDisabled = svcConfig.CaptureDisabled
-	// Service is disabled, so close all collectors and clear the map so we can instantiate new ones if we enable this service.
-	if svc.captureDisabled {
-		svc.closeCollectors()
-		svc.collectors = make(map[resourceMethodMetadata]*collectorAndConfig)
-	}
+	syncSensor, syncSensorEnabled := syncSensorFromDeps(c.SelectiveSyncerName, deps, b.logger)
+	syncConfig := c.syncConfig(syncSensor, syncSensorEnabled, b.logger)
 
-	// Initialize or add collectors based on changes to the component configurations.
-	newCollectors := make(map[resourceMethodMetadata]*collectorAndConfig)
-	if !svc.captureDisabled {
-		for _, resConf := range svcConfig.ResourceConfigs {
-			if resConf.Resource == nil {
-				// do not have the resource right now
-				continue
-			}
-			if !resConf.Disabled && resConf.CaptureFrequencyHz > 0 {
-				// Create component/method metadata to check if the collector exists.
-				methodMetadata := data.MethodMetadata{
-					API:        resConf.Name.API,
-					MethodName: resConf.Method,
-				}
-
-				componentMethodMetadata := resourceMethodMetadata{
-					ResourceName:   resConf.Name.ShortName(),
-					MethodMetadata: methodMetadata,
-					MethodParams:   fmt.Sprintf("%v", resConf.AdditionalParams),
-				}
-
-				// We only use service-level tags.
-				resConf.Tags = svcConfig.Tags
-
-				newCollectorAndConfig, err := svc.initializeOrUpdateCollector(componentMethodMetadata, resConf)
-				if err != nil {
-					svc.logger.Errorw("failed to initialize or update collector", "error", err)
-				} else {
-					newCollectors[componentMethodMetadata] = newCollectorAndConfig
-				}
-			}
-		}
-	}
-
-	// If a component/method has been removed from the config, close the collector.
-	for md, collAndConfig := range svc.collectors {
-		if _, present := newCollectors[md]; !present {
-			collAndConfig.Collector.Close()
-		}
-	}
-	svc.collectors = newCollectors
-	svc.additionalSyncPaths = svcConfig.AdditionalSyncPaths
-
-	if svc.syncDisabled != svcConfig.ScheduledSyncDisabled || svc.syncIntervalMins != svcConfig.SyncIntervalMins ||
-		!reflect.DeepEqual(svc.tags, svcConfig.Tags) {
-		svc.syncDisabled = svcConfig.ScheduledSyncDisabled
-		svc.syncIntervalMins = svcConfig.SyncIntervalMins
-		svc.tags = svcConfig.Tags
-
-		svc.cancelSyncScheduler()
-		if !svc.syncDisabled && svc.syncIntervalMins != 0.0 {
-			if svc.syncer == nil {
-				if err := svc.initSyncer(ctx); err != nil {
-					return err
-				}
-			} else if reinitSyncer {
-				svc.closeSyncer()
-				if err := svc.initSyncer(ctx); err != nil {
-					return err
-				}
-			}
-			svc.syncer.SetArbitraryFileTags(svc.tags)
-			svc.startSyncScheduler(svc.syncIntervalMins)
-		} else {
-			if svc.syncTicker != nil {
-				svc.syncTicker.Stop()
-				svc.syncTicker = nil
-			}
-			svc.closeSyncer()
-		}
-	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// These Reconfigure calls are the only methods in builtin.Reconfigure which create / destroy resources.
+	// It is important that no errors happen for a given Reconfigure call after we being callin Reconfigure on capture & sync
+	// or we could leak goroutines, wasting resources and cauing bugs due to duplicate work.
+	b.diskSummaryLogger.reconfigure(syncConfig.SyncPaths(), diskSummaryLogInterval)
+	b.capture.Reconfigure(ctx, collectorConfigsByResource, captureConfig)
+	b.sync.Reconfigure(ctx, syncConfig, cloudConnSvc)
 
 	return nil
 }
 
-// startSyncScheduler starts the goroutine that calls Sync repeatedly if scheduled sync is enabled.
-func (svc *builtIn) startSyncScheduler(intervalMins float64) {
-	cancelCtx, fn := context.WithCancel(context.Background())
-	svc.syncRoutineCancelFn = fn
-	svc.uploadData(cancelCtx, intervalMins)
-}
-
-// cancelSyncScheduler cancels the goroutine that calls Sync repeatedly if scheduled sync is enabled.
-// It does not close the syncer or any in progress uploads.
-func (svc *builtIn) cancelSyncScheduler() {
-	if svc.syncRoutineCancelFn != nil {
-		svc.syncRoutineCancelFn()
-		svc.backgroundWorkers.Wait()
-		svc.syncRoutineCancelFn = nil
+func syncSensorFromDeps(name string, deps resource.Dependencies, logger logging.Logger) (sensor.Sensor, bool) {
+	if name == "" {
+		return nil, false
 	}
-}
-
-func (svc *builtIn) uploadData(cancelCtx context.Context, intervalMins float64) {
-	// time.Duration loses precision at low floating point values, so turn intervalMins to milliseconds.
-	intervalMillis := 60000.0 * intervalMins
-	// The ticker must be created before uploadData returns to prevent race conditions between clock.Ticker and
-	// clock.Add in sync_test.go.
-	svc.syncTicker = clock.Ticker(time.Millisecond * time.Duration(intervalMillis))
-	svc.backgroundWorkers.Add(1)
-	goutils.PanicCapturingGo(func() {
-		defer svc.backgroundWorkers.Done()
-		defer svc.syncTicker.Stop()
-
-		for {
-			if err := cancelCtx.Err(); err != nil {
-				if !errors.Is(err, context.Canceled) {
-					svc.logger.Errorw("data manager context closed unexpectedly", "error", err)
-				}
-				return
-			}
-
-			select {
-			case <-cancelCtx.Done():
-				return
-			case <-svc.syncTicker.C:
-				svc.lock.Lock()
-				if svc.syncer != nil {
-					svc.sync()
-				}
-				svc.lock.Unlock()
-			}
-		}
-	})
-}
-
-func (svc *builtIn) sync() {
-	svc.flushCollectors()
-	toSync := getAllFilesToSync(svc.captureDir, svc.waitAfterLastModifiedMillis)
-	for _, ap := range svc.additionalSyncPaths {
-		toSync = append(toSync, getAllFilesToSync(ap, svc.waitAfterLastModifiedMillis)...)
+	syncSensor, err := sensor.FromDependencies(deps, name)
+	if err != nil {
+		// see sync.Config for how this affects whether or not scheduled sync will run
+		logger.Errorw(
+			"unable to initialize selective syncer; will not schedule sync at all until fixed or removed from config", "error", err.Error())
+		return nil, true
 	}
-	for _, p := range toSync {
-		svc.syncer.SyncFile(p)
-	}
+	return syncSensor, true
 }
 
-//nolint
-func getAllFilesToSync(dir string, lastModifiedMillis int) []string {
-	var filePaths []string
-	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-		if info.IsDir() {
-			return nil
-		}
-		// If a file was modified within the past lastModifiedMillis seconds, do not sync it (data
-		// may still be being written).
-		timeSinceMod := clock.Since(info.ModTime())
-		// When using a mock clock in tests, this can be negative since the file system will still use the system clock.
-		// Take max(timeSinceMod, 0) to account for this.
-		if timeSinceMod < 0 {
-			timeSinceMod = 0
-		}
-		if timeSinceMod >= (time.Duration(lastModifiedMillis)*time.Millisecond) || filepath.Ext(path) == datacapture.FileExt {
-			filePaths = append(filePaths, path)
-		}
-		return nil
-	})
-	return filePaths
-}
-
-// Build the component configs associated with the data manager service.
-func (svc *builtIn) updateDataCaptureConfigs(
-	resources resource.Dependencies,
-	resourceConfigs []*datamanager.DataCaptureConfig,
+// Lookup the collector configs associated with the data manager service.
+func lookupCollectorConfigsByResource(
+	deps resource.Dependencies,
+	resConfig resource.Config,
 	captureDir string,
-) {
-	for _, resConf := range resourceConfigs {
-		res, err := resources.Lookup(resConf.Name)
+	logger logging.Logger,
+) (capture.CollectorConfigsByResource, error) {
+	collectorConfigsByResource := capture.CollectorConfigsByResource{}
+	for name, rawAssocCfg := range resConfig.AssociatedAttributes {
+		assocCfg, err := utils.AssertType[*datamanager.AssociatedConfig](rawAssocCfg)
 		if err != nil {
-			svc.logger.Debugw("failed to lookup resource", "error", err)
+			// This would only happen if there is a bug in resource graph
+			return nil, err
+		}
+		res, err := deps.Lookup(name)
+		if err != nil {
+			logger.Warnw("datamanager failed to lookup resource from config", "error", err)
 			continue
 		}
 
-		resConf.Resource = res
-		resConf.CaptureDirectory = captureDir
+		collectorConfigs := []datamanager.DataCaptureConfig{}
+		for _, collectorConfig := range assocCfg.CaptureMethods {
+			// we need to set the CaptureDirectory to that in the data manager config
+			collectorConfig.CaptureDirectory = captureDir
+			collectorConfigs = append(collectorConfigs, collectorConfig)
+		}
+		collectorConfigsByResource[res] = collectorConfigs
 	}
+	return collectorConfigsByResource, nil
 }

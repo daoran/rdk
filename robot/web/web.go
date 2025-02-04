@@ -3,32 +3,24 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"html/template"
 	"io"
-	"io/fs"
-	"math"
 	"net"
 	"net/http"
 	"net/http/pprof"
 	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
-	"github.com/Masterminds/sprig"
-	"github.com/NYTimes/gziphandler"
-	"github.com/edaniels/golog"
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	"github.com/jhump/protoreflect/dynamic"
 	"github.com/pkg/errors"
 	"github.com/rs/cors"
-	"github.com/viamrobotics/gostream"
-	streampb "github.com/viamrobotics/gostream/proto/stream/v1"
 	"go.opencensus.io/trace"
 	pb "go.viam.com/api/robot/v1"
 	"go.viam.com/utils"
@@ -39,10 +31,9 @@ import (
 	"goji.io/pat"
 	googlegrpc "google.golang.org/grpc"
 
-	"go.viam.com/rdk/components/audioinput"
-	"go.viam.com/rdk/components/camera"
 	"go.viam.com/rdk/config"
 	"go.viam.com/rdk/grpc"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/module"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/robot"
@@ -50,175 +41,23 @@ import (
 	weboptions "go.viam.com/rdk/robot/web/options"
 	webstream "go.viam.com/rdk/robot/web/stream"
 	rutils "go.viam.com/rdk/utils"
-	"go.viam.com/rdk/web"
 )
 
 // SubtypeName is a constant that identifies the internal web resource subtype string.
-const SubtypeName = "web"
+const (
+	SubtypeName = "web"
+	// TCPParentPort is the port of the parent socket when VIAM_TCP_MODE is set.
+	TCPParentPort = 14998
+	// TestTCPParentPort is the test suite version of TCPParentPort. It's different to avoid
+	// collisions; it's listed here for documentation.
+	TestTCPParentPort = 14999
+)
 
 // API is the fully qualified API for the internal web service.
 var API = resource.APINamespaceRDKInternal.WithServiceType(SubtypeName)
 
 // InternalServiceName is used to refer to/depend on this service internally.
 var InternalServiceName = resource.NewName(API, "builtin")
-
-// defaultMethodTimeout is the default context timeout for all inbound gRPC
-// methods used when no deadline is set on the context.
-var defaultMethodTimeout = 10 * time.Minute
-
-// robotWebApp hosts a web server to interact with a robot in addition to hosting
-// a gRPC/REST server.
-type robotWebApp struct {
-	template *template.Template
-	theRobot robot.Robot
-	logger   golog.Logger
-	options  weboptions.Options
-}
-
-// Init does template initialization work.
-func (app *robotWebApp) Init() error {
-	var err error
-
-	t := template.New("foo").Funcs(template.FuncMap{
-		//nolint:gosec
-		"jsSafe": func(js string) template.JS {
-			return template.JS(js)
-		},
-		//nolint:gosec
-		"htmlSafe": func(html string) template.HTML {
-			return template.HTML(html)
-		},
-	}).Funcs(sprig.FuncMap())
-
-	if app.options.SharedDir != "" {
-		t, err = t.ParseGlob(fmt.Sprintf("%s/*.html", app.options.SharedDir+"/templates"))
-	} else {
-		t, err = t.ParseFS(web.AppFS, "runtime-shared/templates/*.html")
-	}
-
-	if err != nil {
-		return err
-	}
-	app.template = t.Lookup("webappindex.html")
-	return nil
-}
-
-// AppTemplateData is used to render the remote control page.
-type AppTemplateData struct {
-	WebRTCEnabled          bool                   `json:"webrtc_enabled"`
-	WebRTCSignalingAddress string                 `json:"webrtc_signaling_address"`
-	Env                    string                 `json:"env"`
-	Host                   string                 `json:"host"`
-	StaticHost             string                 `json:"static_host"`
-	SupportedAuthTypes     []string               `json:"supported_auth_types"`
-	AuthEntity             string                 `json:"auth_entity"`
-	BakedAuth              map[string]interface{} `json:"baked_auth"`
-}
-
-// ServeHTTP serves the UI.
-func (app *robotWebApp) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
-	}
-	if true {
-		err := app.Init()
-		if err != nil {
-			app.logger.Debugf("couldn't reload template: %s", err)
-			return
-		}
-	}
-
-	var data AppTemplateData
-	data.StaticHost = app.options.StaticHost
-
-	if err := r.ParseForm(); err != nil {
-		app.logger.Debugw("failed to parse form", "error", err)
-	}
-
-	if os.Getenv("ENV") == "development" {
-		data.Env = "development"
-	} else {
-		data.Env = "production"
-	}
-
-	data.Host = app.options.FQDN
-	if app.options.WebRTC && r.Form.Get("grpc") != "true" {
-		data.WebRTCEnabled = true
-	}
-
-	if app.options.Managed && hasManagedAuthHandlers(app.options.Auth.Handlers) {
-		data.BakedAuth = map[string]interface{}{
-			"authEntity": app.options.BakedAuthEntity,
-			"creds":      app.options.BakedAuthCreds,
-		}
-	} else {
-		for _, handler := range app.options.Auth.Handlers {
-			data.SupportedAuthTypes = append(data.SupportedAuthTypes, string(handler.Type))
-		}
-	}
-
-	err := app.template.Execute(w, data)
-	if err != nil {
-		app.logger.Debugf("couldn't execute web page: %s", err)
-	}
-}
-
-// Two known auth handlers (LocationSecret, WebOauth).
-func hasManagedAuthHandlers(handlers []config.AuthHandlerConfig) bool {
-	hasLocationSecretHandler := false
-	for _, h := range handlers {
-		if h.Type == rutils.CredentialsTypeRobotLocationSecret {
-			hasLocationSecretHandler = true
-		}
-	}
-
-	if len(handlers) == 1 && hasLocationSecretHandler {
-		return true
-	}
-
-	return false
-}
-
-// validSDPTrackName returns a valid SDP video/audio track name as defined in RFC 4566 (https://www.rfc-editor.org/rfc/rfc4566)
-// where track names should not include colons.
-func validSDPTrackName(name string) string {
-	return strings.ReplaceAll(name, ":", "+")
-}
-
-// refreshVideoSources checks and initializes every possible video source that could be viewed from the robot.
-func (svc *webService) refreshVideoSources() {
-	for _, name := range camera.NamesFromRobot(svc.r) {
-		cam, err := camera.FromRobot(svc.r, name)
-		if err != nil {
-			continue
-		}
-		existing, ok := svc.videoSources[validSDPTrackName(name)]
-		if ok {
-			existing.Swap(cam)
-			continue
-		}
-		newSwapper := gostream.NewHotSwappableVideoSource(cam)
-		svc.videoSources[validSDPTrackName(name)] = newSwapper
-	}
-}
-
-// refreshAudioSources checks and initializes every possible audio source that could be viewed from the robot.
-func (svc *webService) refreshAudioSources() {
-	for _, name := range audioinput.NamesFromRobot(svc.r) {
-		input, err := audioinput.FromRobot(svc.r, name)
-		if err != nil {
-			continue
-		}
-		existing, ok := svc.audioSources[validSDPTrackName(name)]
-		if ok {
-			existing.Swap(input)
-			continue
-		}
-		newSwapper := gostream.NewHotSwappableAudioSource(input)
-		svc.audioSources[validSDPTrackName(name)] = newSwapper
-	}
-}
 
 // A Service controls the web server for a robot.
 type Service interface {
@@ -238,56 +77,34 @@ type Service interface {
 
 	// Returns the unix socket path the module server listens on.
 	ModuleAddress() string
-}
 
-// StreamServer manages streams and displays.
-type StreamServer struct {
-	// Server serves streams
-	Server gostream.StreamServer
-	// HasStreams is true if service has streams that require a WebRTC connection.
-	HasStreams bool
-}
+	Stats() any
 
-// New returns a new web service for the given robot.
-func New(r robot.Robot, logger golog.Logger, opts ...Option) Service {
-	var wOpts options
-	for _, opt := range opts {
-		opt.apply(&wOpts)
-	}
-	webSvc := &webService{
-		Named:        InternalServiceName.AsNamed(),
-		r:            r,
-		logger:       logger,
-		rpcServer:    nil,
-		streamServer: nil,
-		services:     map[resource.API]resource.APIResourceCollection[resource.Resource]{},
-		opts:         wOpts,
-		videoSources: map[string]gostream.HotSwappableVideoSource{},
-		audioSources: map[string]gostream.HotSwappableAudioSource{},
-	}
-	return webSvc
+	RequestCounter() *RequestCounter
 }
 
 type webService struct {
 	resource.Named
 
-	mu                      sync.Mutex
-	r                       robot.Robot
-	rpcServer               rpc.Server
-	modServer               rpc.Server
-	streamServer            *StreamServer
-	services                map[resource.API]resource.APIResourceCollection[resource.Resource]
-	opts                    options
-	addr                    string
-	modAddr                 string
-	logger                  golog.Logger
-	cancelCtx               context.Context
-	cancelFunc              func()
-	isRunning               bool
-	activeBackgroundWorkers sync.WaitGroup
+	mu        sync.Mutex
+	r         robot.Robot
+	rpcServer rpc.Server
+	modServer rpc.Server
 
-	videoSources map[string]gostream.HotSwappableVideoSource
-	audioSources map[string]gostream.HotSwappableAudioSource
+	// Will be nil on non-cgo builds.
+	streamServer *webstream.Server
+	services     map[resource.API]resource.APIResourceCollection[resource.Resource]
+	opts         options
+	addr         string
+	modAddr      string
+	logger       logging.Logger
+	cancelCtx    context.Context
+	cancelFunc   func()
+	isRunning    bool
+	webWorkers   sync.WaitGroup
+	modWorkers   sync.WaitGroup
+
+	requestCounter RequestCounter
 }
 
 var internalWebServiceName = resource.NewName(
@@ -323,7 +140,7 @@ func (svc *webService) Start(ctx context.Context, o weboptions.Options) error {
 }
 
 // RunWeb starts the web server on the robot with web options and blocks until we cancel the context.
-func RunWeb(ctx context.Context, r robot.LocalRobot, o weboptions.Options, logger golog.Logger) (err error) {
+func RunWeb(ctx context.Context, r robot.LocalRobot, o weboptions.Options, logger logging.Logger) (err error) {
 	defer func() {
 		if err != nil {
 			err = utils.FilterOutError(err, context.Canceled)
@@ -341,7 +158,7 @@ func RunWeb(ctx context.Context, r robot.LocalRobot, o weboptions.Options, logge
 }
 
 // RunWebWithConfig starts the web server on the robot with a robot config and blocks until we cancel the context.
-func RunWebWithConfig(ctx context.Context, r robot.LocalRobot, cfg *config.Config, logger golog.Logger) error {
+func RunWebWithConfig(ctx context.Context, r robot.LocalRobot, cfg *config.Config, logger logging.Logger) error {
 	o, err := weboptions.FromConfig(cfg)
 	if err != nil {
 		return err
@@ -374,28 +191,25 @@ func (svc *webService) StartModule(ctx context.Context) error {
 	var lis net.Listener
 	var addr string
 	if err := module.MakeSelfOwnedFilesFunc(func() error {
-		dir, err := os.MkdirTemp("", "viam-module-*")
+		dir, err := rutils.PlatformMkdirTemp("", "viam-module-*")
 		if err != nil {
 			return errors.WithMessage(err, "module startup failed")
 		}
-		addr = filepath.ToSlash(filepath.Join(dir, "parent.sock"))
-		if runtime.GOOS == "windows" {
-			// on windows, we need to craft a good enough looking URL for gRPC which
-			// means we need to take out the volume which will have the current drive
-			// be used. In a client server relationship for windows dialing, this must
-			// be known. That is, if this is a multi process UDS, then for the purposes
-			// of dialing without any resolver modifications to gRPC, they must initially
-			// agree on using the same drive.
-			addr = addr[2:]
+
+		if rutils.ViamTCPSockets() {
+			addr = "127.0.0.1:" + strconv.Itoa(TCPParentPort)
+			lis, err = net.Listen("tcp", addr)
+		} else {
+			addr, err = module.CreateSocketAddress(dir, "parent")
+			if err != nil {
+				return errors.WithMessage(err, "module startup failed")
+			}
+			lis, err = net.Listen("unix", addr)
 		}
-		if err := module.CheckSocketAddressLength(addr); err != nil {
-			return err
-		}
-		svc.modAddr = addr
-		lis, err = net.Listen("unix", addr)
 		if err != nil {
 			return errors.WithMessage(err, "failed to listen")
 		}
+		svc.modAddr = addr
 		return nil
 	}); err != nil {
 		return err
@@ -405,27 +219,38 @@ func (svc *webService) StartModule(ctx context.Context) error {
 		streamInterceptors []googlegrpc.StreamServerInterceptor
 	)
 
-	unaryInterceptors = append(unaryInterceptors, ensureTimeoutUnaryInterceptor)
+	unaryInterceptors = append(unaryInterceptors, grpc.EnsureTimeoutUnaryServerInterceptor)
+
+	// Attach the module name (as defined by the robot config) to the handler context. Can be
+	// accessed via `grpc.GetModuleName`.
+	unaryInterceptors = append(unaryInterceptors, grpc.ModNameUnaryServerInterceptor)
+	unaryInterceptors = append(unaryInterceptors, svc.requestCounter.UnaryInterceptor)
 
 	opManager := svc.r.OperationManager()
-	unaryInterceptors = append(unaryInterceptors, opManager.UnaryServerInterceptor)
+	unaryInterceptors = append(unaryInterceptors,
+		opManager.UnaryServerInterceptor, logging.UnaryServerInterceptor)
 	streamInterceptors = append(streamInterceptors, opManager.StreamServerInterceptor)
 	// TODO(PRODUCT-343): Add session manager interceptors
 
-	svc.modServer = module.NewServer(unaryInterceptors, streamInterceptors)
-	if err := svc.modServer.RegisterServiceServer(ctx, &pb.RobotService_ServiceDesc, grpcserver.New(svc.r)); err != nil {
-		return err
+	opts := []googlegrpc.ServerOption{
+		googlegrpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(unaryInterceptors...)),
+		googlegrpc.StreamInterceptor(grpc_middleware.ChainStreamServer(streamInterceptors...)),
+		googlegrpc.UnknownServiceHandler(svc.foreignServiceHandler),
 	}
-	if err := svc.refreshResources(); err != nil {
+	svc.modServer = module.NewServer(opts...)
+	if err := svc.modServer.RegisterServiceServer(ctx, &pb.RobotService_ServiceDesc, grpcserver.New(svc.r)); err != nil {
 		return err
 	}
 	if err := svc.initAPIResourceCollections(ctx, true); err != nil {
 		return err
 	}
+	if err := svc.refreshResources(); err != nil {
+		return err
+	}
 
-	svc.activeBackgroundWorkers.Add(1)
+	svc.modWorkers.Add(1)
 	utils.PanicCapturingGo(func() {
-		defer svc.activeBackgroundWorkers.Done()
+		defer svc.modWorkers.Done()
 		svc.logger.Debugw("module server listening", "socket path", lis.Addr())
 		defer utils.UncheckedErrorFunc(func() error { return os.RemoveAll(filepath.Dir(addr)) })
 		if err := svc.modServer.Serve(lis); err != nil {
@@ -447,21 +272,9 @@ func (svc *webService) refreshResources() error {
 	return svc.updateResources(resources)
 }
 
-// Update updates the web service when the robot has changed.
-func (svc *webService) Reconfigure(ctx context.Context, deps resource.Dependencies, _ resource.Config) error {
-	svc.mu.Lock()
-	defer svc.mu.Unlock()
-	if err := svc.updateResources(deps); err != nil {
-		return err
-	}
-	if !svc.isRunning {
-		return nil
-	}
-	return svc.addNewStreams(svc.cancelCtx)
-}
-
+// updateResources gets every existing resource on the robot's resource graph and updates ResourceAPICollection object
+// with the correct resources, include deleting ones which have been removed from the resource graph.
 func (svc *webService) updateResources(resources map[resource.Name]resource.Resource) error {
-	// so group resources by API
 	groupedResources := make(map[resource.API]map[resource.Name]resource.Resource)
 	for n, v := range resources {
 		r, ok := groupedResources[n.API]
@@ -472,42 +285,47 @@ func (svc *webService) updateResources(resources map[resource.Name]resource.Reso
 		groupedResources[n.API] = r
 	}
 
-	apiRegs := resource.RegisteredAPIs()
-	for a, v := range groupedResources {
-		apiResColl, ok := svc.services[a]
-		// TODO(RSDK-144): register new service if it doesn't currently exist
+	// For a given API that the web service has resources for, we get the new set of resources we should be updated with.
+	// If we find a set of resources, `coll.ReplaceAll` will do the work of adding any new resources and deleting old ones.
+	//
+	// If there are no input resources of the given API, we call `coll.ReplaceAll` with an empty input such that it will
+	// remove any existing resources.
+	for api, coll := range svc.services {
+		group, ok := groupedResources[api]
 		if !ok {
-			reg, ok := apiRegs[a]
-			var apiResColl resource.APIResourceCollection[resource.Resource]
-			if ok {
-				apiResColl = reg.MakeEmptyCollection()
-			} else {
-				// Log a warning here to remind users to register their APIs. Do not warn if the resource is internal to the RDK or
-				// the resource is handled by a remote with a possibly separate API registration. Modular resources will
-				// have API registrations already and should not reach this point in the method.
-				if a.Type.Namespace != resource.APINamespaceRDKInternal {
-					for n := range v {
-						if !n.ContainsRemoteNames() {
-							svc.logger.Warnw(
-								"missing registration for api, resources with this API will be unreachable through a client", "api", n.API)
-							break
-						}
-					}
-				}
-				continue
-			}
+			// create an empty map of resources if one does not exist
+			group = make(map[resource.Name]resource.Resource)
+		}
+		if err := coll.ReplaceAll(group); err != nil {
+			return err
+		}
+		delete(groupedResources, api)
+	}
 
-			if err := apiResColl.ReplaceAll(v); err != nil {
-				return err
-			}
-			svc.services[a] = apiResColl
-		} else {
-			if err := apiResColl.ReplaceAll(v); err != nil {
-				return err
+	// If there are any groupedResources remaining, check if they are registered/internal/remote.
+	//  * Custom APIs are registered and do not have a dedicated gRPC service as requests for them are routed through the
+	//    foreignServiceHandler.
+	//  * Internal services do not have an associated gRPC API and so can be safely ignored.
+	//  * Remote resources with unregistered APIs are possibly handled by the remote robot and requests would be routed through the
+	//    foreignServiceHandler.
+	for api, group := range groupedResources {
+		apiRegs := resource.RegisteredAPIs()
+		_, ok := apiRegs[api]
+		if ok {
+			// If registered, the API is most likely a custom API registered through modular resources.
+			continue
+		}
+		// Log a warning here to remind users to register their APIs.
+		if api.Type.Namespace != resource.APINamespaceRDKInternal {
+			for n := range group {
+				if !n.ContainsRemoteNames() {
+					svc.logger.Warnw(
+						"missing registration for api, resources with this API will be unreachable through a client", "api", n.API)
+					break
+				}
 			}
 		}
 	}
-
 	return nil
 }
 
@@ -515,236 +333,28 @@ func (svc *webService) updateResources(resources map[resource.Name]resource.Reso
 func (svc *webService) Stop() {
 	svc.mu.Lock()
 	defer svc.mu.Unlock()
+	svc.stopWeb()
+}
+
+func (svc *webService) stopWeb() {
 	if svc.cancelFunc != nil {
 		svc.cancelFunc()
 	}
 	svc.isRunning = false
+	svc.webWorkers.Wait()
 }
 
 // Close closes a webService via calls to its Cancel func.
 func (svc *webService) Close(ctx context.Context) error {
 	svc.mu.Lock()
 	defer svc.mu.Unlock()
+	svc.stopWeb()
 	var err error
-	if svc.cancelFunc != nil {
-		svc.cancelFunc()
-	}
-	svc.isRunning = false
 	if svc.modServer != nil {
 		err = svc.modServer.Stop()
 	}
-	svc.activeBackgroundWorkers.Wait()
+	svc.modWorkers.Wait()
 	return err
-}
-
-func (svc *webService) streamInitialized() bool {
-	return svc.streamServer != nil && svc.streamServer.Server != nil
-}
-
-func (svc *webService) addNewStreams(ctx context.Context) error {
-	if !svc.streamInitialized() {
-		return nil
-	}
-	svc.refreshVideoSources()
-	svc.refreshAudioSources()
-	if svc.opts.streamConfig == nil {
-		if len(svc.videoSources) != 0 || len(svc.audioSources) != 0 {
-			svc.logger.Debug("not starting streams due to no stream config being set")
-		}
-		return nil
-	}
-
-	newStream := func(name string) (gostream.Stream, bool, error) {
-		// Configure new stream
-		config := *svc.opts.streamConfig
-		config.Name = name
-		stream, err := svc.streamServer.Server.NewStream(config)
-
-		// Skip if stream is already registered, otherwise raise any other errors
-		var registeredError *gostream.StreamAlreadyRegisteredError
-		if errors.As(err, &registeredError) {
-			return nil, true, nil
-		} else if err != nil {
-			return nil, false, err
-		}
-
-		if !svc.streamServer.HasStreams {
-			svc.streamServer.HasStreams = true
-		}
-		return stream, false, nil
-	}
-
-	for name, source := range svc.videoSources {
-		stream, alreadyRegistered, err := newStream(name)
-		if err != nil {
-			return err
-		} else if alreadyRegistered {
-			continue
-		}
-
-		svc.startVideoStream(ctx, source, stream)
-	}
-
-	for name, source := range svc.audioSources {
-		stream, alreadyRegistered, err := newStream(name)
-		if err != nil {
-			return err
-		} else if alreadyRegistered {
-			continue
-		}
-
-		svc.startAudioStream(ctx, source, stream)
-	}
-
-	return nil
-}
-
-func (svc *webService) makeStreamServer(ctx context.Context) (*StreamServer, error) {
-	svc.refreshVideoSources()
-	svc.refreshAudioSources()
-	var streams []gostream.Stream
-	var streamTypes []bool
-
-	if svc.opts.streamConfig == nil || (len(svc.videoSources) == 0 && len(svc.audioSources) == 0) {
-		if len(svc.videoSources) != 0 || len(svc.audioSources) != 0 {
-			svc.logger.Debug("not starting streams due to no stream config being set")
-		}
-		noopServer, err := gostream.NewStreamServer(streams...)
-		return &StreamServer{noopServer, false}, err
-	}
-
-	addStream := func(streams []gostream.Stream, name string, isVideo bool) ([]gostream.Stream, error) {
-		config := *svc.opts.streamConfig
-		config.Name = name
-		if isVideo {
-			config.AudioEncoderFactory = nil
-
-			// set TargetFrameRate to the framerate of the video source if available
-			props, err := svc.videoSources[name].MediaProperties(ctx)
-			if err != nil {
-				svc.logger.Warnw("failed to get video source properties", "name", name, "error", err)
-			} else if props.FrameRate > 0.0 {
-				// round float up to nearest int
-				config.TargetFrameRate = int(math.Ceil(float64(props.FrameRate)))
-			}
-			// default to 60fps if the video source doesn't have a framerate
-			if config.TargetFrameRate == 0 {
-				config.TargetFrameRate = 60
-			}
-
-			if runtime.GOOS == "windows" {
-				// TODO(RSDK-1771): support video on windows
-				svc.logger.Warnw("not starting video stream since not supported on Windows yet", "name", name)
-				return streams, nil
-			}
-		} else {
-			config.VideoEncoderFactory = nil
-		}
-		stream, err := gostream.NewStream(config)
-		if err != nil {
-			return streams, err
-		}
-		return append(streams, stream), nil
-	}
-	for name := range svc.videoSources {
-		var err error
-		streams, err = addStream(streams, name, true)
-		if err != nil {
-			return nil, err
-		}
-		streamTypes = append(streamTypes, true)
-	}
-	for name := range svc.audioSources {
-		var err error
-		streams, err = addStream(streams, name, false)
-		if err != nil {
-			return nil, err
-		}
-		streamTypes = append(streamTypes, false)
-	}
-
-	streamServer, err := gostream.NewStreamServer(streams...)
-	if err != nil {
-		return nil, err
-	}
-
-	for idx, stream := range streams {
-		if streamTypes[idx] {
-			svc.startVideoStream(ctx, svc.videoSources[stream.Name()], stream)
-		} else {
-			svc.startAudioStream(ctx, svc.audioSources[stream.Name()], stream)
-		}
-	}
-
-	return &StreamServer{streamServer, true}, nil
-}
-
-func (svc *webService) startStream(streamFunc func(opts *webstream.BackoffTuningOptions) error) {
-	waitCh := make(chan struct{})
-	svc.activeBackgroundWorkers.Add(1)
-	utils.PanicCapturingGo(func() {
-		defer svc.activeBackgroundWorkers.Done()
-		close(waitCh)
-		opts := &webstream.BackoffTuningOptions{
-			BaseSleep: 50 * time.Microsecond,
-			MaxSleep:  2 * time.Second,
-			Cooldown:  5 * time.Second,
-		}
-		if err := streamFunc(opts); err != nil {
-			if utils.FilterOutError(err, context.Canceled) != nil {
-				svc.logger.Errorw("error streaming", "error", err)
-			}
-		}
-	})
-	<-waitCh
-}
-
-func (svc *webService) startVideoStream(ctx context.Context, source gostream.VideoSource, stream gostream.Stream) {
-	// Honor ctx that may be coming from a Reconfigure.
-	ctxWithJPEGHint := gostream.WithMIMETypeHint(ctx, rutils.WithLazyMIMEType(rutils.MimeTypeJPEG))
-	svc.startStream(func(opts *webstream.BackoffTuningOptions) error {
-		streamVideoCtx, _ := utils.MergeContext(svc.cancelCtx, ctxWithJPEGHint)
-		return webstream.StreamVideoSource(streamVideoCtx, source, stream, opts, svc.logger)
-	})
-}
-
-func (svc *webService) startAudioStream(ctx context.Context, source gostream.AudioSource, stream gostream.Stream) {
-	svc.startStream(func(opts *webstream.BackoffTuningOptions) error {
-		// Merge ctx that may be coming from a Reconfigure.
-		streamAudioCtx, _ := utils.MergeContext(svc.cancelCtx, ctx)
-		return webstream.StreamAudioSource(streamAudioCtx, source, stream, opts, svc.logger)
-	})
-}
-
-// installWeb prepares the given mux to be able to serve the UI for the robot.
-func (svc *webService) installWeb(mux *goji.Mux, theRobot robot.Robot, options weboptions.Options) error {
-	app := &robotWebApp{theRobot: theRobot, logger: svc.logger, options: options}
-	if err := app.Init(); err != nil {
-		return err
-	}
-
-	var staticDir http.FileSystem
-	if app.options.SharedDir != "" {
-		staticDir = http.Dir(app.options.SharedDir + "/static")
-	} else {
-		embedFS, err := fs.Sub(web.AppFS, "runtime-shared/static")
-		if err != nil {
-			return err
-		}
-		matches, err := fs.Glob(embedFS, "*.js")
-		if err != nil {
-			return err
-		}
-		if len(matches) == 0 {
-			svc.logger.Warnw("Couldn't find any static files when running RDK. Make sure to run 'make build-web' - using staticrc.viam.com")
-			app.options.StaticHost = "https://staticrc.viam.com"
-		}
-		staticDir = http.FS(embedFS)
-	}
-	mux.Handle(pat.Get("/static/*"), gziphandler.GzipHandler(http.StripPrefix("/static", http.FileServer(staticDir))))
-	mux.Handle(pat.New("/"), app)
-
-	return nil
 }
 
 // runWeb takes the given robot and options and runs the web server. This function will
@@ -785,7 +395,8 @@ func (svc *webService) runWeb(ctx context.Context, options weboptions.Options) (
 		return err
 	}
 
-	svc.rpcServer, err = rpc.NewServer(svc.logger, rpcOpts...)
+	ioLogger := svc.logger.Sublogger("networking")
+	svc.rpcServer, err = rpc.NewServer(ioLogger, rpcOpts...)
 	if err != nil {
 		return err
 	}
@@ -803,28 +414,15 @@ func (svc *webService) runWeb(ctx context.Context, options weboptions.Options) (
 		return err
 	}
 
-	if err := svc.refreshResources(); err != nil {
-		return err
-	}
 	if err := svc.initAPIResourceCollections(ctx, false); err != nil {
 		return err
 	}
+	if err := svc.refreshResources(); err != nil {
+		return err
+	}
 
-	svc.streamServer, err = svc.makeStreamServer(ctx)
-	if err != nil {
+	if err := svc.initStreamServer(ctx); err != nil {
 		return err
-	}
-	if err := svc.rpcServer.RegisterServiceServer(
-		ctx,
-		&streampb.StreamService_ServiceDesc,
-		svc.streamServer.Server.ServiceServer(),
-		streampb.RegisterStreamServiceHandlerFromEndpoint,
-	); err != nil {
-		return err
-	}
-	if svc.streamServer.HasStreams {
-		// force WebRTC template rendering
-		options.WebRTC = true
 	}
 
 	if options.Debug {
@@ -845,9 +443,9 @@ func (svc *webService) runWeb(ctx context.Context, options weboptions.Options) (
 
 	// Serve
 
-	svc.activeBackgroundWorkers.Add(1)
+	svc.webWorkers.Add(1)
 	utils.PanicCapturingGo(func() {
-		defer svc.activeBackgroundWorkers.Done()
+		defer svc.webWorkers.Done()
 		<-ctx.Done()
 		defer func() {
 			if err := httpServer.Shutdown(context.Background()); err != nil {
@@ -859,15 +457,11 @@ func (svc *webService) runWeb(ctx context.Context, options weboptions.Options) (
 				svc.logger.Errorw("error stopping rpc server", "error", err)
 			}
 		}()
-		if svc.streamServer.Server != nil {
-			if err := svc.streamServer.Server.Close(); err != nil {
-				svc.logger.Errorw("error closing stream server", "error", err)
-			}
-		}
+		svc.closeStreamServer()
 	})
-	svc.activeBackgroundWorkers.Add(1)
+	svc.webWorkers.Add(1)
 	utils.PanicCapturingGo(func() {
-		defer svc.activeBackgroundWorkers.Done()
+		defer svc.webWorkers.Done()
 		if err := svc.rpcServer.Start(); err != nil {
 			svc.logger.Errorw("error starting rpc server", "error", err)
 		}
@@ -892,9 +486,9 @@ func (svc *webService) runWeb(ctx context.Context, options weboptions.Options) (
 	}
 	svc.logger.Infow("serving", urlFields...)
 
-	svc.activeBackgroundWorkers.Add(1)
+	svc.webWorkers.Add(1)
 	utils.PanicCapturingGo(func() {
-		defer svc.activeBackgroundWorkers.Done()
+		defer svc.webWorkers.Done()
 		var serveErr error
 		if options.Secure {
 			serveErr = httpServer.ServeTLS(listener, options.Network.TLSCertFile, options.Network.TLSKeyFile)
@@ -905,35 +499,106 @@ func (svc *webService) runWeb(ctx context.Context, options weboptions.Options) (
 			svc.logger.Errorw("error serving http", "error", serveErr)
 		}
 	})
+
 	return err
+}
+
+// Namer is used to get a resource name from incoming requests for countingfor request. Requests for
+// resources are expected to be a gRPC object that includes a `GetName` method.
+type Namer interface {
+	GetName() string
+}
+
+// RequestCounter maps string keys to atomic ints that get bumped on every incoming gRPC request for
+// components.
+type RequestCounter struct {
+	counts sync.Map
+}
+
+// UnaryInterceptor returns an incoming server interceptor that will pull method information and
+// optionally resource information to bump the request counters.
+func (rc *RequestCounter) UnaryInterceptor(
+	ctx context.Context, req any, info *googlegrpc.UnaryServerInfo, handler googlegrpc.UnaryHandler,
+) (resp any, err error) {
+	// Handle `info.FullMethod` values such as:
+	// - `/viam.component.motor.v1.MotorService/IsMoving`
+	// - `/viam.robot.v1.RobotService/SendSessionHeartbeat`
+	//
+	// Only count component APIs, for now.
+	var apiMethod string
+	switch {
+	case strings.HasPrefix(info.FullMethod, "/viam.component."):
+		apiMethod = info.FullMethod[strings.LastIndexByte(info.FullMethod, byte('/'))+1:]
+	default:
+	}
+
+	// Storing in FTDC: `web.motor-name.IsMoving: <count>`.
+	if apiMethod != "" {
+		if namer, ok := req.(Namer); ok {
+			key := fmt.Sprintf("%v.%v", namer.GetName(), apiMethod)
+			if apiCounts, ok := rc.counts.Load(key); ok {
+				apiCounts.(*atomic.Int64).Add(1)
+			} else {
+				newCounter := new(atomic.Int64)
+				newCounter.Add(1)
+				rc.counts.Store(key, newCounter)
+			}
+		}
+	}
+
+	return handler(ctx, req)
+}
+
+// Stats satisfies the ftdc.Statser interface and will return a copy of the counters.
+func (rc *RequestCounter) Stats() any {
+	ret := make(map[string]int64)
+	rc.counts.Range(func(key, value any) bool {
+		ret[key.(string)] = value.(*atomic.Int64).Load()
+		return true
+	})
+
+	return ret
+}
+
+// RequestCounter returns the request counter object.
+func (svc *webService) RequestCounter() *RequestCounter {
+	return &svc.requestCounter
 }
 
 // Initialize RPC Server options.
 func (svc *webService) initRPCOptions(listenerTCPAddr *net.TCPAddr, options weboptions.Options) ([]rpc.ServerOption, error) {
 	hosts := options.GetHosts(listenerTCPAddr)
+
+	webrtcOptions := rpc.WebRTCServerOptions{
+		Enable:                    true,
+		EnableInternalSignaling:   true,
+		ExternalSignalingDialOpts: options.SignalingDialOpts,
+		ExternalSignalingAddress:  options.SignalingAddress,
+		ExternalSignalingHosts:    hosts.External,
+		InternalSignalingHosts:    hosts.Internal,
+		Config:                    &grpc.DefaultWebRTCConfiguration,
+		OnPeerAdded:               options.WebRTCOnPeerAdded,
+		OnPeerRemoved:             options.WebRTCOnPeerRemoved,
+	}
+	if options.DisallowWebRTC {
+		webrtcOptions = rpc.WebRTCServerOptions{
+			Enable: false,
+		}
+	}
+
 	rpcOpts := []rpc.ServerOption{
 		rpc.WithAuthIssuer(options.FQDN),
 		rpc.WithAuthAudience(options.FQDN),
 		rpc.WithInstanceNames(hosts.Names...),
-		rpc.WithWebRTCServerOptions(rpc.WebRTCServerOptions{
-			Enable:                    true,
-			EnableInternalSignaling:   true,
-			ExternalSignalingDialOpts: options.SignalingDialOpts,
-			ExternalSignalingAddress:  options.SignalingAddress,
-			ExternalSignalingHosts:    hosts.External,
-			InternalSignalingHosts:    hosts.Internal,
-			Config:                    &grpc.DefaultWebRTCConfiguration,
-			OnPeerAdded:               options.WebRTCOnPeerAdded,
-			OnPeerRemoved:             options.WebRTCOnPeerRemoved,
-		}),
+		rpc.WithWebRTCServerOptions(webrtcOptions),
 	}
 	if options.DisableMulticastDNS {
 		rpcOpts = append(rpcOpts, rpc.WithDisableMulticastDNS())
 	}
 
 	var unaryInterceptors []googlegrpc.UnaryServerInterceptor
-
-	unaryInterceptors = append(unaryInterceptors, ensureTimeoutUnaryInterceptor)
+	unaryInterceptors = append(unaryInterceptors, grpc.EnsureTimeoutUnaryServerInterceptor)
+	unaryInterceptors = append(unaryInterceptors, svc.requestCounter.UnaryInterceptor)
 
 	if options.Debug {
 		rpcOpts = append(rpcOpts, rpc.WithDebug())
@@ -967,7 +632,8 @@ func (svc *webService) initRPCOptions(listenerTCPAddr *net.TCPAddr, options webo
 	if sessManagerInts.UnaryServerInterceptor != nil {
 		unaryInterceptors = append(unaryInterceptors, sessManagerInts.UnaryServerInterceptor)
 	}
-	unaryInterceptors = append(unaryInterceptors, opManager.UnaryServerInterceptor)
+	unaryInterceptors = append(unaryInterceptors,
+		opManager.UnaryServerInterceptor, logging.UnaryServerInterceptor)
 
 	if sessManagerInts.StreamServerInterceptor != nil {
 		streamInterceptors = append(streamInterceptors, sessManagerInts.StreamServerInterceptor)
@@ -1031,18 +697,13 @@ func (svc *webService) initAuthHandlers(listenerTCPAddr *net.TCPAddr, options we
 		for _, handler := range options.Auth.Handlers {
 			switch handler.Type {
 			case rpc.CredentialsTypeAPIKey:
-				apiKeys := handler.Config.StringSlice("keys")
+				apiKeys := config.ParseAPIKeys(handler)
+
 				if len(apiKeys) == 0 {
-					apiKey := handler.Config.String("key")
-					if apiKey == "" {
-						return nil, errors.Errorf("%q handler requires non-empty API key or keys", handler.Type)
-					}
-					apiKeys = []string{apiKey}
+					return nil, errors.Errorf("%q handler requires non-empty API keys", handler.Type)
 				}
-				rpcOpts = append(rpcOpts, rpc.WithAuthHandler(
-					handler.Type,
-					rpc.MakeSimpleMultiAuthHandler(authEntities, apiKeys),
-				))
+
+				rpcOpts = append(rpcOpts, rpc.WithAuthHandler(handler.Type, rpc.MakeSimpleMultiAuthPairHandler(apiKeys)))
 			case rutils.CredentialsTypeRobotLocationSecret:
 				locationSecrets := handler.Config.StringSlice("secrets")
 				if len(locationSecrets) == 0 {
@@ -1097,10 +758,7 @@ func (svc *webService) initAPIResourceCollections(ctx context.Context, mod bool)
 
 // Initialize HTTP server.
 func (svc *webService) initHTTPServer(listenerTCPAddr *net.TCPAddr, options weboptions.Options) (*http.Server, error) {
-	mux, err := svc.initMux(options)
-	if err != nil {
-		return nil, err
-	}
+	mux := svc.initMux(options)
 
 	httpServer, err := utils.NewPossiblySecureHTTPServer(mux, utils.HTTPServerOptions{
 		Secure:         options.Secure,
@@ -1116,11 +774,15 @@ func (svc *webService) initHTTPServer(listenerTCPAddr *net.TCPAddr, options webo
 }
 
 // Initialize multiplexer between http handlers.
-func (svc *webService) initMux(options weboptions.Options) (*goji.Mux, error) {
+func (svc *webService) initMux(options weboptions.Options) *goji.Mux {
 	mux := goji.NewMux()
-	if err := svc.installWeb(mux, svc.r, options); err != nil {
-		return nil, err
-	}
+	// Note: used by viam-agent for health checks
+	mux.HandleFunc(pat.New("/"), func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte("healthy")); err != nil {
+			svc.logger.Warnf("unable to write healthy response: %w", err)
+		}
+	})
 
 	if options.Pprof {
 		mux.HandleFunc(pat.New("/debug/pprof/"), pprof.Index)
@@ -1129,6 +791,14 @@ func (svc *webService) initMux(options weboptions.Options) (*goji.Mux, error) {
 		mux.HandleFunc(pat.New("/debug/pprof/symbol"), pprof.Symbol)
 		mux.HandleFunc(pat.New("/debug/pprof/trace"), pprof.Trace)
 	}
+
+	// serve resource graph visualization
+	// TODO: hide behind option
+	// TODO: accept params to display different formats
+	mux.HandleFunc(pat.New("/debug/graph"), svc.handleVisualizeResourceGraph)
+
+	// serve restart status
+	mux.HandleFunc(pat.New("/restart_status"), svc.handleRestartStatus)
 
 	prefix := "/viam"
 	addPrefix := func(h http.Handler) http.Handler {
@@ -1154,10 +824,15 @@ func (svc *webService) initMux(options weboptions.Options) (*goji.Mux, error) {
 	mux.Handle(pat.New("/api/*"), corsHandler.Handler(addPrefix(svc.rpcServer.GatewayHandler())))
 	mux.Handle(pat.New("/*"), corsHandler.Handler(svc.rpcServer.GRPCHandler()))
 
-	return mux, nil
+	return mux
 }
 
+// foreignServiceHandler is a bidi-streaming RPC service handler to support custom APIs.
+// It is invoked instead of returning the "unimplemented" gRPC error whenever a request is received for
+// an unregistered service or method. These method could be registered on a remote viam-server or a module server
+// so this handler will attempt to route the request to the correct next node in the chain.
 func (svc *webService) foreignServiceHandler(srv interface{}, stream googlegrpc.ServerStream) error {
+	// method will be in the form of PackageName.ServiceName/MethodName
 	method, ok := googlegrpc.MethodFromServerStream(stream)
 	if !ok {
 		return grpc.UnimplementedError
@@ -1169,10 +844,15 @@ func (svc *webService) foreignServiceHandler(srv interface{}, stream googlegrpc.
 
 	firstMsg := dynamic.NewMessage(methodDesc.GetInputType())
 
+	// The stream blocks until it receives a message and attempts to deserialize
+	// the message into firstMsg - it will error out if the received message cannot
+	// be marshalled into the expected type.
 	if err := stream.RecvMsg(firstMsg); err != nil {
 		return err
 	}
 
+	// We expect each message to contain a "name" argument which will allow us to route
+	// the message towards the correct destination.
 	resource, fqName, err := robot.ResourceFromProtoMessage(svc.r, firstMsg, subType.API)
 	if err != nil {
 		svc.logger.Errorw("unable to route foreign message", "error", err)
@@ -1213,6 +893,8 @@ func (svc *webService) foreignServiceHandler(srv interface{}, stream googlegrpc.
 			defer wg.Done()
 
 			var err error
+			// process first message before waiting for more messages
+			err = bidiStream.SendMsg(firstMsg)
 			for err == nil {
 				msg := dynamic.NewMessage(methodDesc.GetInputType())
 				if err = stream.RecvMsg(msg); err != nil {
@@ -1261,8 +943,12 @@ func (svc *webService) foreignServiceHandler(srv interface{}, stream googlegrpc.
 		if err != nil {
 			return err
 		}
-
-		for {
+		// process first message before waiting for more messages
+		err = clientStream.SendMsg(firstMsg)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		for err == nil {
 			msg := dynamic.NewMessage(methodDesc.GetInputType())
 			if err := stream.RecvMsg(msg); err != nil {
 				if errors.Is(err, io.EOF) {
@@ -1324,16 +1010,39 @@ func (svc *webService) foreignServiceHandler(srv interface{}, stream googlegrpc.
 	}
 }
 
-// ensureTimeoutUnaryInterceptor sets a default timeout on the context if one is
-// not already set. To be called as the first unary server interceptor.
-func ensureTimeoutUnaryInterceptor(ctx context.Context, req interface{},
-	info *googlegrpc.UnaryServerInfo, handler googlegrpc.UnaryHandler,
-) (interface{}, error) {
-	if _, deadlineSet := ctx.Deadline(); !deadlineSet {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, defaultMethodTimeout)
-		defer cancel()
+type stats struct {
+	RPCServer any
+}
+
+// Stats returns ftdc data on behalf of the rpcServer and other web services.
+func (svc *webService) Stats() any {
+	// RSDK-9369: It's not ideal to block in `Stats`. But we don't today expect this to be
+	// problematic, and alternatives are more complex/expensive.
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+
+	return stats{svc.rpcServer.Stats()}
+}
+
+// RestartStatusResponse is the JSON response of the `restart_status` HTTP
+// endpoint.
+type RestartStatusResponse struct {
+	// RestartAllowed represents whether this instance of the viam-server can be
+	// safely restarted.
+	RestartAllowed bool `json:"restart_allowed"`
+}
+
+// Handles the `/restart_status` endpoint.
+func (svc *webService) handleRestartStatus(w http.ResponseWriter, r *http.Request) {
+	localRobot, isLocal := svc.r.(robot.LocalRobot)
+	if !isLocal {
+		return
 	}
 
-	return handler(ctx, req)
+	response := RestartStatusResponse{RestartAllowed: localRobot.RestartAllowed()}
+
+	w.Header().Set("Content-Type", "application/json")
+	// Only log errors from encoding here. A failure to encode should never
+	// happen.
+	utils.UncheckedError(json.NewEncoder(w).Encode(response))
 }

@@ -3,7 +3,9 @@ package motor
 import (
 	"context"
 	"errors"
+	"time"
 
+	pb "go.viam.com/api/component/motor/v1"
 	"google.golang.org/protobuf/types/known/anypb"
 
 	"go.viam.com/rdk/data"
@@ -26,55 +28,59 @@ func (m method) String() string {
 	return "Unknown"
 }
 
-// Position wraps the returned position value.
-type Position struct {
-	Position float64
-}
-
+// newPositionCollector returns a collector to register a position method. If one is already registered
+// with the same MethodMetadata it will panic.
 func newPositionCollector(resource interface{}, params data.CollectorParams) (data.Collector, error) {
 	motor, err := assertMotor(resource)
 	if err != nil {
 		return nil, err
 	}
 
-	cFunc := data.CaptureFunc(func(ctx context.Context, _ map[string]*anypb.Any) (interface{}, error) {
+	cFunc := data.CaptureFunc(func(ctx context.Context, _ map[string]*anypb.Any) (data.CaptureResult, error) {
+		timeRequested := time.Now()
+		var res data.CaptureResult
 		v, err := motor.Position(ctx, data.FromDMExtraMap)
 		if err != nil {
 			// A modular filter component can be created to filter the readings from a component. The error ErrNoCaptureToStore
 			// is used in the datamanager to exclude readings from being captured and stored.
 			if errors.Is(err, data.ErrNoCaptureToStore) {
-				return nil, err
+				return res, err
 			}
-			return nil, data.FailedToReadErr(params.ComponentName, position.String(), err)
+			return res, data.FailedToReadErr(params.ComponentName, position.String(), err)
 		}
-		return Position{Position: v}, nil
+		ts := data.Timestamps{TimeRequested: timeRequested, TimeReceived: time.Now()}
+		return data.NewTabularCaptureResult(ts, pb.GetPositionResponse{
+			Position: v,
+		})
 	})
 	return data.NewCollector(cFunc, params)
 }
 
-// Powered wraps the returned IsPowered value.
-type Powered struct {
-	IsPowered bool
-	PowerPct  float64
-}
-
+// newIsPoweredCollector returns a collector to register an is powered method. If one is already registered
+// with the same MethodMetadata it will panic.
 func newIsPoweredCollector(resource interface{}, params data.CollectorParams) (data.Collector, error) {
 	motor, err := assertMotor(resource)
 	if err != nil {
 		return nil, err
 	}
 
-	cFunc := data.CaptureFunc(func(ctx context.Context, _ map[string]*anypb.Any) (interface{}, error) {
+	cFunc := data.CaptureFunc(func(ctx context.Context, _ map[string]*anypb.Any) (data.CaptureResult, error) {
+		timeRequested := time.Now()
+		var res data.CaptureResult
 		v, powerPct, err := motor.IsPowered(ctx, data.FromDMExtraMap)
 		if err != nil {
 			// A modular filter component can be created to filter the readings from a component. The error ErrNoCaptureToStore
 			// is used in the datamanager to exclude readings from being captured and stored.
 			if errors.Is(err, data.ErrNoCaptureToStore) {
-				return nil, err
+				return res, err
 			}
-			return nil, data.FailedToReadErr(params.ComponentName, isPowered.String(), err)
+			return res, data.FailedToReadErr(params.ComponentName, isPowered.String(), err)
 		}
-		return Powered{IsPowered: v, PowerPct: powerPct}, nil
+		ts := data.Timestamps{TimeRequested: timeRequested, TimeReceived: time.Now()}
+		return data.NewTabularCaptureResult(ts, pb.IsPoweredResponse{
+			IsOn:     v,
+			PowerPct: powerPct,
+		})
 	})
 	return data.NewCollector(cFunc, params)
 }

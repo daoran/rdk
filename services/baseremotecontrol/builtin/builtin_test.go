@@ -4,23 +4,23 @@ import (
 	"context"
 	"testing"
 
-	"github.com/edaniels/golog"
 	"github.com/golang/geo/r3"
 	"github.com/pkg/errors"
 	"go.viam.com/test"
-	"go.viam.com/utils"
 
 	"go.viam.com/rdk/components/base"
 	fakebase "go.viam.com/rdk/components/base/fake"
 	"go.viam.com/rdk/components/input"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/services/baseremotecontrol"
+	"go.viam.com/rdk/testutils"
 	"go.viam.com/rdk/testutils/inject"
 )
 
 func TestBaseRemoteControl(t *testing.T) {
 	ctx := context.Background()
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	deps := make(resource.Dependencies)
 	cfg := &Config{
 		BaseName:            "baseTest",
@@ -30,7 +30,12 @@ func TestBaseRemoteControl(t *testing.T) {
 
 	depNames, err := cfg.Validate("")
 	test.That(t, err, test.ShouldBeNil)
-	test.That(t, utils.NewStringSet(depNames...), test.ShouldResemble, utils.NewStringSet("baseTest", "inputTest"))
+	testutils.VerifySameElements(t, depNames, []string{"baseTest", "inputTest"})
+
+	cfg.ControlModeName = "fail"
+	_, err = cfg.Validate("")
+	test.That(t, err, test.ShouldBeError,
+		resource.NewConfigValidationError("", errors.Errorf("Control mode '%s' is not in %v", cfg.ControlModeName, modes)))
 
 	fakeController := &inject.InputController{}
 	fakeBase := &fakebase.Base{}
@@ -120,7 +125,7 @@ func TestBaseRemoteControl(t *testing.T) {
 			ConvertedAttributes: cfg,
 		},
 		logger)
-	test.That(t, err, test.ShouldBeError, errors.New("\"rdk:component:input_controller/inputTest\" missing from dependencies"))
+	test.That(t, err, test.ShouldBeError, errors.New("Resource missing from dependencies. Resource: rdk:component:input_controller/inputTest"))
 
 	// Base import failure
 	deps[input.Named(cfg.InputControllerName)] = fakeController
@@ -133,7 +138,7 @@ func TestBaseRemoteControl(t *testing.T) {
 			ConvertedAttributes: cfg,
 		},
 		logger)
-	test.That(t, err, test.ShouldBeError, errors.New("\"rdk:component:base/baseTest\" missing from dependencies"))
+	test.That(t, err, test.ShouldBeError, errors.New("Resource missing from dependencies. Resource: rdk:component:base/baseTest"))
 
 	//  Deps exist but are incorrect component
 	deps[input.Named(cfg.InputControllerName)] = fakeController

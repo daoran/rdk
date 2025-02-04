@@ -2,46 +2,102 @@ package module
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base32"
 	"fmt"
 	"net"
 	"os"
-	"runtime"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/fullstorydev/grpcurl"
+	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	"github.com/jhump/protoreflect/desc"
 	"github.com/jhump/protoreflect/grpcreflect"
+	"github.com/pion/rtp"
 	"github.com/pkg/errors"
+	"github.com/viamrobotics/webrtc/v3"
+	"go.opencensus.io/trace"
 	"go.uber.org/multierr"
-	"go.uber.org/zap"
 	pb "go.viam.com/api/module/v1"
 	robotpb "go.viam.com/api/robot/v1"
+	streampb "go.viam.com/api/stream/v1"
 	"go.viam.com/utils"
+	vprotoutils "go.viam.com/utils/protoutils"
 	"go.viam.com/utils/rpc"
+	"golang.org/x/exp/maps"
 	"google.golang.org/grpc"
 	reflectpb "google.golang.org/grpc/reflection/grpc_reflection_v1alpha"
 
+	"go.viam.com/rdk/components/camera/rtppassthrough"
 	"go.viam.com/rdk/config"
+	rgrpc "go.viam.com/rdk/grpc"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/operation"
 	"go.viam.com/rdk/protoutils"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/robot/client"
+	"go.viam.com/rdk/services/discovery"
 	rutils "go.viam.com/rdk/utils"
 )
 
-// CheckSocketAddressLength returns an error if the socket path is too long for the OS.
-func CheckSocketAddressLength(addr string) error {
+const (
+	socketSuffix = ".sock"
+	// socketHashSuffixLength determines how many characters from the module's name's hash should be used when truncating the module socket.
+	socketHashSuffixLength int = 5
 	// maxSocketAddressLength is the length (-1 for null terminator) of the .sun_path field as used in kernel bind()/connect() syscalls.
-	maxSocketAddressLength := 103
-	if runtime.GOOS == "linux" {
-		maxSocketAddressLength = 107
+	// Linux allows for a max length of 107 but to simplify this code, we truncate to the macOS limit of 103.
+	socketMaxAddressLength int = 103
+	rtpBufferSize          int = 512
+	// https://viam.atlassian.net/browse/RSDK-7347
+	// https://viam.atlassian.net/browse/RSDK-7521
+	// maxSupportedWebRTCTRacks is the max number of WebRTC tracks that can be supported given wihout hitting the sctp SDP message size limit.
+	maxSupportedWebRTCTRacks = 9
+
+	// NoModuleParentEnvVar indicates whether there is a parent for a module being started.
+	NoModuleParentEnvVar = "VIAM_NO_MODULE_PARENT"
+)
+
+// errMaxSupportedWebRTCTrackLimit is the error returned when the MaxSupportedWebRTCTRacks limit is reached.
+var errMaxSupportedWebRTCTrackLimit = fmt.Errorf("only %d WebRTC tracks are supported per peer connection", maxSupportedWebRTCTRacks)
+
+// CreateSocketAddress returns a socket address of the form parentDir/desiredName.sock
+// if it is shorter than the socketMaxAddressLength. If this path would be too long, this function
+// truncates desiredName and returns parentDir/truncatedName-hashOfDesiredName.sock.
+//
+// Importantly, this function will return the same socket address as long as the desiredName doesn't change.
+func CreateSocketAddress(parentDir, desiredName string) (string, error) {
+	baseAddr := filepath.ToSlash(parentDir)
+	numRemainingChars := socketMaxAddressLength -
+		len(baseAddr) -
+		len(socketSuffix) -
+		1 // `/` between baseAddr and name
+	if numRemainingChars < len(desiredName) && numRemainingChars < socketHashSuffixLength+1 {
+		return "", errors.Errorf("module socket base path would result in a path greater than the OS limit of %d characters: %s",
+			socketMaxAddressLength, baseAddr)
 	}
-	if len(addr) > maxSocketAddressLength {
-		return errors.Errorf("module socket path exceeds OS limit of %d characters: %s", maxSocketAddressLength, addr)
+	// If possible, early-exit with a non-truncated socket path
+	if numRemainingChars >= len(desiredName) {
+		return filepath.Join(baseAddr, desiredName+socketSuffix), nil
 	}
-	return nil
+	// Hash the desiredName so that every invocation returns the same truncated address
+	desiredNameHashCreator := sha256.New()
+	_, err := desiredNameHashCreator.Write([]byte(desiredName))
+	if err != nil {
+		return "", errors.Errorf("failed to calculate a hash for %q while creating a truncated socket address", desiredName)
+	}
+	desiredNameHash := base32.StdEncoding.EncodeToString(desiredNameHashCreator.Sum(nil))
+	if len(desiredNameHash) < socketHashSuffixLength {
+		// sha256.Sum() should return 32 bytes so this shouldn't occur, but good to check instead of panicing
+		return "", errors.Errorf("the encoded hash %q for %q is shorter than the minimum socket suffix length %v",
+			desiredNameHash, desiredName, socketHashSuffixLength)
+	}
+	// Assemble the truncated socket address
+	socketHashSuffix := desiredNameHash[:socketHashSuffixLength]
+	truncatedName := desiredName[:(numRemainingChars - socketHashSuffixLength - 1)]
+	return filepath.Join(baseAddr, fmt.Sprintf("%s-%s%s", truncatedName, socketHashSuffix, socketSuffix)), nil
 }
 
 // HandlerMap is the format for api->model pairs that the module will service.
@@ -70,7 +126,7 @@ func (h HandlerMap) ToProto() *pb.HandlerMap {
 }
 
 // NewHandlerMapFromProto converts protobuf to HandlerMap.
-func NewHandlerMapFromProto(ctx context.Context, pMap *pb.HandlerMap, conn *grpc.ClientConn) (HandlerMap, error) {
+func NewHandlerMapFromProto(ctx context.Context, pMap *pb.HandlerMap, conn rpc.ClientConn) (HandlerMap, error) {
 	hMap := make(HandlerMap)
 	refClient := grpcreflect.NewClientV1Alpha(ctx, reflectpb.NewServerReflectionClient(conn))
 	defer refClient.Reset()
@@ -79,22 +135,26 @@ func NewHandlerMapFromProto(ctx context.Context, pMap *pb.HandlerMap, conn *grpc
 	var errs error
 	for _, h := range pMap.GetHandlers() {
 		api := protoutils.ResourceNameFromProto(h.Subtype.Subtype).API
-
-		symDesc, err := reflSource.FindSymbol(h.Subtype.ProtoService)
-		if err != nil {
-			errs = multierr.Combine(errs, err)
-			if errors.Is(err, grpcurl.ErrReflectionNotSupported) {
-				return nil, errs
-			}
-			continue
-		}
-		svcDesc, ok := symDesc.(*desc.ServiceDescriptor)
-		if !ok {
-			return nil, errors.Errorf("expected descriptor to be service descriptor but got %T", symDesc)
-		}
 		rpcAPI := &resource.RPCAPI{
-			API:  api,
-			Desc: svcDesc,
+			API: api,
+		}
+		// due to how tagger is setup in the api we cannot use reflection on the discovery service currently
+		// for now we will skip the reflection step for discovery until the issue is resolved.
+		// TODO(RSDK-9718) - remove the skip.
+		if api != discovery.API {
+			symDesc, err := reflSource.FindSymbol(h.Subtype.ProtoService)
+			if err != nil {
+				errs = multierr.Combine(errs, err)
+				if errors.Is(err, grpcurl.ErrReflectionNotSupported) {
+					return nil, errs
+				}
+				continue
+			}
+			svcDesc, ok := symDesc.(*desc.ServiceDescriptor)
+			if !ok {
+				return nil, errors.Errorf("expected descriptor to be service descriptor but got %T", symDesc)
+			}
+			rpcAPI.Desc = svcDesc
 		}
 		for _, m := range h.Models {
 			model, err := resource.NewModelFromString(m)
@@ -107,12 +167,26 @@ func NewHandlerMapFromProto(ctx context.Context, pMap *pb.HandlerMap, conn *grpc
 	return hMap, errs
 }
 
+type peerResourceState struct {
+	// NOTE As I'm only suppporting video to start this will always be a single element
+	// once we add audio we will need to make this a slice / map
+	subID rtppassthrough.SubscriptionID
+}
+
 // Module represents an external resource module that services components/services.
 type Module struct {
+	// The name of the module as per the robot config. This value is communicated via the
+	// `VIAM_MODULE_NAME` env var.
+	name string
+
+	shutdownCtx             context.Context
+	shutdownFn              context.CancelFunc
 	parent                  *client.RobotClient
 	server                  rpc.Server
-	logger                  *zap.SugaredLogger
+	logger                  logging.Logger
 	mu                      sync.Mutex
+	activeResourceStreams   map[resource.Name]peerResourceState
+	streamSourceByName      map[resource.Name]rtppassthrough.Source
 	operations              *operation.Manager
 	ready                   bool
 	addr                    string
@@ -120,52 +194,95 @@ type Module struct {
 	activeBackgroundWorkers sync.WaitGroup
 	handlers                HandlerMap
 	collections             map[resource.API]resource.APIResourceCollection[resource.Resource]
+	resLoggers              map[resource.Resource]logging.Logger
 	closeOnce               sync.Once
+	pc                      *webrtc.PeerConnection
+	pcReady                 <-chan struct{}
+	pcClosed                <-chan struct{}
+	pcFailed                <-chan struct{}
 	pb.UnimplementedModuleServiceServer
+	streampb.UnimplementedStreamServiceServer
+	robotpb.UnimplementedRobotServiceServer
 }
 
-// NewModule returns the basic module framework/structure.
-func NewModule(ctx context.Context, address string, logger *zap.SugaredLogger) (*Module, error) {
+// NewModule returns the basic module framework/structure. Use ModularMain and NewModuleFromArgs unless
+// you really know what you're doing.
+func NewModule(ctx context.Context, address string, logger logging.Logger) (*Module, error) {
 	// TODO(PRODUCT-343): session support likely means interceptors here
 	opMgr := operation.NewManager(logger)
 	unaries := []grpc.UnaryServerInterceptor{
+		rgrpc.EnsureTimeoutUnaryServerInterceptor,
 		opMgr.UnaryServerInterceptor,
 	}
 	streams := []grpc.StreamServerInterceptor{
 		opMgr.StreamServerInterceptor,
 	}
+	opts := []grpc.ServerOption{
+		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(unaries...)),
+		grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(streams...)),
+	}
+
+	cancelCtx, cancel := context.WithCancel(context.Background())
+
+	// If the env variable does not exist, the empty string is returned.
+	modName, _ := os.LookupEnv("VIAM_MODULE_NAME")
+
 	m := &Module{
-		logger:      logger,
-		addr:        address,
-		operations:  opMgr,
-		server:      NewServer(unaries, streams),
-		ready:       true,
-		handlers:    HandlerMap{},
-		collections: map[resource.API]resource.APIResourceCollection[resource.Resource]{},
+		name:                  modName,
+		shutdownCtx:           cancelCtx,
+		shutdownFn:            cancel,
+		logger:                logger,
+		addr:                  address,
+		operations:            opMgr,
+		streamSourceByName:    map[resource.Name]rtppassthrough.Source{},
+		activeResourceStreams: map[resource.Name]peerResourceState{},
+		server:                NewServer(opts...),
+		ready:                 true,
+		handlers:              HandlerMap{},
+		collections:           map[resource.API]resource.APIResourceCollection[resource.Resource]{},
+		resLoggers:            map[resource.Resource]logging.Logger{},
 	}
 	if err := m.server.RegisterServiceServer(ctx, &pb.ModuleService_ServiceDesc, m); err != nil {
 		return nil, err
 	}
+	if err := m.server.RegisterServiceServer(ctx, &streampb.StreamService_ServiceDesc, m); err != nil {
+		return nil, err
+	}
+	// We register the RobotService API to supplement the ModuleService in order to serve select robot level methods from the module server
+	// such as the DiscoverComponents API
+	if err := m.server.RegisterServiceServer(ctx, &robotpb.RobotService_ServiceDesc, m); err != nil {
+		return nil, err
+	}
+
+	// attempt to construct a PeerConnection
+	pc, err := rgrpc.NewLocalPeerConnection(logger)
+	if err != nil {
+		logger.Debugw("Unable to create optional peer connection for module. Skipping WebRTC for module...", "err", err)
+		return m, nil
+	}
+
+	// attempt to configure PeerConnection
+	pcReady, pcClosed, err := rpc.ConfigureForRenegotiation(pc, rpc.PeerRoleServer, logger)
+	if err != nil {
+		msg := "Error creating renegotiation channel for module. Unable to " +
+			"create optional peer connection for module. Skipping WebRTC for module..."
+		logger.Debugw(msg, "err", err)
+		return m, nil
+	}
+
+	m.pc = pc
+	m.pcReady = pcReady
+	m.pcClosed = pcClosed
+
 	return m, nil
 }
 
 // NewModuleFromArgs directly parses the command line argument to get its address.
-func NewModuleFromArgs(ctx context.Context, logger *zap.SugaredLogger) (*Module, error) {
+func NewModuleFromArgs(ctx context.Context) (*Module, error) {
 	if len(os.Args) < 2 {
 		return nil, errors.New("need socket path as command line argument")
 	}
-	return NewModule(ctx, os.Args[1], logger)
-}
-
-// NewLoggerFromArgs can be used to create a golog.Logger at "DebugLevel" if
-// "--log-level=debug" is the third argument in os.Args and at "InfoLevel"
-// otherwise. See config.Module.LogLevel documentation for more info on how
-// to start modules with a "log-level" commandline argument.
-func NewLoggerFromArgs(moduleName string) golog.Logger {
-	if len(os.Args) >= 3 && os.Args[2] == "--log-level=debug" {
-		return golog.NewDebugLogger(moduleName)
-	}
-	return golog.NewDevelopmentLogger(moduleName)
+	return NewModule(ctx, os.Args[1], NewLoggerFromArgs(""))
 }
 
 // Start starts the module service and grpc server.
@@ -174,9 +291,13 @@ func (m *Module) Start(ctx context.Context) error {
 	defer m.mu.Unlock()
 
 	var lis net.Listener
+	prot := "unix"
+	if rutils.TCPRegex.MatchString(m.addr) {
+		prot = "tcp"
+	}
 	if err := MakeSelfOwnedFilesFunc(func() error {
 		var err error
-		lis, err = net.Listen("unix", m.addr)
+		lis, err = net.Listen(prot, m.addr)
 		if err != nil {
 			return errors.WithMessage(err, "failed to listen")
 		}
@@ -201,8 +322,14 @@ func (m *Module) Start(ctx context.Context) error {
 // Close shuts down the module and grpc server.
 func (m *Module) Close(ctx context.Context) {
 	m.closeOnce.Do(func() {
+		m.shutdownFn()
 		m.mu.Lock()
 		parent := m.parent
+		if m.pc != nil {
+			if err := m.pc.GracefulClose(); err != nil {
+				m.logger.CErrorw(ctx, "WebRTC Peer Connection Close", "err", err)
+			}
+		}
 		m.mu.Unlock()
 		m.logger.Info("Shutting down gracefully.")
 		if parent != nil {
@@ -219,10 +346,6 @@ func (m *Module) Close(ctx context.Context) {
 
 // GetParentResource returns a resource from the parent robot by name.
 func (m *Module) GetParentResource(ctx context.Context, name resource.Name) (resource.Resource, error) {
-	if err := m.connectParent(ctx); err != nil {
-		return nil, err
-	}
-
 	// Refresh parent to ensure it has the most up-to-date resources before calling
 	// ResourceByName.
 	if err := m.parent.Refresh(ctx); err != nil {
@@ -232,19 +355,46 @@ func (m *Module) GetParentResource(ctx context.Context, name resource.Name) (res
 }
 
 func (m *Module) connectParent(ctx context.Context) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.parent == nil {
+	// If parent connection has already been made, do not make another one. Some
+	// tests send two ReadyRequests sequentially, and if an rdk were to retry
+	// sending a ReadyRequest to a module for any reason, we could feasibly make
+	// a second connection back to the parent and leak the first, so disallow the
+	// setting of parent more than once.
+	if m.parent != nil {
+		return nil
+	}
+
+	fullAddr := m.parentAddr
+	if !rutils.TCPRegex.MatchString(m.parentAddr) {
 		if err := CheckSocketOwner(m.parentAddr); err != nil {
 			return err
 		}
-		// TODO(PRODUCT-343): add session support to modules
-		rc, err := client.New(ctx, "unix://"+m.parentAddr, m.logger, client.WithDisableSessions())
-		if err != nil {
-			return err
-		}
-		m.parent = rc
+		fullAddr = "unix://" + m.parentAddr
 	}
+
+	// moduleLoggers may be creating the client connection below, so use a
+	// different logger here to avoid a deadlock where the client connection
+	// tries to recursively connect to the parent.
+	clientLogger := logging.NewLogger("networking.module-connection")
+	clientLogger.SetLevel(m.logger.GetLevel())
+	// TODO(PRODUCT-343): add session support to modules
+
+	connectOptions := []client.RobotClientOption{
+		client.WithDisableSessions(),
+	}
+
+	// Modules compiled against newer SDKs may be running against older `viam-server`s that do not
+	// provide the module name as an env variable.
+	if m.name != "" {
+		connectOptions = append(connectOptions, client.WithModName(m.name))
+	}
+
+	rc, err := client.New(ctx, fullAddr, m.logger, connectOptions...)
+	if err != nil {
+		return err
+	}
+
+	m.parent = rc
 	return nil
 }
 
@@ -255,20 +405,78 @@ func (m *Module) SetReady(ready bool) {
 	m.ready = ready
 }
 
+// PeerConnect returns the encoded answer string for the `ReadyResponse`.
+func (m *Module) PeerConnect(encodedOffer string) (string, error) {
+	if m.pc == nil {
+		return "", errors.New("no PeerConnection object")
+	}
+
+	offer := webrtc.SessionDescription{}
+	if err := rpc.DecodeSDP(encodedOffer, &offer); err != nil {
+		return "", err
+	}
+	if err := m.pc.SetRemoteDescription(offer); err != nil {
+		return "", err
+	}
+
+	answer, err := m.pc.CreateAnswer(nil)
+	if err != nil {
+		return "", err
+	}
+
+	if err := m.pc.SetLocalDescription(answer); err != nil {
+		return "", err
+	}
+
+	<-webrtc.GatheringCompletePromise(m.pc)
+	return rpc.EncodeSDP(m.pc.LocalDescription())
+}
+
 // Ready receives the parent address and reports api/model combos the module is ready to service.
 func (m *Module) Ready(ctx context.Context, req *pb.ReadyRequest) (*pb.ReadyResponse, error) {
+	resp := &pb.ReadyResponse{}
+
+	encodedAnswer, err := m.PeerConnect(req.WebrtcOffer)
+	if err == nil {
+		resp.WebrtcAnswer = encodedAnswer
+	} else {
+		m.logger.Debugw("Unable to create optional peer connection for module. Skipping WebRTC for module...", "err", err)
+		pcFailed := make(chan struct{})
+		close(pcFailed)
+		m.pcFailed = pcFailed
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.parentAddr = req.GetParentAddress()
 
-	return &pb.ReadyResponse{
-		Ready:      m.ready,
-		Handlermap: m.handlers.ToProto(),
-	}, nil
+	// we start the module without connecting to a parent since we
+	// are only concerned with validation and extracting metadata.
+	if os.Getenv(NoModuleParentEnvVar) != "true" {
+		m.parentAddr = req.GetParentAddress()
+		if err := m.connectParent(ctx); err != nil {
+			// Return error back to parent if we cannot make a connection from module
+			// -> parent. Something is wrong in that case and the module should not be
+			// operational.
+			return nil, err
+		}
+		// If logger is a moduleLogger, start gRPC logging.
+		// Note that this logging assumes that a valid parent exists.
+		if moduleLogger, ok := m.logger.(*moduleLogger); ok {
+			moduleLogger.startLoggingViaGRPC(m)
+		}
+	}
+
+	resp.Ready = m.ready
+	resp.Handlermap = m.handlers.ToProto()
+	return resp, nil
 }
 
 // AddResource receives the component/service configuration from the parent.
 func (m *Module) AddResource(ctx context.Context, req *pb.AddResourceRequest) (*pb.AddResourceResponse, error) {
+	select {
+	case <-m.pcReady:
+	case <-m.pcFailed:
+	}
+
 	deps := make(resource.Dependencies)
 	for _, c := range req.Dependencies {
 		name, err := resource.NewFromString(c)
@@ -298,9 +506,34 @@ func (m *Module) AddResource(ctx context.Context, req *pb.AddResourceRequest) (*
 	if resInfo.Constructor == nil {
 		return nil, errors.Errorf("invariant: no constructor for %q", conf.API)
 	}
-	res, err := resInfo.Constructor(ctx, deps, *conf, m.logger)
+	resLogger := m.logger.Sublogger(conf.ResourceName().String())
+	levelStr := req.Config.GetLogConfiguration().GetLevel()
+	// An unset LogConfiguration will materialize as an empty string.
+	if levelStr != "" {
+		if level, err := logging.LevelFromString(levelStr); err == nil {
+			resLogger.SetLevel(level)
+		} else {
+			m.logger.Warnw("LogConfiguration does not contain a valid level.", "resource", conf.ResourceName().Name, "level", levelStr)
+		}
+	}
+
+	res, err := resInfo.Constructor(ctx, deps, *conf, resLogger)
 	if err != nil {
 		return nil, err
+	}
+
+	// If context has errored, even if construction succeeded we should close the resource and return the context error.
+	// Use shutdownCtx because otherwise any Close operations that rely on the context will immediately fail.
+	// The deadline associated with the context passed in to this function is rutils.GetResourceConfigurationTimeout,
+	// which is propagated to AddResource through gRPC.
+	if ctx.Err() != nil {
+		m.logger.CDebugw(ctx, "resource successfully constructed but context is done, closing constructed resource", "err", ctx.Err().Error())
+		return nil, multierr.Combine(ctx.Err(), res.Close(m.shutdownCtx))
+	}
+
+	var passthroughSource rtppassthrough.Source
+	if p, ok := res.(rtppassthrough.Source); ok {
+		passthroughSource = p
 	}
 
 	m.mu.Lock()
@@ -310,7 +543,79 @@ func (m *Module) AddResource(ctx context.Context, req *pb.AddResourceRequest) (*
 		return nil, errors.Errorf("module cannot service api: %s", conf.API)
 	}
 
-	return &pb.AddResourceResponse{}, coll.Add(conf.ResourceName(), res)
+	// If adding the resource name to the collection fails, close the resource
+	// and return an error
+	if err := coll.Add(conf.ResourceName(), res); err != nil {
+		return nil, multierr.Combine(err, res.Close(ctx))
+	}
+
+	m.resLoggers[res] = resLogger
+
+	// add the video stream resources upon creation
+	if passthroughSource != nil {
+		m.streamSourceByName[res.Name()] = passthroughSource
+	}
+	return &pb.AddResourceResponse{}, nil
+}
+
+// DiscoverComponents is DEPRECATED!!! Please use the Discovery Service instead.
+// DiscoverComponents takes a list of discovery queries and returns corresponding
+// component configurations.
+//
+//nolint:deprecated,staticcheck
+func (m *Module) DiscoverComponents(
+	ctx context.Context,
+	req *robotpb.DiscoverComponentsRequest,
+) (*robotpb.DiscoverComponentsResponse, error) {
+	var discoveries []*robotpb.Discovery
+
+	for _, q := range req.Queries {
+		// Handle triplet edge case i.e. if the subtype doesn't contain ':', add the "rdk:component:" prefix
+		if !strings.ContainsRune(q.Subtype, ':') {
+			q.Subtype = "rdk:component:" + q.Subtype
+		}
+
+		api, err := resource.NewAPIFromString(q.Subtype)
+		if err != nil {
+			return nil, fmt.Errorf("invalid subtype: %s: %w", q.Subtype, err)
+		}
+		model, err := resource.NewModelFromString(q.Model)
+		if err != nil {
+			return nil, fmt.Errorf("invalid model: %s: %w", q.Model, err)
+		}
+
+		resInfo, ok := resource.LookupRegistration(api, model)
+		if !ok {
+			return nil, fmt.Errorf("no registration found for API %s and model %s", api, model)
+		}
+
+		if resInfo.Discover == nil {
+			return nil, fmt.Errorf("discovery not supported for API %s and model %s", api, model)
+		}
+
+		results, err := resInfo.Discover(ctx, m.logger, q.Extra.AsMap())
+		if err != nil {
+			return nil, fmt.Errorf("error discovering components for API %s and model %s: %w", api, model, err)
+		}
+		if results == nil {
+			return nil, fmt.Errorf("error discovering components for API %s and model %s: results was nil", api, model)
+		}
+
+		pbResults, err := vprotoutils.StructToStructPb(results)
+		if err != nil {
+			return nil, fmt.Errorf("unable to convert discovery results to pb struct for query %v: %w", q, err)
+		}
+
+		pbDiscovery := &robotpb.Discovery{
+			Query:   q,
+			Results: pbResults,
+		}
+		discoveries = append(discoveries, pbDiscovery)
+	}
+
+	return &robotpb.DiscoverComponentsResponse{
+		Discovery: discoveries,
+	}, nil
 }
 
 // ReconfigureResource receives the component/service configuration from the parent.
@@ -351,6 +656,18 @@ func (m *Module) ReconfigureResource(ctx context.Context, req *pb.ReconfigureRes
 		return nil, err
 	}
 
+	if logger, ok := m.resLoggers[res]; ok {
+		levelStr := req.GetConfig().GetLogConfiguration().GetLevel()
+		// An unset LogConfiguration will materialize as an empty string.
+		if levelStr != "" {
+			if level, err := logging.LevelFromString(levelStr); err == nil {
+				logger.SetLevel(level)
+			} else {
+				m.logger.Warnw("LogConfiguration does not contain a valid level.", "resource", res.Name().Name, "level", levelStr)
+			}
+		}
+	}
+
 	reconfErr := res.Reconfigure(ctx, deps, *conf)
 	if reconfErr == nil {
 		return &pb.ReconfigureResourceResponse{}, nil
@@ -365,6 +682,7 @@ func (m *Module) ReconfigureResource(ctx context.Context, req *pb.ReconfigureRes
 		m.logger.Error(err)
 	}
 
+	delete(m.activeResourceStreams, res.Name())
 	resInfo, ok := resource.LookupRegistration(conf.API, conf.Model)
 	if !ok {
 		return nil, errors.Errorf("do not know how to construct %q", conf.API)
@@ -372,9 +690,18 @@ func (m *Module) ReconfigureResource(ctx context.Context, req *pb.ReconfigureRes
 	if resInfo.Constructor == nil {
 		return nil, errors.Errorf("invariant: no constructor for %q", conf.API)
 	}
+
 	newRes, err := resInfo.Constructor(ctx, deps, *conf, m.logger)
 	if err != nil {
 		return nil, err
+	}
+	var passthroughSource rtppassthrough.Source
+	if p, ok := newRes.(rtppassthrough.Source); ok {
+		passthroughSource = p
+	}
+
+	if passthroughSource != nil {
+		m.streamSourceByName[res.Name()] = passthroughSource
 	}
 	return &pb.ReconfigureResourceResponse{}, coll.ReplaceOne(conf.ResourceName(), newRes)
 }
@@ -429,9 +756,13 @@ func (m *Module) RemoveResource(ctx context.Context, req *pb.RemoveResourceReque
 	if err != nil {
 		return nil, err
 	}
+
 	if err := res.Close(ctx); err != nil {
 		m.logger.Error(err)
 	}
+
+	delete(m.streamSourceByName, res.Name())
+	delete(m.activeResourceStreams, res.Name())
 
 	return &pb.RemoveResourceResponse{}, coll.Remove(name)
 }
@@ -499,19 +830,170 @@ func (m *Module) OperationManager() *operation.Manager {
 	return m.operations
 }
 
+// ListStreams lists the streams.
+func (m *Module) ListStreams(ctx context.Context, req *streampb.ListStreamsRequest) (*streampb.ListStreamsResponse, error) {
+	_, span := trace.StartSpan(ctx, "module::module::ListStreams")
+	defer span.End()
+	names := make([]string, 0, len(m.streamSourceByName))
+	for _, n := range maps.Keys(m.streamSourceByName) {
+		names = append(names, n.String())
+	}
+	return &streampb.ListStreamsResponse{Names: names}, nil
+}
+
+// AddStream adds a stream.
+// Returns an error if:
+// 1. there is no WebRTC peer connection with viam-sever
+// 2. resource doesn't exist
+// 3. the resource doesn't implement rtppassthrough.Source,
+// 4. there are already the max number of supported tracks on the peer connection
+// 5. SubscribeRTP returns an error
+// 6. A webrtc track is unable to be created
+// 7. Adding the track to the peer connection fails.
+func (m *Module) AddStream(ctx context.Context, req *streampb.AddStreamRequest) (*streampb.AddStreamResponse, error) {
+	ctx, span := trace.StartSpan(ctx, "module::module::AddStream")
+	defer span.End()
+	name, err := resource.NewFromString(req.GetName())
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pc == nil {
+		return nil, errors.New("module has no peer connection")
+	}
+	vcss, ok := m.streamSourceByName[name]
+	if !ok {
+		err := errors.New("unknown stream for resource")
+		m.logger.CWarnw(ctx, err.Error(), "name", name, "streamSourceByName", fmt.Sprintf("%#v", m.streamSourceByName))
+		return nil, err
+	}
+
+	if _, ok = m.activeResourceStreams[name]; ok {
+		m.logger.CWarnw(ctx, "AddStream called with when there is already a stream for peer connection. NoOp", "name", name)
+		return &streampb.AddStreamResponse{}, nil
+	}
+
+	if len(m.activeResourceStreams) >= maxSupportedWebRTCTRacks {
+		return nil, errMaxSupportedWebRTCTrackLimit
+	}
+
+	tlsRTP, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: "video/H264"}, "video", name.String())
+	if err != nil {
+		return nil, errors.Wrap(err, "error creating a new TrackLocalStaticRTP")
+	}
+
+	sub, err := vcss.SubscribeRTP(ctx, rtpBufferSize, func(pkts []*rtp.Packet) {
+		for _, pkt := range pkts {
+			if err := tlsRTP.WriteRTP(pkt); err != nil {
+				m.logger.CWarnw(ctx, "SubscribeRTP callback function WriteRTP", "err", err)
+			}
+		}
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "error setting up stream subscription")
+	}
+
+	m.logger.CDebugw(ctx, "AddStream calling AddTrack", "name", name, "subID", sub.ID.String())
+	sender, err := m.pc.AddTrack(tlsRTP)
+	if err != nil {
+		err = errors.Wrap(err, "error adding track")
+		if unsubErr := vcss.Unsubscribe(ctx, sub.ID); unsubErr != nil {
+			return nil, multierr.Combine(err, unsubErr)
+		}
+		return nil, err
+	}
+
+	removeTrackOnSubTerminate := func() {
+		defer m.logger.Debugw("RemoveTrack called on ", "name", name, "subID", sub.ID.String())
+		// wait until either the module is shutting down, or the subscription terminates
+		var msg string
+		select {
+		case <-sub.Terminated.Done():
+			msg = "rtp_passthrough subscription expired, calling RemoveTrack"
+		case <-m.shutdownCtx.Done():
+			msg = "module closing calling RemoveTrack"
+		}
+		// remove the track from the peer connection so that viam-server clients know that the stream has terminated
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		m.logger.Debugw(msg, "name", name, "subID", sub.ID.String())
+		delete(m.activeResourceStreams, name)
+		if err := m.pc.RemoveTrack(sender); err != nil {
+			m.logger.Warnf("RemoveTrack returned error", "name", name, "subID", sub.ID.String(), "err", err)
+		}
+	}
+	m.activeBackgroundWorkers.Add(1)
+	utils.ManagedGo(removeTrackOnSubTerminate, m.activeBackgroundWorkers.Done)
+
+	m.activeResourceStreams[name] = peerResourceState{subID: sub.ID}
+	return &streampb.AddStreamResponse{}, nil
+}
+
+// RemoveStream removes a stream.
+func (m *Module) RemoveStream(ctx context.Context, req *streampb.RemoveStreamRequest) (*streampb.RemoveStreamResponse, error) {
+	ctx, span := trace.StartSpan(ctx, "module::module::RemoveStream")
+	defer span.End()
+	name, err := resource.NewFromString(req.GetName())
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pc == nil {
+		return nil, errors.New("module has no peer connection")
+	}
+	vcss, ok := m.streamSourceByName[name]
+	if !ok {
+		return nil, errors.Errorf("unknown stream for resource %s", name)
+	}
+
+	prs, ok := m.activeResourceStreams[name]
+	if !ok {
+		return nil, errors.Errorf("stream %s is not active", name)
+	}
+
+	if err := vcss.Unsubscribe(ctx, prs.subID); err != nil {
+		m.logger.CWarnw(ctx, "RemoveStream > Unsubscribe", "name", name, "subID", prs.subID.String(), "err", err)
+		return nil, err
+	}
+
+	delete(m.activeResourceStreams, name)
+	return &streampb.RemoveStreamResponse{}, nil
+}
+
 // addConvertedAttributesToConfig uses the MapAttributeConverter to fill in the
-// ConvertedAttributes field from the Attributes.
+// ConvertedAttributes field from the Attributes and AssociatedResourceConfigs.
 func addConvertedAttributes(cfg *resource.Config) error {
 	// Try to find map converter for a resource.
 	reg, ok := resource.LookupRegistration(cfg.API, cfg.Model)
-	if !ok || reg.AttributeMapConverter == nil {
-		return nil
+	if ok && reg.AttributeMapConverter != nil {
+		converted, err := reg.AttributeMapConverter(cfg.Attributes)
+		if err != nil {
+			return errors.Wrapf(err, "error converting attributes for resource")
+		}
+		cfg.ConvertedAttributes = converted
 	}
-	converted, err := reg.AttributeMapConverter(cfg.Attributes)
-	if err != nil {
-		return errors.Wrapf(err, "error converting attributes for resource")
+
+	// Also try for associated configs (will only succeed if module itself registers the associated config API).
+	for subIdx, associatedConf := range cfg.AssociatedResourceConfigs {
+		conv, ok := resource.LookupAssociatedConfigRegistration(associatedConf.API)
+		if !ok {
+			continue
+		}
+		if conv.AttributeMapConverter != nil {
+			converted, err := conv.AttributeMapConverter(associatedConf.Attributes)
+			if err != nil {
+				return errors.Wrap(err, "error converting associated resource config attributes")
+			}
+			// associated resource configs for resources might be missing a resource name
+			// which can be inferred from its resource config.
+			converted.UpdateResourceNames(func(oldName resource.Name) resource.Name {
+				return cfg.ResourceName()
+			})
+			cfg.AssociatedResourceConfigs[subIdx].ConvertedAttributes = converted
+		}
 	}
-	cfg.ConvertedAttributes = converted
 	return nil
 }
 

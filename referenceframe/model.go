@@ -13,16 +13,15 @@ import (
 	"go.uber.org/multierr"
 	pb "go.viam.com/api/component/arm/v1"
 
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/spatialmath"
 )
-
-// errUnsupportedFileType is returned if we try to build a model from an inproper extension.
-var errUnsupportedFileType = errors.New("only files with .json and .urdf file extensions are supported")
 
 // A Model represents a frame that can change its name, and can return itself as a ModelConfig struct.
 type Model interface {
 	Frame
 	ModelConfig() *ModelConfig
+	ModelPieceFrames([]Input) (map[string]Frame, error)
 }
 
 // ModelFramer has a method that returns the kinematics information needed to build a dynamic referenceframe.
@@ -75,6 +74,25 @@ func (m *SimpleModel) Transform(inputs []Input) (spatialmath.Pose, error) {
 		return nil, err
 	}
 	return frames[0].transform, err
+}
+
+// Interpolate interpolates the given amount between the two sets of inputs.
+func (m *SimpleModel) Interpolate(from, to []Input, by float64) ([]Input, error) {
+	interp := make([]Input, 0, len(from))
+	posIdx := 0
+	for _, transform := range m.OrdTransforms {
+		dof := len(transform.DoF()) + posIdx
+		fromSubset := from[posIdx:dof]
+		toSubset := to[posIdx:dof]
+		posIdx = dof
+
+		interpSubset, err := transform.Interpolate(fromSubset, toSubset, by)
+		if err != nil {
+			return nil, err
+		}
+		interp = append(interp, interpSubset...)
+	}
+	return interp, nil
 }
 
 // InputFromProtobuf converts pb.JointPosition to inputs.
@@ -172,13 +190,27 @@ func (m *SimpleModel) MarshalJSON() ([]byte, error) {
 	return json.Marshal(m.modelConfig)
 }
 
+// ModelPieceFrames takes a list of inputs and returns a map of frame names to their corresponding static frames,
+// effectively breaking the model into its kinematic pieces.
+func (m *SimpleModel) ModelPieceFrames(inputs []Input) (map[string]Frame, error) {
+	poses, err := m.inputsToFrames(inputs, true)
+	if err != nil {
+		return nil, err
+	}
+	frameMap := map[string]Frame{}
+	for _, sFrame := range poses {
+		frameMap[sFrame.Name()] = sFrame
+	}
+	return frameMap, nil
+}
+
 // TODO(rb) better comment
 // takes a model and a list of joint angles in radians and computes the dual quaternion representing the
 // cartesian position of each of the links up to and including the end effector. This is useful for when conversions
 // between quaternions and OV are not needed.
 func (m *SimpleModel) inputsToFrames(inputs []Input, collectAll bool) ([]*staticFrame, error) {
 	if len(m.DoF()) != len(inputs) {
-		return nil, NewIncorrectInputLengthError(len(inputs), len(m.DoF()))
+		return nil, NewIncorrectDoFError(len(inputs), len(m.DoF()))
 	}
 	var err error
 	poses := make([]*staticFrame, 0, len(m.OrdTransforms))
@@ -233,61 +265,6 @@ func floatsToString(inputs []Input) string {
 	return string(b)
 }
 
-// Create an ordered list of transforms given a parent mapping, keeping an eye out for a sentinel string (World).
-func sortTransforms(unsorted map[string]Frame, parentMap map[string]string, start, finish string) ([]Frame, error) {
-	seen := map[string]bool{}
-
-	nextTransform, ok := unsorted[start]
-	if !ok {
-		return nil, NewFrameNotInListOfTransformsError(start)
-	}
-	orderedTransforms := []Frame{nextTransform}
-	seen[start] = true
-	for {
-		parent, ok := parentMap[nextTransform.Name()]
-		if !ok {
-			return nil, NewParentFrameNotInMapOfParentsError(nextTransform.Name())
-		}
-		if seen[parent] {
-			return nil, ErrCircularReference
-		}
-		// Reserved word, we reached the end of the chain
-		if parent == finish {
-			break
-		}
-		seen[parent] = true
-		nextTransform, ok = unsorted[parent]
-		if !ok {
-			return nil, NewFrameNotInListOfTransformsError(parent)
-		}
-		orderedTransforms = append(orderedTransforms, nextTransform)
-	}
-
-	// After the above loop, the transforms are in reverse order, so we reverse the list.
-	for i, j := 0, len(orderedTransforms)-1; i < j; i, j = i+1, j-1 {
-		orderedTransforms[i], orderedTransforms[j] = orderedTransforms[j], orderedTransforms[i]
-	}
-
-	return orderedTransforms, nil
-}
-
-// ModelFromPath returns a Model from a given path.
-func ModelFromPath(modelPath, name string) (Model, error) {
-	var (
-		model Model
-		err   error
-	)
-	switch {
-	case strings.HasSuffix(modelPath, ".urdf"):
-		model, err = ParseURDFFile(modelPath, name)
-	case strings.HasSuffix(modelPath, ".json"):
-		model, err = ParseModelJSONFile(modelPath, name)
-	default:
-		return model, errUnsupportedFileType
-	}
-	return model, err
-}
-
 // New2DMobileModelFrame builds the kinematic model associated with the kinematicWheeledBase
 // This model is intended to be used with a mobile base and has either 2DOF corresponding to  a state of x, y
 // or has 3DOF corresponding to a state of x, y, and theta, where x and y are the positional coordinates
@@ -323,4 +300,42 @@ func New2DMobileModelFrame(name string, limits []Limit, collisionGeometry spatia
 		model.OrdTransforms = []Frame{x, y, geometry}
 	}
 	return model, nil
+}
+
+// ComputeOOBPosition takes a frame and a slice of Inputs and returns the cartesian position of the frame after
+// transforming it by the given inputs even when if the inputs given would violate the Limits of the frame.
+// This is performed statelessly without changing any data.
+func ComputeOOBPosition(frame Frame, inputs []Input) (spatialmath.Pose, error) {
+	if inputs == nil {
+		return nil, errors.New("cannot compute position for nil joints")
+	}
+	if frame == nil {
+		return nil, errors.New("cannot compute position for nil frame")
+	}
+
+	pose, err := frame.Transform(inputs)
+	if err != nil && !strings.Contains(err.Error(), OOBErrString) {
+		return nil, err
+	}
+
+	return pose, nil
+}
+
+// ComputePosition takes a frame and a slice of Inputs and returns the cartesian position of the frame.
+func ComputePosition(frame Frame, inputs []Input) (spatialmath.Pose, error) {
+	// TODO: delete this function
+	logging.Global().Warn("ComputePosition is deprecated and will be removed in a future update. Swap to Transform()")
+
+	if inputs == nil {
+		return nil, errors.New("cannot compute position for nil joints")
+	}
+	if frame == nil {
+		return nil, errors.New("cannot compute position for nil frame")
+	}
+
+	pose, err := frame.Transform(inputs)
+	if err != nil {
+		return nil, err
+	}
+	return pose, err
 }

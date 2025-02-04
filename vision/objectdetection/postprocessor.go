@@ -1,6 +1,9 @@
 package objectdetection
 
-import "sort"
+import (
+	"sort"
+	"strings"
+)
 
 // Postprocessor defines a function that filters/modifies on an incoming array of Detections.
 type Postprocessor func([]Detection) []Detection
@@ -25,6 +28,47 @@ func NewScoreFilter(conf float64) Postprocessor {
 		for _, d := range in {
 			if d.Score() >= conf {
 				out = append(out, d)
+			}
+		}
+		return out
+	}
+}
+
+// NewLabelFilter returns a function that filters out detections without one of the chosen labels.
+// Does not filter when input is empty.
+func NewLabelFilter(labels map[string]interface{}) Postprocessor {
+	return func(in []Detection) []Detection {
+		if len(labels) < 1 {
+			return in
+		}
+		out := make([]Detection, 0, len(in))
+		for _, d := range in {
+			if _, ok := labels[strings.ToLower(d.Label())]; ok {
+				out = append(out, d)
+			}
+		}
+		return out
+	}
+}
+
+// NewLabelConfidenceFilter returns a function that filters out detections based on label map.
+// Does not filter when input is empty.
+func NewLabelConfidenceFilter(labels map[string]float64) Postprocessor {
+	// ensure all the label names are lower case
+	theLabels := make(map[string]float64)
+	for name, conf := range labels {
+		theLabels[strings.ToLower(name)] = conf
+	}
+	return func(in []Detection) []Detection {
+		if len(theLabels) < 1 {
+			return in
+		}
+		out := make([]Detection, 0, len(in))
+		for _, d := range in {
+			if conf, ok := theLabels[strings.ToLower(d.Label())]; ok {
+				if d.Score() >= conf {
+					out = append(out, d)
+				}
 			}
 		}
 		return out

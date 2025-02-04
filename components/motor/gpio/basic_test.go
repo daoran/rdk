@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/pkg/errors"
 	"go.viam.com/test"
 	"go.viam.com/utils/testutils"
@@ -14,6 +13,7 @@ import (
 	"go.viam.com/rdk/components/board"
 	fakeboard "go.viam.com/rdk/components/board/fake"
 	"go.viam.com/rdk/components/motor"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 )
 
@@ -23,7 +23,7 @@ const maxRPM = 100
 func TestMotorABPWM(t *testing.T) {
 	ctx := context.Background()
 	b := &fakeboard.Board{GPIOPins: map[string]*fakeboard.GPIOPin{}}
-	logger, obs := golog.NewObservedTestLogger(t)
+	logger, obs := logging.NewObservedTestLogger(t)
 
 	mc := resource.Config{
 		Name: "abc",
@@ -41,6 +41,18 @@ func TestMotorABPWM(t *testing.T) {
 		}, mc.ResourceName(), logger)
 		test.That(t, m, test.ShouldBeNil)
 		test.That(t, err, test.ShouldBeError, errors.New("max_power_pct must be between 0.06 and 1.0"))
+
+		m, err = NewMotor(b, Config{
+			Pins: PinConfig{A: "1", PWM: "3"}, MaxPowerPct: 0.07, PWMFreq: 4000,
+		}, mc.ResourceName(), logger)
+		test.That(t, m, test.ShouldBeNil)
+		test.That(t, err, test.ShouldBeError, resource.NewConfigValidationError("", getPinConfigErrorMessage(aNotB)))
+
+		m, err = NewMotor(b, Config{
+			Pins: PinConfig{B: "1", PWM: "3"}, MaxPowerPct: 0.07, PWMFreq: 4000,
+		}, mc.ResourceName(), logger)
+		test.That(t, m, test.ShouldBeNil)
+		test.That(t, err, test.ShouldBeError, resource.NewConfigValidationError("", getPinConfigErrorMessage(bNotA)))
 	})
 
 	t.Run("motor (A/B/PWM) Off testing", func(t *testing.T) {
@@ -83,7 +95,7 @@ func TestMotorABPWM(t *testing.T) {
 		on, powerPct, err = m.IsPowered(ctx, nil)
 		test.That(t, err, test.ShouldBeNil)
 		test.That(t, on, test.ShouldBeTrue)
-		test.That(t, powerPct, test.ShouldEqual, 0.44)
+		test.That(t, powerPct, test.ShouldEqual, -0.44)
 
 		test.That(t, m.SetPower(ctx, 0, nil), test.ShouldBeNil)
 		test.That(t, mustGetGPIOPinByName(b, "1").Get(context.Background()), test.ShouldEqual, false)
@@ -97,15 +109,15 @@ func TestMotorABPWM(t *testing.T) {
 	})
 
 	t.Run("motor (A/B/PWM) GoFor testing", func(t *testing.T) {
-		test.That(t, m.GoFor(ctx, 50, 0, nil), test.ShouldBeNil)
-		test.That(t, mustGetGPIOPinByName(b, "1").Get(context.Background()), test.ShouldEqual, true)
-		test.That(t, mustGetGPIOPinByName(b, "2").Get(context.Background()), test.ShouldEqual, false)
-		test.That(t, mustGetGPIOPinByName(b, "3").PWM(context.Background()), test.ShouldEqual, .5)
-
-		test.That(t, m.GoFor(ctx, -50, 0, nil), test.ShouldBeNil)
+		test.That(t, m.GoFor(ctx, 50, 0, nil), test.ShouldBeError, motor.NewZeroRevsError())
 		test.That(t, mustGetGPIOPinByName(b, "1").Get(context.Background()), test.ShouldEqual, false)
-		test.That(t, mustGetGPIOPinByName(b, "2").Get(context.Background()), test.ShouldEqual, true)
-		test.That(t, mustGetGPIOPinByName(b, "3").PWM(context.Background()), test.ShouldEqual, .5)
+		test.That(t, mustGetGPIOPinByName(b, "2").Get(context.Background()), test.ShouldEqual, false)
+		test.That(t, mustGetGPIOPinByName(b, "3").PWM(context.Background()), test.ShouldEqual, 0)
+
+		test.That(t, m.GoFor(ctx, -50, 0, nil), test.ShouldBeError, motor.NewZeroRevsError())
+		test.That(t, mustGetGPIOPinByName(b, "1").Get(context.Background()), test.ShouldEqual, false)
+		test.That(t, mustGetGPIOPinByName(b, "2").Get(context.Background()), test.ShouldEqual, false)
+		test.That(t, mustGetGPIOPinByName(b, "3").PWM(context.Background()), test.ShouldEqual, 0)
 
 		test.That(t, m.GoFor(ctx, 0, 1, nil), test.ShouldBeError, motor.NewZeroRPMError())
 		test.That(t, m.Stop(context.Background(), nil), test.ShouldBeNil)
@@ -145,7 +157,7 @@ func TestMotorABPWM(t *testing.T) {
 func TestMotorDirPWM(t *testing.T) {
 	ctx := context.Background()
 	b := &fakeboard.Board{GPIOPins: map[string]*fakeboard.GPIOPin{}}
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 
 	mc := resource.Config{
 		Name: "fake_motor",
@@ -156,7 +168,12 @@ func TestMotorDirPWM(t *testing.T) {
 			mc.ResourceName(), logger)
 
 		test.That(t, err, test.ShouldBeNil)
-		test.That(t, m.GoFor(ctx, 50, 10, nil), test.ShouldBeError, errors.New("not supported, define max_rpm attribute != 0"))
+		test.That(t, m.GoFor(ctx, 50, 10, nil), test.ShouldBeNil)
+
+		m, err = NewMotor(b, Config{Pins: PinConfig{Direction: "1", EnablePinLow: "2"}, PWMFreq: 4000},
+			mc.ResourceName(), logger)
+		test.That(t, m, test.ShouldBeNil)
+		test.That(t, err, test.ShouldBeError, resource.NewConfigValidationError("", getPinConfigErrorMessage(dirNotPWM)))
 
 		_, err = NewMotor(
 			b,
@@ -174,7 +191,7 @@ func TestMotorDirPWM(t *testing.T) {
 
 	t.Run("motor (DIR/PWM) Off testing", func(t *testing.T) {
 		test.That(t, m.Stop(ctx, nil), test.ShouldBeNil)
-		test.That(t, mustGetGPIOPinByName(b, "1").Get(context.Background()), test.ShouldEqual, false)
+		test.That(t, mustGetGPIOPinByName(b, "1").Get(context.Background()), test.ShouldEqual, true)
 		test.That(t, mustGetGPIOPinByName(b, "2").Get(context.Background()), test.ShouldEqual, true)
 		test.That(t, mustGetGPIOPinByName(b, "1").PWM(context.Background()), test.ShouldEqual, 0)
 		test.That(t, mustGetGPIOPinByName(b, "2").PWM(context.Background()), test.ShouldEqual, 0)
@@ -186,13 +203,13 @@ func TestMotorDirPWM(t *testing.T) {
 	})
 
 	t.Run("motor (DIR/PWM) GoFor testing", func(t *testing.T) {
-		test.That(t, m.GoFor(ctx, 50, 0, nil), test.ShouldBeNil)
+		test.That(t, m.GoFor(ctx, 50, 0, nil), test.ShouldBeError, motor.NewZeroRevsError())
 		test.That(t, mustGetGPIOPinByName(b, "1").Get(context.Background()), test.ShouldEqual, true)
-		test.That(t, mustGetGPIOPinByName(b, "3").PWM(context.Background()), test.ShouldEqual, .5)
+		test.That(t, mustGetGPIOPinByName(b, "3").PWM(context.Background()), test.ShouldEqual, 0)
 
-		test.That(t, m.GoFor(ctx, -50, 0, nil), test.ShouldBeNil)
-		test.That(t, mustGetGPIOPinByName(b, "1").Get(context.Background()), test.ShouldEqual, false)
-		test.That(t, mustGetGPIOPinByName(b, "3").PWM(context.Background()), test.ShouldEqual, .5)
+		test.That(t, m.GoFor(ctx, -50, 0, nil), test.ShouldBeError, motor.NewZeroRevsError())
+		test.That(t, mustGetGPIOPinByName(b, "1").Get(context.Background()), test.ShouldEqual, true)
+		test.That(t, mustGetGPIOPinByName(b, "3").PWM(context.Background()), test.ShouldEqual, 0)
 
 		test.That(t, m.Stop(context.Background(), nil), test.ShouldBeNil)
 	})
@@ -229,10 +246,19 @@ func TestMotorDirPWM(t *testing.T) {
 func TestMotorAB(t *testing.T) {
 	ctx := context.Background()
 	b := &fakeboard.Board{GPIOPins: map[string]*fakeboard.GPIOPin{}}
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	mc := resource.Config{
 		Name: "fake_motor",
 	}
+
+	t.Run("motor (A/B) initialization errors", func(t *testing.T) {
+		m, err := NewMotor(b, Config{
+			Pins:   PinConfig{A: "1", EnablePinLow: "3"},
+			MaxRPM: maxRPM, PWMFreq: 4000,
+		}, mc.ResourceName(), logger)
+		test.That(t, m, test.ShouldBeNil)
+		test.That(t, err, test.ShouldBeError, resource.NewConfigValidationError("", getPinConfigErrorMessage(aNotB)))
+	})
 
 	m, err := NewMotor(b, Config{
 		Pins:   PinConfig{A: "1", B: "2", EnablePinLow: "3"},
@@ -303,7 +329,7 @@ func TestMotorAB(t *testing.T) {
 func TestMotorABNoEncoder(t *testing.T) {
 	ctx := context.Background()
 	b := &fakeboard.Board{GPIOPins: map[string]*fakeboard.GPIOPin{}}
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	mc := resource.Config{
 		Name: "fake_motor",
 	}
@@ -315,7 +341,7 @@ func TestMotorABNoEncoder(t *testing.T) {
 	test.That(t, err, test.ShouldBeNil)
 
 	t.Run("motor no encoder GoFor testing", func(t *testing.T) {
-		test.That(t, m.GoFor(ctx, 50, 10, nil), test.ShouldBeError, errors.New("not supported, define max_rpm attribute != 0"))
+		test.That(t, m.GoFor(ctx, 50, 10, nil), test.ShouldBeNil)
 	})
 
 	t.Run("motor no encoder GoTo testing", func(t *testing.T) {
@@ -330,7 +356,7 @@ func TestMotorABNoEncoder(t *testing.T) {
 
 func TestGoForInterruptionAB(t *testing.T) {
 	b := &fakeboard.Board{GPIOPins: map[string]*fakeboard.GPIOPin{}}
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 
 	mc := resource.Config{
 		Name: "abc",
@@ -366,7 +392,7 @@ func TestGoForInterruptionAB(t *testing.T) {
 
 func TestGoForInterruptionDir(t *testing.T) {
 	b := &fakeboard.Board{GPIOPins: map[string]*fakeboard.GPIOPin{}}
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 
 	mc := resource.Config{
 		Name: "abc",
@@ -429,12 +455,34 @@ func TestGoForMath(t *testing.T) {
 	test.That(t, waitDur, test.ShouldEqual, 30*time.Second)
 
 	powerPct, waitDur = goForMath(200, 50, 0)
-	test.That(t, powerPct, test.ShouldEqual, 0.25)
+	test.That(t, powerPct, test.ShouldEqual, 0)
 	test.That(t, waitDur, test.ShouldEqual, 0)
 
 	powerPct, waitDur = goForMath(200, -50, 0)
-	test.That(t, powerPct, test.ShouldEqual, -0.25)
+	test.That(t, powerPct, test.ShouldEqual, 0)
 	test.That(t, waitDur, test.ShouldEqual, 0)
+}
+
+func TestOtherInitializationErrors(t *testing.T) {
+	b := &fakeboard.Board{GPIOPins: map[string]*fakeboard.GPIOPin{}}
+	logger := logging.NewTestLogger(t)
+
+	mc := resource.Config{
+		Name: "abc",
+	}
+	m, err := NewMotor(b, Config{
+		Pins:   PinConfig{EnablePinLow: "2", PWM: "3"},
+		MaxRPM: maxRPM, PWMFreq: 4000,
+	}, mc.ResourceName(), logger)
+	test.That(t, m, test.ShouldBeNil)
+	test.That(t, err, test.ShouldBeError, resource.NewConfigValidationError("", getPinConfigErrorMessage(onlyPWM)))
+
+	m, err = NewMotor(b, Config{
+		Pins:   PinConfig{EnablePinLow: "2"},
+		MaxRPM: maxRPM, PWMFreq: 4000,
+	}, mc.ResourceName(), logger)
+	test.That(t, m, test.ShouldBeNil)
+	test.That(t, err, test.ShouldBeError, resource.NewConfigValidationError("", getPinConfigErrorMessage(noPins)))
 }
 
 func mustGetGPIOPinByName(b board.Board, name string) mustGPIOPin {

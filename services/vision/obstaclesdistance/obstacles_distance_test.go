@@ -15,9 +15,18 @@ import (
 	"go.viam.com/rdk/rimage"
 	"go.viam.com/rdk/services/vision"
 	"go.viam.com/rdk/testutils/inject"
+	"go.viam.com/rdk/utils"
 )
 
 func TestObstacleDist(t *testing.T) {
+	// Setting a global in utils is unsafe, and was originally in an init() which causes races.
+	// This is still not ideal, but as this is the only test function in this package, it should be okay for now.
+	origParallelFactor := utils.ParallelFactor
+	utils.ParallelFactor = 1
+	defer func() {
+		utils.ParallelFactor = origParallelFactor
+	}()
+
 	inp := DistanceDetectorConfig{
 		NumQueries: 10,
 	}
@@ -45,6 +54,13 @@ func TestObstacleDist(t *testing.T) {
 	test.That(t, srv.Name(), test.ShouldResemble, name)
 	img, err := rimage.NewImageFromFile(artifact.MustPath("vision/objectdetection/detection_test.jpg"))
 	test.That(t, err, test.ShouldBeNil)
+
+	// Test properties. Should support object PCDs and not detections or classifications
+	props, err := srv.GetProperties(context.Background(), nil)
+	test.That(t, err, test.ShouldBeNil)
+	test.That(t, props.ObjectPCDsSupported, test.ShouldEqual, true)
+	test.That(t, props.DetectionSupported, test.ShouldEqual, false)
+	test.That(t, props.ClassificationSupported, test.ShouldEqual, false)
 
 	// Does not implement Detections
 	_, err = srv.Detections(ctx, img, nil)
@@ -88,10 +104,10 @@ func TestObstacleDist(t *testing.T) {
 
 	test.That(t, len(objects), test.ShouldEqual, 1)
 
-	_, isPoint = objects[0].PointCloud.At(0, 0, 5.5)
+	_, isPoint = objects[0].PointCloud.At(0, 0, 5)
 	test.That(t, isPoint, test.ShouldBeTrue)
 
-	// error more than one point in cloud
+	// more than one point in cloud
 	count = 0
 	cam.NextPointCloudFunc = func(ctx context.Context) (pc.PointCloud, error) {
 		cloud := pc.New()
@@ -101,12 +117,13 @@ func TestObstacleDist(t *testing.T) {
 		test.That(t, err, test.ShouldBeNil)
 		return cloud, err
 	}
-	_, err = srv.GetObjectPointClouds(ctx, "fakeCamera", nil)
-	test.That(t, err.Error(), test.ShouldContainSubstring, "obstacles_distance expects one point in the point cloud")
+	objects, err = srv.GetObjectPointClouds(ctx, "fakeCamera", nil)
+	test.That(t, err, test.ShouldBeNil)
 
-	inp.NumQueries = 0 // value out of range
-	_, err = inp.Validate("path")
-	test.That(t, err.Error(), test.ShouldContainSubstring, "invalid number of queries")
+	test.That(t, len(objects), test.ShouldEqual, 1)
+
+	_, isPoint = objects[0].PointCloud.At(0, 0, 6)
+	test.That(t, isPoint, test.ShouldBeTrue)
 
 	// with error - nil parameters
 	_, err = registerObstacleDistanceDetector(ctx, name, nil, r)

@@ -5,14 +5,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/edaniels/golog"
 	"go.viam.com/test"
 
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/utils"
 )
 
 func TestSumConfig(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	for _, c := range []struct {
 		conf BlockConfig
 		err  string
@@ -66,7 +66,7 @@ func TestSumConfig(t *testing.T) {
 		if c.err == "" {
 			s := b.(*sum)
 			test.That(t, err, test.ShouldBeNil)
-			test.That(t, len(s.y), test.ShouldEqual, 1)
+			test.That(t, len(s.y), test.ShouldEqual, 4)
 		} else {
 			test.That(t, err, test.ShouldNotBeNil)
 			test.That(t, err.Error(), test.ShouldResemble, c.err)
@@ -76,7 +76,7 @@ func TestSumConfig(t *testing.T) {
 
 func TestSumNext(t *testing.T) {
 	ctx := context.Background()
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	c := BlockConfig{
 		Name: "Sum1",
 		Type: "Sum",
@@ -117,5 +117,6 @@ func TestSumNext(t *testing.T) {
 	}
 	out, ok := s.Next(ctx, signals, time.Millisecond*1)
 	test.That(t, ok, test.ShouldBeTrue)
-	test.That(t, out[0].GetSignalValueAt(0), test.ShouldEqual, -1.0)
+	test.That(t, out[0].GetSignalValueAt(0), test.ShouldEqual, 0.0)
+	test.That(t, out[1].GetSignalValueAt(0), test.ShouldEqual, -1.0)
 }

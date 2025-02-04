@@ -51,7 +51,7 @@ func newRemoteName(remoteName string, api API, name string) Name {
 // NewFromString creates a new Name based on a fully qualified resource name string passed in.
 func NewFromString(resourceName string) (Name, error) {
 	if !resRegexValidator.MatchString(resourceName) {
-		return Name{}, errors.Errorf("string %q is not a valid resource name", resourceName)
+		return Name{}, errors.Errorf("string %q is not a fully qualified resource name", resourceName)
 	}
 	matches := resRegexValidator.FindStringSubmatch(resourceName)
 	rAPIParts := strings.Split(matches[1], ":")
@@ -139,4 +139,24 @@ func (n Name) String() string {
 		name = fmt.Sprintf("%s/%s", name, n.Name)
 	}
 	return name
+}
+
+// SDPTrackName returns a valid SDP video/audio track name as defined in RFC 4566 (https://www.rfc-editor.org/rfc/rfc4566)
+// where track names should not include colons.
+func (n Name) SDPTrackName() string {
+	return strings.ReplaceAll(n.ShortName(), ":", "+")
+}
+
+// SDPTrackNameToShortName takes the output of SDPTrackName() and returns the resource ShortName.
+func SDPTrackNameToShortName(name string) string {
+	return strings.ReplaceAll(name, "+", ":")
+}
+
+// NamesToStrings is a utility that takes a list of resource names and returns a list of fully qualified names.
+func NamesToStrings(lst []Name) []string {
+	rNames := make([]string, 0, len(lst))
+	for _, rName := range lst {
+		rNames = append(rNames, rName.String())
+	}
+	return rNames
 }

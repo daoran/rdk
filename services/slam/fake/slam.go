@@ -6,9 +6,9 @@ import (
 	"context"
 	"time"
 
-	"github.com/edaniels/golog"
 	"go.opencensus.io/trace"
 
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/pointcloud"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/resource"
@@ -29,7 +29,7 @@ func init() {
 				ctx context.Context,
 				_ resource.Dependencies,
 				conf resource.Config,
-				logger golog.Logger,
+				logger logging.Logger,
 			) (slam.Service, error) {
 				return NewSLAM(conf.ResourceName(), logger), nil
 			},
@@ -43,12 +43,12 @@ type SLAM struct {
 	resource.TriviallyReconfigurable
 	resource.TriviallyCloseable
 	dataCount    int
-	logger       golog.Logger
+	logger       logging.Logger
 	mapTimestamp time.Time
 }
 
 // NewSLAM is a constructor for a fake slam service.
-func NewSLAM(name resource.Name, logger golog.Logger) *SLAM {
+func NewSLAM(name resource.Name, logger logging.Logger) *SLAM {
 	return &SLAM{
 		Named:        name.AsNamed(),
 		logger:       logger,
@@ -65,7 +65,7 @@ func (slamSvc *SLAM) getCount() int {
 }
 
 // Position returns a Pose and a component reference string of the robot's current location according to SLAM.
-func (slamSvc *SLAM) Position(ctx context.Context) (spatialmath.Pose, string, error) {
+func (slamSvc *SLAM) Position(ctx context.Context) (spatialmath.Pose, error) {
 	ctx, span := trace.StartSpan(ctx, "slam::fake::Position")
 	defer span.End()
 	return fakePosition(ctx, datasetDirectory, slamSvc)
@@ -73,7 +73,7 @@ func (slamSvc *SLAM) Position(ctx context.Context) (spatialmath.Pose, string, er
 
 // PointCloudMap returns a callback function which will return the next chunk of the current pointcloud
 // map.
-func (slamSvc *SLAM) PointCloudMap(ctx context.Context) (func() ([]byte, error), error) {
+func (slamSvc *SLAM) PointCloudMap(ctx context.Context, returnEditedMap bool) (func() ([]byte, error), error) {
 	ctx, span := trace.StartSpan(ctx, "slam::fake::PointCloudMap")
 	defer span.End()
 	slamSvc.incrementDataCount()
@@ -88,13 +88,25 @@ func (slamSvc *SLAM) InternalState(ctx context.Context) (func() ([]byte, error),
 	return fakeInternalState(ctx, datasetDirectory, slamSvc)
 }
 
-// LatestMapInfo returns information used to determine whether the slam mode is localizing.
-// Fake Slam is always in mapping mode, so it always returns a new timestamp.
-func (slamSvc *SLAM) LatestMapInfo(ctx context.Context) (time.Time, error) {
-	_, span := trace.StartSpan(ctx, "slam::fake::LatestMapInfo")
+// Properties returns the mapping mode of the slam service as well as a boolean indicating if it is running
+// in the cloud or locally. In the case of fake slam, it will return that the service is being run locally
+// and is creating a new map.
+func (slamSvc *SLAM) Properties(ctx context.Context) (slam.Properties, error) {
+	_, span := trace.StartSpan(ctx, "slam::fake::Properties")
 	defer span.End()
-	slamSvc.mapTimestamp = time.Now().UTC()
-	return slamSvc.mapTimestamp, nil
+
+	// MappingModeLocalizationOnly may cause the frontend to not refresh, but it allows motion to work with
+	// fakeslam. Can make changes in motion to only restrict for cartographer if this becomes a problem.
+	prop := slam.Properties{
+		CloudSlam:             false,
+		MappingMode:           slam.MappingModeLocalizationOnly,
+		InternalStateFileType: ".pbstream",
+		SensorInfo: []slam.SensorInfo{
+			{Name: "my-camera", Type: slam.SensorTypeCamera},
+			{Name: "my-movement-sensor", Type: slam.SensorTypeMovementSensor},
+		},
+	}
+	return prop, nil
 }
 
 // incrementDataCount is not thread safe but that is ok as we only intend a single user to be interacting
@@ -104,8 +116,8 @@ func (slamSvc *SLAM) incrementDataCount() {
 }
 
 // Limits returns the bounds of the slam map as a list of referenceframe.Limits.
-func (slamSvc *SLAM) Limits(ctx context.Context) ([]referenceframe.Limit, error) {
-	data, err := slam.PointCloudMapFull(ctx, slamSvc)
+func (slamSvc *SLAM) Limits(ctx context.Context, useEditedMap bool) ([]referenceframe.Limit, error) {
+	data, err := slam.PointCloudMapFull(ctx, slamSvc, useEditedMap)
 	if err != nil {
 		return nil, err
 	}

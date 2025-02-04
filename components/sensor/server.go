@@ -3,6 +3,7 @@ package sensor
 
 import (
 	"context"
+	"fmt"
 
 	commonpb "go.viam.com/api/common/v1"
 	pb "go.viam.com/api/component/sensor/v1"
@@ -10,6 +11,11 @@ import (
 	"go.viam.com/rdk/protoutils"
 	"go.viam.com/rdk/resource"
 )
+
+// ErrReadingsNil is the returned error if sensor readings are nil.
+var ErrReadingsNil = func(sensorType, sensorName string) error {
+	return fmt.Errorf("%v component %v Readings should not return nil readings", sensorType, sensorName)
+}
 
 // serviceServer implements the SensorService from sensor.proto.
 type serviceServer struct {
@@ -25,8 +31,8 @@ func NewRPCServiceServer(coll resource.APIResourceCollection[Sensor]) interface{
 // GetReadings returns the most recent readings from the given Sensor.
 func (s *serviceServer) GetReadings(
 	ctx context.Context,
-	req *pb.GetReadingsRequest,
-) (*pb.GetReadingsResponse, error) {
+	req *commonpb.GetReadingsRequest,
+) (*commonpb.GetReadingsResponse, error) {
 	sensorDevice, err := s.coll.Resource(req.Name)
 	if err != nil {
 		return nil, err
@@ -35,11 +41,14 @@ func (s *serviceServer) GetReadings(
 	if err != nil {
 		return nil, err
 	}
+	if readings == nil {
+		return nil, ErrReadingsNil("sensor", req.Name)
+	}
 	m, err := protoutils.ReadingGoToProto(readings)
 	if err != nil {
 		return nil, err
 	}
-	return &pb.GetReadingsResponse{Readings: m}, nil
+	return &commonpb.GetReadingsResponse{Readings: m}, nil
 }
 
 // DoCommand receives arbitrary commands.

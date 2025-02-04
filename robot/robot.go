@@ -4,16 +4,18 @@ package robot
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"strings"
 
-	"github.com/edaniels/golog"
 	"github.com/jhump/protoreflect/desc"
 	"github.com/jhump/protoreflect/dynamic"
 	"github.com/pkg/errors"
 	"go.viam.com/utils/pexec"
 
+	"go.viam.com/rdk/cloud"
 	"go.viam.com/rdk/config"
 	"go.viam.com/rdk/grpc"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/operation"
 	"go.viam.com/rdk/pointcloud"
 	"go.viam.com/rdk/referenceframe"
@@ -24,11 +26,71 @@ import (
 	"go.viam.com/rdk/session"
 )
 
+const (
+	platform = "rdk"
+)
+
 // A Robot encompasses all functionality of some robot comprised
 // of parts, local and remote.
+//
+// DiscoverComponents example:
+//
+//	// Define a new discovery query.
+//	q := resource.NewDiscoveryQuery(camera.API, resource.Model{Name: "webcam", Family: resource.DefaultModelFamily})
+//
+//	// Define a list of discovery queries and get potential component configurations with these queries.
+//	out, err := machine.DiscoverComponents(context.Background(), []resource.DiscoveryQuery{q})
+//
+// ResourceNames example:
+//
+//	resource_names := machine.ResourceNames()
+//
+// FrameSystemConfig example:
+//
+//	// Print the frame system configuration
+//	frameSystem, err := machine.FrameSystemConfig(context.Background())
+//	fmt.Println(frameSystem)
+//
+// TransformPose example:
+//
+//	import (
+//	  "go.viam.com/rdk/referenceframe"
+//	  "go.viam.com/rdk/spatialmath"
+//	)
+//
+//	baseOrigin := referenceframe.NewPoseInFrame("test-base", spatialmath.NewZeroPose())
+//	movementSensorToBase, err := machine.TransformPose(context.Background(), baseOrigin, "my-movement-sensor", nil)
+//
+// CloudMetadata example:
+//
+//	metadata, err := machine.CloudMetadata(context.Background())
+//	primary_org_id := metadata.PrimaryOrgID
+//	location_id := metadata.LocationID
+//	machine_id := metadata.MachineID
+//	machine_part_id := metadata.MachinePartID
+//
+// Close example:
+//
+//	// Cleanly close the underlying connections and stop any periodic tasks,
+//	err := machine.Close(context.Background())
+//
+// StopAll example:
+//
+//	// Cancel all current and outstanding operations for the machine and stop all actuators and movement.
+//	err := machine.StopAll(context.Background(), nil)
+//
+// Shutdown example:
+//
+//	// Shut down the robot.
+//	err := machine.Shutdown(context.Background())
 type Robot interface {
-	// DiscoverComponents returns discovered component configurations.
+	// DiscoverComponents returns discovered potential component configurations.
+	// Only implemented for webcam cameras in builtin components.
 	DiscoverComponents(ctx context.Context, qs []resource.DiscoveryQuery) ([]resource.Discovery, error)
+
+	// GetModelsFromModules returns a list of models supported by the configured modules,
+	// and specifies whether the models are from a local or registry module.
+	GetModelsFromModules(ctx context.Context) ([]resource.ModuleModelDiscovery, error)
 
 	// RemoteByName returns a remote robot by name.
 	RemoteByName(name string) (Robot, bool)
@@ -58,7 +120,7 @@ type Robot interface {
 	PackageManager() packages.Manager
 
 	// Logger returns the logger the robot is using.
-	Logger() golog.Logger
+	Logger() logging.Logger
 
 	// FrameSystemConfig returns the individual parts that make up a robot's frame system
 	FrameSystemConfig(ctx context.Context) (*framesystem.Config, error)
@@ -76,14 +138,26 @@ type Robot interface {
 	// of the transformed pointcloud because that will make the transformations inaccurate.
 	TransformPointCloud(ctx context.Context, srcpc pointcloud.PointCloud, srcName, dstName string) (pointcloud.PointCloud, error)
 
-	// Status takes a list of resource names and returns their corresponding statuses. If no names are passed in, return all statuses.
-	Status(ctx context.Context, resourceNames []resource.Name) ([]Status, error)
+	// CloudMetadata returns app-related information about the robot.
+	CloudMetadata(ctx context.Context) (cloud.Metadata, error)
 
 	// Close attempts to cleanly close down all constituent parts of the robot.
 	Close(ctx context.Context) error
 
 	// StopAll cancels all current and outstanding operations for the robot and stops all actuators and movement
 	StopAll(ctx context.Context, extra map[resource.Name]map[string]interface{}) error
+
+	// RestartModule reloads a module as if its config changed
+	RestartModule(ctx context.Context, req RestartModuleRequest) error
+
+	// Shutdown shuts down the robot.
+	Shutdown(ctx context.Context) error
+
+	// MachineStatus returns the current status of the robot.
+	MachineStatus(ctx context.Context) (MachineStatus, error)
+
+	// Version returns version information about the robot.
+	Version(ctx context.Context) (VersionResponse, error)
 }
 
 // A LocalRobot is a Robot that can have its parts modified.
@@ -101,13 +175,26 @@ type LocalRobot interface {
 	StartWeb(ctx context.Context, o weboptions.Options) error
 
 	// StopWeb stops the web server, will be a noop if server is not up.
-	StopWeb(ctx context.Context) error
+	StopWeb()
 
 	// WebAddress returns the address of the web service.
 	WebAddress() (string, error)
 
 	// ModuleAddress returns the address (path) of the unix socket modules use to contact the parent.
 	ModuleAddress() (string, error)
+
+	// ExportResourcesAsDot exports the resource graph as a DOT representation for
+	// visualization.
+	// DOT reference: https://graphviz.org/doc/info/lang.html
+	ExportResourcesAsDot(index int) (resource.GetSnapshotInfo, error)
+
+	// RestartAllowed returns whether the robot can safely be restarted.
+	RestartAllowed() bool
+
+	// Kill will attempt to kill any processes on the system started by the robot as quickly as possible.
+	// This operation is not clean and will not wait for completion.
+	// Only use this if comfortable with leaking resources (in cases where exiting the program as quickly as possible is desired).
+	Kill()
 }
 
 // A RemoteRobot is a Robot that was created through a connection.
@@ -118,12 +205,10 @@ type RemoteRobot interface {
 	Connected() bool
 }
 
-// Status holds a resource name and its corresponding status. Status is expected to be comprised of string keys
-// and values comprised of primitives, list of primitives, maps with string keys (or at least can be decomposed into one),
-// or lists of the forementioned type of maps. Results with other types of data are not guaranteed.
-type Status struct {
-	Name   resource.Name
-	Status interface{}
+// RestartModuleRequest is a go mirror of a proto message.
+type RestartModuleRequest struct {
+	ModuleID   string
+	ModuleName string
 }
 
 // AllResourcesByName returns an array of all resources that have this short name.
@@ -163,8 +248,8 @@ func TypeAndMethodDescFromMethod(r Robot, method string) (*resource.RPCAPI, *des
 	if len(methodParts) != 3 {
 		return nil, nil, grpc.UnimplementedError
 	}
-	protoSvc := methodParts[1]
-	protoMethod := methodParts[2]
+	protoSvc := methodParts[1]    // e.g. viam.component.arm.v1.ArmService
+	protoMethod := methodParts[2] // e.g. DoCommand
 
 	var foundType *resource.RPCAPI
 	for _, resAPI := range r.ResourceRPCAPIs() {
@@ -224,4 +309,76 @@ func ResourceFromRobot[T resource.Resource](robot Robot, name resource.Name) (T,
 		return zero, resource.TypeError[T](res)
 	}
 	return part, nil
+}
+
+// MatchesModule returns true if the passed-in module matches its name / ID.
+func (rmr *RestartModuleRequest) MatchesModule(mod config.Module) bool {
+	if len(rmr.ModuleID) > 0 {
+		return mod.ModuleID == rmr.ModuleID
+	}
+	return mod.Name == rmr.ModuleName
+}
+
+// MachineState captures the state of a machine.
+type MachineState uint8
+
+const (
+	// StateUnknown represents an unknown state.
+	StateUnknown MachineState = iota
+	// StateInitializing denotes a currently initializing machine. The first
+	// reconfigure after initial creation has not completed.
+	StateInitializing
+	// StateRunning denotes a running machine. The first reconfigure after
+	// initial creation has completed.
+	StateRunning
+)
+
+// MachineStatus encapsulates the current status of the robot.
+type MachineStatus struct {
+	Resources []resource.Status
+	Config    config.Revision
+	State     MachineState
+}
+
+// VersionResponse encapsulates the version info of the robot.
+type VersionResponse struct {
+	Platform   string
+	Version    string
+	APIVersion string
+}
+
+// Version returns platform, version and API version of the robot.
+// platform will always be `rdk`
+// If built without a version tag,  will be dev-<git hash>.
+func Version() (VersionResponse, error) {
+	var result VersionResponse
+	result.Platform = platform
+
+	version := config.Version
+	if version == "" {
+		version = "dev-"
+		if config.GitRevision != "" {
+			version += config.GitRevision
+		} else {
+			version += "unknown"
+		}
+	}
+	result.Version = version
+
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return result, errors.New("error reading build info")
+	}
+	deps := make(map[string]*debug.Module, len(info.Deps))
+	for _, dep := range info.Deps {
+		deps[dep.Path] = dep
+	}
+
+	apiVersion := "?"
+	if dep, ok := deps["go.viam.com/api"]; ok {
+		apiVersion = dep.Version
+	}
+	result.APIVersion = apiVersion
+
+	return result, nil
 }

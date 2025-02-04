@@ -1,7 +1,9 @@
+//go:build !no_cgo
+
 package motionplan
 
 import (
-	"context"
+	"errors"
 	"fmt"
 	"math"
 
@@ -11,40 +13,10 @@ import (
 	"go.viam.com/rdk/utils"
 )
 
-// Plan describes a motion plan.
-type Plan []map[string][]referenceframe.Input
-
-// GetFrameSteps is a helper function which will extract the waypoints of a single frame from the map output of a robot path.
-func (plan Plan) GetFrameSteps(frameName string) ([][]referenceframe.Input, error) {
-	solution := make([][]referenceframe.Input, 0, len(plan))
-	for _, step := range plan {
-		frameStep, ok := step[frameName]
-		if !ok {
-			return nil, fmt.Errorf("frame named %s not found in solved motion plan", frameName)
-		}
-		solution = append(solution, frameStep)
-	}
-	return solution, nil
-}
-
-// String returns a human-readable version of the Plan, suitable for debugging.
-func (plan Plan) String() string {
-	var str string
-	for _, step := range plan {
-		str += "\n"
-		for component, input := range step {
-			if len(input) > 0 {
-				str += fmt.Sprintf("%s: %v\t", component, input)
-			}
-		}
-	}
-	return str
-}
-
-// PathStepCount will determine the number of steps which should be used to get from the seed to the goal.
+// CalculateStepCount will determine the number of steps which should be used to get from the seed to the goal.
 // The returned value is guaranteed to be at least 1.
 // stepSize represents both the max mm movement per step, and max R4AA degrees per step.
-func PathStepCount(seedPos, goalPos spatialmath.Pose, stepSize float64) int {
+func CalculateStepCount(seedPos, goalPos spatialmath.Pose, stepSize float64) int {
 	// use a default size of 1 if zero is passed in to avoid divide-by-zero
 	if stepSize == 0 {
 		stepSize = 1.
@@ -57,106 +29,290 @@ func PathStepCount(seedPos, goalPos spatialmath.Pose, stepSize float64) int {
 	return int(nSteps) + 1
 }
 
-// EvaluatePlan assigns a numeric score to a plan that corresponds to the cumulative distance between input waypoints in the plan.
-func EvaluatePlan(plan [][]referenceframe.Input, distFunc ik.SegmentMetric) (totalCost float64) {
-	if len(plan) < 2 {
-		return math.Inf(1)
-	}
-	for i := 0; i < len(plan)-1; i++ {
-		cost := distFunc(&ik.Segment{StartConfiguration: plan[i], EndConfiguration: plan[i+1]})
-		totalCost += cost
-	}
-	return totalCost
-}
-
-// fixOvIncrement will detect whether the given goal position is a precise orientation increment of the current
-// position, in which case it will detect whether we are leaving a pole. If we are an OV increment and leaving a pole,
-// then Theta will be adjusted to give an expected smooth movement. The adjusted goal will be returned. Otherwise the
-// original goal is returned.
-// Rationale: if clicking the increment buttons in the interface, the user likely wants the most intuitive motion
-// posible. If setting values manually, the user likely wants exactly what they requested.
-func fixOvIncrement(goal, seed spatialmath.Pose) spatialmath.Pose {
-	epsilon := 0.01
-	goalPt := goal.Point()
-	goalOrientation := goal.Orientation().OrientationVectorDegrees()
-	seedPt := seed.Point()
-	seedOrientation := seed.Orientation().OrientationVectorDegrees()
-
-	// Nothing to do for spatial translations or theta increments
-	r := utils.Float64AlmostEqual(goalOrientation.OZ, seedOrientation.OZ, epsilon)
-	_ = r
-	if !spatialmath.R3VectorAlmostEqual(goalPt, seedPt, epsilon) ||
-		!utils.Float64AlmostEqual(goalOrientation.Theta, seedOrientation.Theta, epsilon) {
-		return goal
-	}
-	// Check if seed is pointing directly at pole
-	if 1-math.Abs(seedOrientation.OZ) > epsilon || !utils.Float64AlmostEqual(goalOrientation.OZ, seedOrientation.OZ, epsilon) {
-		return goal
-	}
-
-	// we only care about negative xInc
-	xInc := goalOrientation.OX - seedOrientation.OX
-	yInc := math.Abs(goalOrientation.OY - seedOrientation.OY)
-	var adj float64
-	if utils.Float64AlmostEqual(goalOrientation.OX, seedOrientation.OX, epsilon) {
-		// no OX movement
-		if !utils.Float64AlmostEqual(yInc, 0.1, epsilon) && !utils.Float64AlmostEqual(yInc, 0.01, epsilon) {
-			// nonstandard increment
-			return goal
-		}
-		// If wanting to point towards +Y and OZ<0, add 90 to theta, otherwise subtract 90
-		if goalOrientation.OY-seedOrientation.OY > 0 {
-			adj = 90
-		} else {
-			adj = -90
-		}
-	} else {
-		if (!utils.Float64AlmostEqual(xInc, -0.1, epsilon) && !utils.Float64AlmostEqual(xInc, -0.01, epsilon)) ||
-			!utils.Float64AlmostEqual(goalOrientation.OY, seedOrientation.OY, epsilon) {
-			return goal
-		}
-		// If wanting to point towards -X, increment by 180. Values over 180 or under -180 will be automatically wrapped
-		adj = 180
-	}
-	if goalOrientation.OZ > 0 {
-		adj *= -1
-	}
-	goalOrientation.Theta += adj
-
-	return spatialmath.NewPose(goalPt, goalOrientation)
-}
-
-func stepsToNodes(steps [][]referenceframe.Input) []node {
-	nodes := make([]node, 0, len(steps))
-	for _, step := range steps {
-		nodes = append(nodes, &basicNode{q: step})
-	}
-	return nodes
-}
-
 type resultPromise struct {
-	steps  [][]referenceframe.Input
-	future chan *rrtPlanReturn
+	steps  []node
+	future chan *rrtSolution
 }
 
-func (r *resultPromise) result(ctx context.Context) ([][]referenceframe.Input, error) {
-	if r.steps != nil && len(r.steps) > 0 {
+func (r *resultPromise) result() ([]node, error) {
+	if r.steps != nil && len(r.steps) > 0 { //nolint:gosimple
 		return r.steps, nil
 	}
 	// wait for a context cancel or a valid channel result
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
+	planReturn := <-r.future
+	if planReturn.err != nil {
+		return nil, planReturn.err
+	}
+	return planReturn.steps, nil
+}
+
+// linearizedFrameSystem wraps a framesystem, allowing conversion in a known order between a FrameConfiguratinos and a flat array of floats,
+// useful for being able to call IK solvers against framesystems.
+type linearizedFrameSystem struct {
+	fs     referenceframe.FrameSystem
+	frames []referenceframe.Frame // cached ordering of frames. Order is unimportant but cannot change once set.
+	dof    []referenceframe.Limit
+}
+
+func newLinearizedFrameSystem(fs referenceframe.FrameSystem) (*linearizedFrameSystem, error) {
+	frames := []referenceframe.Frame{}
+	dof := []referenceframe.Limit{}
+	for _, fName := range fs.FrameNames() {
+		frame := fs.Frame(fName)
+		if frame == nil {
+			return nil, fmt.Errorf("frame %s was returned in list of frame names, but was not found in frame system", fName)
 		}
-		select {
-		case planReturn := <-r.future:
-			if planReturn.err() != nil {
-				return nil, planReturn.err()
-			}
-			return nodesToInputs(planReturn.steps), nil
-		default:
+		frames = append(frames, frame)
+		dof = append(dof, frame.DoF()...)
+	}
+	return &linearizedFrameSystem{
+		fs:     fs,
+		frames: frames,
+		dof:    dof,
+	}, nil
+}
+
+// mapToSlice will flatten a map of inputs into a slice suitable for input to inverse kinematics, by concatenating
+// the inputs together in the order of the frames in sf.frames.
+func (lfs *linearizedFrameSystem) mapToSlice(inputs referenceframe.FrameSystemInputs) ([]float64, error) {
+	var floatSlice []float64
+	for _, frame := range lfs.frames {
+		if len(frame.DoF()) == 0 {
+			continue
+		}
+		input, ok := inputs[frame.Name()]
+		if !ok {
+			return nil, fmt.Errorf("frame %s missing from input map", frame.Name())
+		}
+		for _, i := range input {
+			floatSlice = append(floatSlice, i.Value)
 		}
 	}
+	return floatSlice, nil
+}
+
+func (lfs *linearizedFrameSystem) sliceToMap(floatSlice []float64) (referenceframe.FrameSystemInputs, error) {
+	inputs := referenceframe.FrameSystemInputs{}
+	i := 0
+	for _, frame := range lfs.frames {
+		if len(frame.DoF()) == 0 {
+			continue
+		}
+		frameInputs := make([]referenceframe.Input, len(frame.DoF()))
+		for j := range frame.DoF() {
+			if i >= len(floatSlice) {
+				return nil, fmt.Errorf("not enough values in float slice for frame %s", frame.Name())
+			}
+			frameInputs[j] = referenceframe.Input{Value: floatSlice[i]}
+			i++
+		}
+		inputs[frame.Name()] = frameInputs
+	}
+	return inputs, nil
+}
+
+// motionChain structs are meant to be ephemerally created for each individual goal in a motion request, and calculates the shortest
+// path between components in the framesystem allowing knowledge of which frames may move.
+type motionChain struct {
+	// List of names of all frames that could move, used for collision detection
+	// As an example a gripper attached to an arm which is moving relative to World, would not be in frames below but in this object
+	movingFS       referenceframe.FrameSystem
+	frames         []referenceframe.Frame // all frames directly between and including solveFrame and goalFrame. Order not important.
+	solveFrameName string
+	goalFrameName  string
+	// If this is true, then goals are translated to their position in `World` before solving.
+	// This is useful when e.g. moving a gripper relative to a point seen by a camera built into that gripper
+	// TODO(pl): explore allowing this to be frames other than world
+	worldRooted bool
+}
+
+func motionChainFromGoal(fs referenceframe.FrameSystem, moveFrame, goalFrameName string) (*motionChain, error) {
+	// get goal frame
+	goalFrame := fs.Frame(goalFrameName)
+	if goalFrame == nil {
+		return nil, referenceframe.NewFrameMissingError(goalFrameName)
+	}
+	goalFrameList, err := fs.TracebackFrame(goalFrame)
+	if err != nil {
+		return nil, err
+	}
+
+	// get solve frame
+	solveFrame := fs.Frame(moveFrame)
+	if solveFrame == nil {
+		return nil, referenceframe.NewFrameMissingError(moveFrame)
+	}
+	solveFrameList, err := fs.TracebackFrame(solveFrame)
+	if err != nil {
+		return nil, err
+	}
+	if len(solveFrameList) == 0 {
+		return nil, errors.New("solveFrameList was empty")
+	}
+
+	movingFS := func(frameList []referenceframe.Frame) (referenceframe.FrameSystem, error) {
+		// Find first moving frame
+		var moveF referenceframe.Frame
+		for i := len(frameList) - 1; i >= 0; i-- {
+			if len(frameList[i].DoF()) != 0 {
+				moveF = frameList[i]
+				break
+			}
+		}
+		if moveF == nil {
+			return referenceframe.NewEmptyFrameSystem(""), nil
+		}
+		return fs.FrameSystemSubset(moveF)
+	}
+
+	// find pivot frame between goal and solve frames
+	var moving referenceframe.FrameSystem
+	var frames []referenceframe.Frame
+	worldRooted := false
+	pivotFrame, err := findPivotFrame(solveFrameList, goalFrameList)
+	if err != nil {
+		return nil, err
+	}
+	if pivotFrame.Name() == referenceframe.World {
+		frames = uniqInPlaceSlice(append(solveFrameList, goalFrameList...))
+		moving, err = movingFS(solveFrameList)
+		if err != nil {
+			return nil, err
+		}
+		movingSubset2, err := movingFS(goalFrameList)
+		if err != nil {
+			return nil, err
+		}
+		if err = moving.MergeFrameSystem(movingSubset2, moving.World()); err != nil {
+			return nil, err
+		}
+	} else {
+		dof := 0
+		var solveMovingList []referenceframe.Frame
+		var goalMovingList []referenceframe.Frame
+
+		// Get minimal set of frames from solve frame to goal frame
+		for _, frame := range solveFrameList {
+			if frame == pivotFrame {
+				break
+			}
+			dof += len(frame.DoF())
+			frames = append(frames, frame)
+			solveMovingList = append(solveMovingList, frame)
+		}
+		for _, frame := range goalFrameList {
+			if frame == pivotFrame {
+				break
+			}
+			dof += len(frame.DoF())
+			frames = append(frames, frame)
+			goalMovingList = append(goalMovingList, frame)
+		}
+
+		// If shortest path has 0 dof (e.g. a camera attached to a gripper), translate goal to world frame
+		if dof == 0 {
+			worldRooted = true
+			frames = solveFrameList
+			moving, err = movingFS(solveFrameList)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			// Get all child nodes of pivot node
+			moving, err = movingFS(solveMovingList)
+			if err != nil {
+				return nil, err
+			}
+			movingSubset2, err := movingFS(goalMovingList)
+			if err != nil {
+				return nil, err
+			}
+			if err = moving.MergeFrameSystem(movingSubset2, moving.World()); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return &motionChain{
+		movingFS:       moving,
+		frames:         frames,
+		solveFrameName: solveFrame.Name(),
+		goalFrameName:  goalFrame.Name(),
+		worldRooted:    worldRooted,
+	}, nil
+}
+
+// findPivotFrame finds the first common frame in two ordered lists of frames.
+func findPivotFrame(frameList1, frameList2 []referenceframe.Frame) (referenceframe.Frame, error) {
+	// find shorter list
+	shortList := frameList1
+	longList := frameList2
+	if len(frameList1) > len(frameList2) {
+		shortList = frameList2
+		longList = frameList1
+	}
+
+	// cache names seen in shorter list
+	nameSet := make(map[string]struct{}, len(shortList))
+	for _, frame := range shortList {
+		nameSet[frame.Name()] = struct{}{}
+	}
+
+	// look for already seen names in longer list
+	for _, frame := range longList {
+		if _, ok := nameSet[frame.Name()]; ok {
+			return frame, nil
+		}
+	}
+	return nil, errors.New("no path from solve frame to goal frame")
+}
+
+// uniqInPlaceSlice will deduplicate the values in a slice using in-place replacement on the slice. This is faster than
+// a solution using append().
+// This function does not remove anything from the input slice, but it does rearrange the elements.
+func uniqInPlaceSlice(s []referenceframe.Frame) []referenceframe.Frame {
+	seen := make(map[referenceframe.Frame]struct{}, len(s))
+	j := 0
+	for _, v := range s {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		s[j] = v
+		j++
+	}
+	return s[:j]
+}
+
+func nodeConfigurationDistanceFunc(node1, node2 node) float64 {
+	return ik.FSConfigurationL2Distance(&ik.SegmentFS{StartConfiguration: node1.Q(), EndConfiguration: node2.Q()})
+}
+
+// If a motion chain is worldrooted, then goals are translated to their position in `World` before solving.
+// This is useful when e.g. moving a gripper relative to a point seen by a camera built into that gripper.
+func alterGoals(
+	chains []*motionChain,
+	fs referenceframe.FrameSystem,
+	start referenceframe.FrameSystemInputs,
+	goal *PlanState,
+) (*PlanState, error) {
+	alteredGoals := referenceframe.FrameSystemPoses{}
+	if goal.poses != nil {
+		for _, chain := range chains {
+			// chain solve frame may only be in the goal configuration, in which case we skip as the configuration will be passed through
+			if goalPif, ok := goal.poses[chain.solveFrameName]; ok {
+				if chain.worldRooted {
+					tf, err := fs.Transform(start, goalPif, referenceframe.World)
+					if err != nil {
+						return nil, err
+					}
+					alteredGoals[chain.solveFrameName] = tf.(*referenceframe.PoseInFrame)
+				} else {
+					alteredGoals[chain.solveFrameName] = goalPif
+				}
+			}
+		}
+		return &PlanState{poses: alteredGoals, configuration: goal.configuration}, nil
+	}
+	return goal, nil
 }

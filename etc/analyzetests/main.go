@@ -7,22 +7,23 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/edaniels/golog"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/mongo/readpref"
 	"go.uber.org/multierr"
 	"go.viam.com/utils"
 	"gotest.tools/gotestsum/testjson"
+
+	"go.viam.com/rdk/logging"
 )
 
-var logger = golog.NewDebugLogger("analyzetests")
+var logger = logging.NewDebugLogger("analyzetests")
 
 func main() {
 	utils.ContextualMain(mainWithArgs, logger)
 }
 
-func mainWithArgs(ctx context.Context, args []string, logger golog.Logger) error {
+func mainWithArgs(ctx context.Context, args []string, logger logging.Logger) error {
 	exec, err := testjson.ScanTestOutput(testjson.ScanConfig{
 		Stdout: os.Stdin,
 	})
@@ -36,13 +37,10 @@ func mainWithArgs(ctx context.Context, args []string, logger golog.Logger) error
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	client, err := mongo.NewClient(options.Client().ApplyURI(mongoURI))
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(mongoURI))
 	if err != nil {
-		return err
-	}
-	if err := client.Connect(ctx); err != nil {
 		return err
 	}
 	if err := client.Ping(ctx, readpref.Primary()); err != nil {

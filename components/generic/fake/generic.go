@@ -1,12 +1,11 @@
-// Package fake implements a fake Generic component.
+// Package fake implements a fake generic component.
 package fake
 
 import (
 	"context"
 
-	"github.com/edaniels/golog"
-
 	"go.viam.com/rdk/components/generic"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 )
 
@@ -18,13 +17,13 @@ func init() {
 			ctx context.Context,
 			deps resource.Dependencies,
 			conf resource.Config,
-			logger golog.Logger,
+			logger logging.Logger,
 		) (resource.Resource, error) {
 			return newGeneric(conf.ResourceName(), logger), nil
 		}})
 }
 
-func newGeneric(name resource.Name, logger golog.Logger) resource.Resource {
+func newGeneric(name resource.Name, logger logging.Logger) resource.Resource {
 	return &Generic{Named: name.AsNamed(), logger: logger}
 }
 
@@ -33,5 +32,10 @@ type Generic struct {
 	resource.Named
 	resource.TriviallyReconfigurable
 	resource.TriviallyCloseable
-	logger golog.Logger
+	logger logging.Logger
+}
+
+// DoCommand echos input back to the caller.
+func (fg *Generic) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
+	return cmd, nil
 }

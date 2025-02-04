@@ -2,12 +2,15 @@ package control
 
 import (
 	"context"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/pkg/errors"
 	"go.viam.com/utils"
+
+	"go.viam.com/rdk/logging"
 )
 
 // controlBlockInternal Holds internal variables to control the flow of data between blocks.
@@ -30,21 +33,22 @@ type Loop struct {
 	cfg                     Config
 	blocks                  map[string]*controlBlockInternal
 	ct                      controlTicker
-	logger                  golog.Logger
+	logger                  logging.Logger
 	ts                      []chan time.Time
 	dt                      time.Duration
 	activeBackgroundWorkers sync.WaitGroup
 	cancelCtx               context.Context
 	cancel                  context.CancelFunc
-	running                 bool
+	running                 atomic.Bool
+	pidBlocks               []*basicPID
 }
 
 // NewLoop construct a new control loop for a specific endpoint.
-func NewLoop(logger golog.Logger, cfg Config, m Controllable) (*Loop, error) {
+func NewLoop(logger logging.Logger, cfg Config, m Controllable) (*Loop, error) {
 	return createLoop(logger, cfg, m)
 }
 
-func createLoop(logger golog.Logger, cfg Config, m Controllable) (*Loop, error) {
+func createLoop(logger logging.Logger, cfg Config, m Controllable) (*Loop, error) {
 	cancelCtx, cancel := context.WithCancel(context.Background())
 	l := Loop{
 		logger:    logger,
@@ -52,14 +56,14 @@ func createLoop(logger golog.Logger, cfg Config, m Controllable) (*Loop, error) 
 		blocks:    make(map[string]*controlBlockInternal),
 		cancelCtx: cancelCtx,
 		cancel:    cancel,
-		running:   false,
 	}
+	l.running.Store(false)
 	if l.cfg.Frequency == 0.0 || l.cfg.Frequency > 200 {
 		return nil, errors.New("loop frequency shouldn't be 0 or above 200Hz")
 	}
 	l.dt = time.Duration(float64(time.Second) * (1.0 / (l.cfg.Frequency)))
 	for _, bcfg := range cfg.Blocks {
-		blk, err := createBlock(bcfg, logger)
+		blk, err := l.createBlock(bcfg, logger)
 		if err != nil {
 			return nil, err
 		}
@@ -111,31 +115,39 @@ func createLoop(logger golog.Logger, cfg Config, m Controllable) (*Loop, error) 
 			l.activeBackgroundWorkers.Add(1)
 			utils.ManagedGo(func() {
 				b := b
-				nInputs := len(b.ins)
 				close(waitCh)
 				for {
-					sw := make([]*Signal, nInputs)
-					for i, c := range b.ins {
+					sw := []*Signal{}
+					s := []*Signal{}
+					for _, c := range b.ins {
 						r, ok := <-c
 						if !ok {
 							b.mu.Lock()
 							for _, out := range b.outs {
 								close(out)
 							}
-							// logger.Debugf("Closing outs for block %s %+v\r\n", b.blk.Config(ctx).Name, r)
 							b.outs = nil
 							b.mu.Unlock()
 							return
 						}
-						if len(r) == 1 {
-							sw[i] = r[0]
-						} else {
-							// TODO(npmenard) do we want to support multidimentional signals?
-							//nolint: makezero
-							sw = append(sw, r...)
+						for j := 0; j < len(r); j++ {
+							if r[j] != nil {
+								sw = append(sw, r[j])
+							}
 						}
+						// TODO(npmenard) do we want to support multidimentional signals?
 					}
-					v, ok := b.blk.Next(l.cancelCtx, sw, l.dt)
+					if strings.Contains(b.blk.Config(l.cancelCtx).Name, "PID") {
+						if strings.Contains(b.blk.Config(l.cancelCtx).Name, "ang") {
+							s = append(s, sw[1])
+						} else {
+							s = append(s, sw[0])
+						}
+					} else {
+						s = sw
+					}
+
+					v, ok := b.blk.Next(l.cancelCtx, s, l.dt)
 					if ok {
 						for _, out := range b.outs {
 							out <- v
@@ -153,25 +165,36 @@ func createLoop(logger golog.Logger, cfg Config, m Controllable) (*Loop, error) 
 func (l *Loop) OutputAt(ctx context.Context, name string) ([]*Signal, error) {
 	blk, ok := l.blocks[name]
 	if !ok {
-		return []*Signal{}, errors.Errorf("cannot return Signals for non existing block %s", name)
+		return []*Signal{}, errors.Errorf("cannot return Signals for nonexistent %s", name)
 	}
 	return blk.blk.Output(ctx), nil
 }
 
-// ConfigAt returns the Configl at the block name, error when the block doesn't exist.
+// ConfigAt returns the Config at the block name, error when the block doesn't exist.
 func (l *Loop) ConfigAt(ctx context.Context, name string) (BlockConfig, error) {
 	blk, ok := l.blocks[name]
 	if !ok {
-		return BlockConfig{}, errors.Errorf("cannot return Config for non existing block %s", name)
+		return BlockConfig{}, errors.Errorf("cannot return Config for nonexistent %s", name)
 	}
 	return blk.blk.Config(ctx), nil
+}
+
+// ConfigsAtType returns the Config(s) at the block type, error when the block doesn't exist.
+func (l *Loop) ConfigsAtType(ctx context.Context, bType string) []BlockConfig {
+	var blocks []BlockConfig
+	for _, b := range l.blocks {
+		if b.blockType == controlBlockType(bType) {
+			blocks = append(blocks, b.blk.Config(ctx))
+		}
+	}
+	return blocks
 }
 
 // SetConfigAt returns the Configl at the block name, error when the block doesn't exist.
 func (l *Loop) SetConfigAt(ctx context.Context, name string, config BlockConfig) error {
 	blk, ok := l.blocks[name]
 	if !ok {
-		return errors.Errorf("cannot return Config for non existing block %s", name)
+		return errors.Errorf("cannot return Config for nonexistent %s", name)
 	}
 	return blk.blk.UpdateConfig(ctx, config)
 }
@@ -185,6 +208,12 @@ func (l *Loop) BlockList(ctx context.Context) ([]string, error) {
 	return out, nil
 }
 
+// GetPIDVals returns the tuned PID values.
+// TODO: update this when MIMO fully supported.
+func (l *Loop) GetPIDVals(pidIndex int) PIDConfig {
+	return *l.pidBlocks[pidIndex].PIDSets[0]
+}
+
 // Frequency returns the loop's frequency.
 func (l *Loop) Frequency(ctx context.Context) (float64, error) {
 	return l.cfg.Frequency, nil
@@ -195,7 +224,7 @@ func (l *Loop) Start() error {
 	if len(l.ts) == 0 {
 		return errors.New("cannot start the control loop if there are no blocks depending on an impulse")
 	}
-	l.logger.Debugf("Running loop on %1.4f %+v\r\n", l.cfg.Frequency, l.dt)
+	l.logger.Infof("Running control loop at %1.4f Hz, %+v\r\n", l.cfg.Frequency, l.dt)
 	l.ct = controlTicker{
 		ticker: time.NewTicker(l.dt),
 		stop:   make(chan bool, 1),
@@ -232,7 +261,7 @@ func (l *Loop) Start() error {
 		}
 	}, l.activeBackgroundWorkers.Done)
 	<-waitCh
-	l.running = true
+	l.running.Store(true)
 	return nil
 }
 
@@ -267,15 +296,78 @@ func (l *Loop) startBenchmark(loops int) error {
 
 // Stop stops then loop.
 func (l *Loop) Stop() {
-	if l.running {
-		l.ct.ticker.Stop()
-		close(l.ct.stop)
-		l.activeBackgroundWorkers.Wait()
-		l.running = false
+	l.running.Store(false)
+	l.logger.Debug("closing loop")
+	l.ct.ticker.Stop()
+	close(l.ct.stop)
+	l.cancel()
+	l.activeBackgroundWorkers.Wait()
+}
+
+// Pause sets l.running to false to pause the loop.
+func (l *Loop) Pause() {
+	l.running.Store(false)
+}
+
+// Resume sets l.running to true to resume the loop.
+func (l *Loop) Resume() {
+	if !l.running.Load() {
+		for _, b := range l.pidBlocks {
+			if err := b.Reset(context.Background()); err != nil {
+				l.logger.Error(err)
+				return
+			}
+		}
 	}
+	l.running.Store(true)
+}
+
+// Running returns the value of l.running.
+func (l *Loop) Running() bool {
+	return l.running.Load()
 }
 
 // GetConfig return the control loop config.
 func (l *Loop) GetConfig(ctx context.Context) Config {
 	return l.cfg
+}
+
+// MonitorTuning waits for tuning to start, and then returns once it's done.
+func (l *Loop) MonitorTuning(ctx context.Context) {
+	// wait until tuning has started
+	for {
+		// 100 Hz is probably faster than we need, but we needed at least a small delay because
+		// GetTuning will lock the PID block
+		if utils.SelectContextOrWait(ctx, 10*time.Millisecond) {
+			tuning := l.GetTuning(ctx)
+			if tuning {
+				break
+			}
+			continue
+		}
+		l.logger.Error("error starting tuner")
+		return
+	}
+	// wait until tuning is done
+	for {
+		if utils.SelectContextOrWait(ctx, 10*time.Millisecond) {
+			tuning := l.GetTuning(ctx)
+			if !tuning {
+				break
+			}
+			continue
+		}
+		l.logger.Error("error waiting for tuner")
+		return
+	}
+}
+
+// GetTuning returns the current tuning value.
+func (l *Loop) GetTuning(ctx context.Context) bool {
+	for _, b := range l.pidBlocks {
+		if b.GetTuning() {
+			return true
+		}
+	}
+	return false
 }

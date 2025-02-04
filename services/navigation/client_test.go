@@ -6,7 +6,6 @@ import (
 	"net"
 	"testing"
 
-	"github.com/edaniels/golog"
 	geo "github.com/kellydunn/golang-geo"
 	"github.com/pkg/errors"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -16,6 +15,7 @@ import (
 	"google.golang.org/grpc"
 
 	viamgrpc "go.viam.com/rdk/grpc"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/services/navigation"
 	"go.viam.com/rdk/spatialmath"
@@ -29,7 +29,7 @@ var (
 )
 
 func TestClient(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	listener1, err := net.Listen("tcp", "localhost:0")
 	test.That(t, err, test.ShouldBeNil)
 	listener2, err := net.Listen("tcp", "localhost:0")
@@ -90,6 +90,19 @@ func TestClient(t *testing.T) {
 		return nil
 	}
 
+	var receivedPaths []*navigation.Path
+	workingNavigationService.PathsFunc = func(ctx context.Context, extra map[string]interface{}) ([]*navigation.Path, error) {
+		path, err := navigation.NewPath(primitive.NewObjectID(), []*geo.Point{geo.NewPoint(0, 0)})
+		test.That(t, err, test.ShouldBeNil)
+		receivedPaths = []*navigation.Path{path}
+		return receivedPaths, nil
+	}
+
+	receivedProp := navigation.Properties{MapType: navigation.NoMap}
+	workingNavigationService.PropertiesFunc = func(ctx context.Context) (navigation.Properties, error) {
+		return receivedProp, nil
+	}
+
 	failingNavigationService.ModeFunc = func(ctx context.Context, extra map[string]interface{}) (navigation.Mode, error) {
 		return navigation.ModeManual, errors.New("failure to retrieve mode")
 	}
@@ -113,6 +126,13 @@ func TestClient(t *testing.T) {
 	failingNavigationService.RemoveWaypointFunc = func(ctx context.Context, id primitive.ObjectID, extra map[string]interface{}) error {
 		receivedFailingID = id
 		return errors.New("failure to remove waypoint")
+	}
+	failingNavigationService.PathsFunc = func(ctx context.Context, extra map[string]interface{}) ([]*navigation.Path, error) {
+		return nil, errors.New("unimplemented")
+	}
+
+	failingNavigationService.PropertiesFunc = func(ctx context.Context) (navigation.Properties, error) {
+		return navigation.Properties{}, errors.New("unimplemented")
 	}
 
 	workingSvc, err := resource.NewAPIResourceCollection(navigation.API, map[resource.Name]navigation.Service{
@@ -165,6 +185,20 @@ func TestClient(t *testing.T) {
 		test.That(t, receivedMode, test.ShouldEqual, navigation.ModeManual)
 		test.That(t, extraOptions, test.ShouldResemble, extra)
 
+		err = workingNavClient.SetMode(context.Background(), navigation.ModeWaypoint, extra)
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, receivedMode, test.ShouldEqual, navigation.ModeWaypoint)
+		test.That(t, extraOptions, test.ShouldResemble, extra)
+
+		err = workingNavClient.SetMode(context.Background(), navigation.ModeExplore, extra)
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, receivedMode, test.ShouldEqual, navigation.ModeExplore)
+		test.That(t, extraOptions, test.ShouldResemble, extra)
+
+		err = workingNavClient.SetMode(context.Background(), 99, extra)
+		test.That(t, err, test.ShouldNotBeNil)
+		test.That(t, err.Error(), test.ShouldContainSubstring, "MODE_UNSPECIFIED")
+
 		// test add waypoint
 		point := geo.NewPoint(90, 1)
 		extra = map[string]interface{}{"foo": "AddWaypoint"}
@@ -172,6 +206,17 @@ func TestClient(t *testing.T) {
 		test.That(t, err, test.ShouldBeNil)
 		test.That(t, receivedPoint, test.ShouldResemble, point)
 		test.That(t, extraOptions, test.ShouldResemble, extra)
+
+		// test Paths
+		ctx := context.Background()
+		paths, err := workingNavClient.Paths(ctx, nil)
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, paths, test.ShouldResemble, receivedPaths)
+
+		// test Properties
+		prop, err := workingNavClient.Properties(ctx)
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, prop.MapType, test.ShouldEqual, receivedProp.MapType)
 
 		// test do command
 		workingNavigationService.DoCommandFunc = testutils.EchoFunc
@@ -246,6 +291,17 @@ func TestClient(t *testing.T) {
 		err = failingNavClient.AddWaypoint(context.Background(), point, map[string]interface{}{})
 		test.That(t, err, test.ShouldNotBeNil)
 		test.That(t, receivedFailingPoint, test.ShouldResemble, point)
+
+		// test Paths
+		paths, err := failingNavClient.Paths(context.Background(), nil)
+		test.That(t, err, test.ShouldNotBeNil)
+		test.That(t, paths, test.ShouldBeNil)
+
+		// test Properties
+		prop, err := failingNavClient.Properties(context.Background())
+		test.That(t, err, test.ShouldNotBeNil)
+		test.That(t, prop, test.ShouldResemble, navigation.Properties{})
+
 		test.That(t, conn.Close(), test.ShouldBeNil)
 	})
 

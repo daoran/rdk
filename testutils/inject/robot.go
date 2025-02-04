@@ -7,11 +7,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/google/uuid"
 	"go.viam.com/utils/pexec"
 
+	"go.viam.com/rdk/cloud"
 	"go.viam.com/rdk/config"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/operation"
 	"go.viam.com/rdk/pointcloud"
 	"go.viam.com/rdk/referenceframe"
@@ -25,28 +26,31 @@ import (
 // Robot is an injected robot.
 type Robot struct {
 	robot.LocalRobot
-	Mu                     sync.RWMutex // Ugly, has to be manually locked if a test means to swap funcs on an in-use robot.
-	DiscoverComponentsFunc func(ctx context.Context, keys []resource.DiscoveryQuery) ([]resource.Discovery, error)
-	RemoteByNameFunc       func(name string) (robot.Robot, bool)
-	ResourceByNameFunc     func(name resource.Name) (resource.Resource, error)
-	RemoteNamesFunc        func() []string
-	ResourceNamesFunc      func() []resource.Name
-	ResourceRPCAPIsFunc    func() []resource.RPCAPI
-	ProcessManagerFunc     func() pexec.ProcessManager
-	ConfigFunc             func() *config.Config
-	LoggerFunc             func() golog.Logger
-	CloseFunc              func(ctx context.Context) error
-	StopAllFunc            func(ctx context.Context, extra map[resource.Name]map[string]interface{}) error
-	FrameSystemConfigFunc  func(ctx context.Context) (*framesystem.Config, error)
-	TransformPoseFunc      func(
+	Mu                       sync.RWMutex // Ugly, has to be manually locked if a test means to swap funcs on an in-use robot.
+	DiscoverComponentsFunc   func(ctx context.Context, keys []resource.DiscoveryQuery) ([]resource.Discovery, error)
+	GetModelsFromModulesFunc func(ctx context.Context) ([]resource.ModuleModelDiscovery, error)
+	RemoteByNameFunc         func(name string) (robot.Robot, bool)
+	ResourceByNameFunc       func(name resource.Name) (resource.Resource, error)
+	RemoteNamesFunc          func() []string
+	ResourceNamesFunc        func() []resource.Name
+	ResourceRPCAPIsFunc      func() []resource.RPCAPI
+	ProcessManagerFunc       func() pexec.ProcessManager
+	ConfigFunc               func() *config.Config
+	LoggerFunc               func() logging.Logger
+	CloseFunc                func(ctx context.Context) error
+	StopAllFunc              func(ctx context.Context, extra map[resource.Name]map[string]interface{}) error
+	FrameSystemConfigFunc    func(ctx context.Context) (*framesystem.Config, error)
+	TransformPoseFunc        func(
 		ctx context.Context,
 		pose *referenceframe.PoseInFrame,
 		dst string,
 		additionalTransforms []*referenceframe.LinkInFrame,
 	) (*referenceframe.PoseInFrame, error)
 	TransformPointCloudFunc func(ctx context.Context, srcpc pointcloud.PointCloud, srcName, dstName string) (pointcloud.PointCloud, error)
-	StatusFunc              func(ctx context.Context, resourceNames []resource.Name) ([]robot.Status, error)
 	ModuleAddressFunc       func() (string, error)
+	CloudMetadataFunc       func(ctx context.Context) (cloud.Metadata, error)
+	MachineStatusFunc       func(ctx context.Context) (robot.MachineStatus, error)
+	ShutdownFunc            func(ctx context.Context) error
 
 	ops        *operation.Manager
 	SessMgr    session.Manager
@@ -55,20 +59,28 @@ type Robot struct {
 
 // MockResourcesFromMap mocks ResourceNames and ResourceByName based on a resource map.
 func (r *Robot) MockResourcesFromMap(rs map[resource.Name]resource.Resource) {
-	r.ResourceNamesFunc = func() []resource.Name {
-		result := []resource.Name{}
-		for name := range rs {
-			result = append(result, name)
+	func() {
+		r.Mu.Lock()
+		defer r.Mu.Unlock()
+		r.ResourceNamesFunc = func() []resource.Name {
+			result := []resource.Name{}
+			for name := range rs {
+				result = append(result, name)
+			}
+			return result
 		}
-		return result
-	}
-	r.ResourceByNameFunc = func(name resource.Name) (resource.Resource, error) {
-		result, ok := rs[name]
-		if ok {
-			return result, nil
+	}()
+	func() {
+		r.Mu.Lock()
+		defer r.Mu.Unlock()
+		r.ResourceByNameFunc = func(name resource.Name) (resource.Resource, error) {
+			result, ok := rs[name]
+			if ok {
+				return result, nil
+			}
+			return nil, errors.New("not found")
 		}
-		return nil, errors.New("not found")
-	}
+	}()
 }
 
 // RemoteByName calls the injected RemoteByName or the real version.
@@ -175,7 +187,7 @@ func (r *Robot) Config() *config.Config {
 }
 
 // Logger calls the injected Logger or the real version.
-func (r *Robot) Logger() golog.Logger {
+func (r *Robot) Logger() logging.Logger {
 	r.Mu.RLock()
 	defer r.Mu.RUnlock()
 	if r.LoggerFunc == nil {
@@ -217,6 +229,16 @@ func (r *Robot) DiscoverComponents(ctx context.Context, keys []resource.Discover
 	return r.DiscoverComponentsFunc(ctx, keys)
 }
 
+// GetModelsFromModules calls the injected GetModelsFromModules or the real one.
+func (r *Robot) GetModelsFromModules(ctx context.Context) ([]resource.ModuleModelDiscovery, error) {
+	r.Mu.RLock()
+	defer r.Mu.RUnlock()
+	if r.GetModelsFromModulesFunc == nil {
+		return r.LocalRobot.GetModelsFromModules(ctx)
+	}
+	return r.GetModelsFromModulesFunc(ctx)
+}
+
 // FrameSystemConfig calls the injected FrameSystemConfig or the real version.
 func (r *Robot) FrameSystemConfig(ctx context.Context) (*framesystem.Config, error) {
 	r.Mu.RLock()
@@ -254,16 +276,6 @@ func (r *Robot) TransformPointCloud(ctx context.Context, srcpc pointcloud.PointC
 	return r.TransformPointCloudFunc(ctx, srcpc, srcName, dstName)
 }
 
-// Status call the injected Status or the real one.
-func (r *Robot) Status(ctx context.Context, resourceNames []resource.Name) ([]robot.Status, error) {
-	r.Mu.RLock()
-	defer r.Mu.RUnlock()
-	if r.StatusFunc == nil {
-		return r.LocalRobot.Status(ctx, resourceNames)
-	}
-	return r.StatusFunc(ctx, resourceNames)
-}
-
 // ModuleAddress calls the injected ModuleAddress or the real one.
 func (r *Robot) ModuleAddress() (string, error) {
 	r.Mu.RLock()
@@ -272,6 +284,36 @@ func (r *Robot) ModuleAddress() (string, error) {
 		return r.LocalRobot.ModuleAddress()
 	}
 	return r.ModuleAddressFunc()
+}
+
+// CloudMetadata calls the injected CloudMetadata or the real one.
+func (r *Robot) CloudMetadata(ctx context.Context) (cloud.Metadata, error) {
+	r.Mu.RLock()
+	defer r.Mu.RUnlock()
+	if r.CloudMetadataFunc == nil {
+		return r.LocalRobot.CloudMetadata(ctx)
+	}
+	return r.CloudMetadataFunc(ctx)
+}
+
+// MachineStatus calls the injected MachineStatus or the real one.
+func (r *Robot) MachineStatus(ctx context.Context) (robot.MachineStatus, error) {
+	r.Mu.RLock()
+	defer r.Mu.RUnlock()
+	if r.MachineStatusFunc == nil {
+		return r.LocalRobot.MachineStatus(ctx)
+	}
+	return r.MachineStatusFunc(ctx)
+}
+
+// Shutdown calls the injected Shutdown or the real one.
+func (r *Robot) Shutdown(ctx context.Context) error {
+	r.Mu.RLock()
+	defer r.Mu.RUnlock()
+	if r.ShutdownFunc == nil {
+		return r.LocalRobot.Shutdown(ctx)
+	}
+	return r.ShutdownFunc(ctx)
 }
 
 type noopSessionManager struct{}

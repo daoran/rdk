@@ -5,13 +5,13 @@ import (
 	"net"
 	"testing"
 
-	"github.com/edaniels/golog"
 	"github.com/golang/geo/r3"
 	"go.viam.com/test"
 	"go.viam.com/utils/rpc"
 
 	"go.viam.com/rdk/components/base"
 	viamgrpc "go.viam.com/rdk/grpc"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/spatialmath"
 	"go.viam.com/rdk/testutils"
@@ -75,10 +75,14 @@ func setupBrokenBase(brokenBase *inject.Base) {
 	brokenBase.PropertiesFunc = func(ctx context.Context, extra map[string]interface{}) (base.Properties, error) {
 		return base.Properties{}, errPropertiesFailed
 	}
+
+	brokenBase.GeometriesFunc = func(ctx context.Context) ([]spatialmath.Geometry, error) {
+		return nil, nil
+	}
 }
 
 func TestClient(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	listener1, err := net.Listen("tcp", "localhost:0")
 	test.That(t, err, test.ShouldBeNil)
 	rpcServer, err := rpc.NewServer(logger, rpc.WithUnauthenticated())
@@ -183,7 +187,7 @@ func TestClient(t *testing.T) {
 			geometries, err := workingBaseClient.Geometries(context.Background(), nil)
 			test.That(t, err, test.ShouldBeNil)
 			for i, geometry := range geometries {
-				test.That(t, geometry.AlmostEqual(expectedGeometries[i]), test.ShouldBeTrue)
+				test.That(t, spatialmath.GeometriesAlmostEqual(geometry, expectedGeometries[i]), test.ShouldBeTrue)
 			}
 		})
 	})
@@ -220,6 +224,9 @@ func TestClient(t *testing.T) {
 
 		_, err = failingBaseClient.Properties(context.Background(), nil)
 		test.That(t, err.Error(), test.ShouldContainSubstring, errPropertiesFailed.Error())
+
+		_, err = failingBaseClient.Geometries(context.Background(), nil)
+		test.That(t, err.Error(), test.ShouldContainSubstring, base.ErrGeometriesNil(failBaseName).Error())
 
 		err = failingBaseClient.Stop(context.Background(), nil)
 		test.That(t, err.Error(), test.ShouldContainSubstring, errStopFailed.Error())

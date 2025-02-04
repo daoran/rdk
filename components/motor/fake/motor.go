@@ -3,25 +3,37 @@ package fake
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"sync"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/pkg/errors"
-	"go.viam.com/utils"
 
 	"go.viam.com/rdk/components/board"
+	fakeboard "go.viam.com/rdk/components/board/fake"
 	"go.viam.com/rdk/components/encoder"
 	"go.viam.com/rdk/components/encoder/fake"
 	"go.viam.com/rdk/components/motor"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/operation"
 	"go.viam.com/rdk/resource"
 )
 
-var model = resource.DefaultModelFamily.WithModel("fake")
+var (
+	model         = resource.DefaultModelFamily.WithModel("fake")
+	fakeBoardConf = resource.Config{
+		Name: "fakeboard",
+		API:  board.API,
+		ConvertedAttributes: &fakeboard.Config{
+			FailNew: false,
+		},
+	}
+)
 
-const defaultMaxRpm = 100
+const (
+	defaultMaxRpm = 100
+)
 
 // PinConfig defines the mapping of where motor are wired.
 type PinConfig struct {
@@ -31,8 +43,8 @@ type PinConfig struct {
 
 // Config describes the configuration of a motor.
 type Config struct {
-	Pins             PinConfig `json:"pins"`
-	BoardName        string    `json:"board"`
+	Pins             PinConfig `json:"pins,omitempty"`
+	BoardName        string    `json:"board,omitempty"`
 	MinPowerPct      float64   `json:"min_power_pct,omitempty"`
 	MaxPowerPct      float64   `json:"max_power_pct,omitempty"`
 	PWMFreq          uint      `json:"pwm_freq,omitempty"`
@@ -50,7 +62,7 @@ func (cfg *Config) Validate(path string) ([]string, error) {
 	}
 	if cfg.Encoder != "" {
 		if cfg.TicksPerRotation <= 0 {
-			return nil, utils.NewConfigValidationError(path, errors.New("need nonzero TicksPerRotation for encoded motor"))
+			return nil, resource.NewConfigValidationError(path, errors.New("need nonzero TicksPerRotation for encoded motor"))
 		}
 		deps = append(deps, cfg.Encoder)
 	}
@@ -59,22 +71,7 @@ func (cfg *Config) Validate(path string) ([]string, error) {
 
 func init() {
 	resource.RegisterComponent(motor.API, model, resource.Registration[motor.Motor, *Config]{
-		Constructor: func(
-			ctx context.Context,
-			deps resource.Dependencies,
-			conf resource.Config,
-			logger golog.Logger,
-		) (motor.Motor, error) {
-			m := &Motor{
-				Named:  conf.ResourceName().AsNamed(),
-				Logger: logger,
-				OpMgr:  operation.NewSingleOperationManager(),
-			}
-			if err := m.Reconfigure(ctx, deps, conf); err != nil {
-				return nil, err
-			}
-			return m, nil
-		},
+		Constructor: NewMotor,
 	})
 }
 
@@ -95,7 +92,20 @@ type Motor struct {
 	TicksPerRotation  int
 
 	OpMgr  *operation.SingleOperationManager
-	Logger golog.Logger
+	Logger logging.Logger
+}
+
+// NewMotor creates a new fake motor.
+func NewMotor(ctx context.Context, deps resource.Dependencies, conf resource.Config, logger logging.Logger) (motor.Motor, error) {
+	m := &Motor{
+		Named:  conf.ResourceName().AsNamed(),
+		Logger: logger,
+		OpMgr:  operation.NewSingleOperationManager(),
+	}
+	if err := m.Reconfigure(ctx, deps, conf); err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 // Reconfigure atomically reconfigures this motor in place based on the new config.
@@ -106,26 +116,39 @@ func (m *Motor) Reconfigure(ctx context.Context, deps resource.Dependencies, con
 	if err != nil {
 		return err
 	}
+
+	var b board.Board
 	if newConf.BoardName != "" {
 		m.Board = newConf.BoardName
-		b, err := board.FromDependencies(deps, m.Board)
+		b, err = board.FromDependencies(deps, m.Board)
 		if err != nil {
 			return err
 		}
-		if newConf.Pins.PWM != "" {
-			m.PWM, err = b.GPIOPinByName(newConf.Pins.PWM)
-			if err != nil {
-				return err
-			}
-			if err = m.PWM.SetPWMFreq(ctx, newConf.PWMFreq, nil); err != nil {
-				return err
-			}
+	} else {
+		m.Logger.CInfo(ctx, "board not provided, using a fake board")
+		m.Board = "fakeboard"
+		b, err = fakeboard.NewBoard(ctx, fakeBoardConf, m.Logger)
+		if err != nil {
+			return err
 		}
 	}
+
+	pwmPin := "1"
+	if newConf.Pins.PWM != "" {
+		pwmPin = newConf.Pins.PWM
+	}
+	m.PWM, err = b.GPIOPinByName(pwmPin)
+	if err != nil {
+		return err
+	}
+	if err = m.PWM.SetPWMFreq(ctx, newConf.PWMFreq, nil); err != nil {
+		return err
+	}
+
 	m.MaxRPM = newConf.MaxRPM
 
 	if m.MaxRPM == 0 {
-		m.Logger.Infof("Max RPM not provided to a fake motor, defaulting to %v", defaultMaxRpm)
+		m.Logger.CInfof(ctx, "Max RPM not provided to a fake motor, defaulting to %v", defaultMaxRpm)
 		m.MaxRPM = defaultMaxRpm
 	}
 
@@ -186,7 +209,7 @@ func (m *Motor) SetPower(ctx context.Context, powerPct float64, extra map[string
 	defer m.mu.Unlock()
 
 	m.OpMgr.CancelRunning(ctx)
-	m.Logger.Debugf("Motor SetPower %f", powerPct)
+	m.Logger.CDebugf(ctx, "Motor SetPower %f", powerPct)
 	m.setPowerPct(powerPct)
 
 	if m.Encoder != nil {
@@ -230,8 +253,6 @@ func (m *Motor) Direction() int {
 	return 0
 }
 
-// If revolutions is 0, the returned wait duration will be 0 representing that
-// the motor should run indefinitely.
 func goForMath(maxRPM, rpm, revolutions float64) (float64, time.Duration, float64) {
 	// need to do this so time is reasonable
 	if rpm > maxRPM {
@@ -239,31 +260,41 @@ func goForMath(maxRPM, rpm, revolutions float64) (float64, time.Duration, float6
 	} else if rpm < -1*maxRPM {
 		rpm = -1 * maxRPM
 	}
-	if rpm == 0 {
-		return 0, 0, revolutions / math.Abs(revolutions)
-	}
 
-	if revolutions == 0 {
-		powerPct := rpm / maxRPM
-		return powerPct, 0, 1
-	}
+	dir := motor.GetRequestedDirection(rpm, revolutions)
 
-	dir := rpm * revolutions / math.Abs(revolutions*rpm)
 	powerPct := math.Abs(rpm) / maxRPM * dir
 	waitDur := time.Duration(math.Abs(revolutions/rpm)*60*1000) * time.Millisecond
 	return powerPct, waitDur, dir
 }
 
+// checkSpeed checks if the input rpm is too slow or fast and returns a warning and/or error.
+func checkSpeed(rpm, max float64) (string, error) {
+	switch speed := math.Abs(rpm); {
+	case speed == 0:
+		return "motor speed requested is 0 rev_per_min", motor.NewZeroRPMError()
+	case speed > 0 && speed < 0.1:
+		return "motor speed is nearly 0 rev_per_min", nil
+	case max > 0 && speed > max-0.1:
+		return fmt.Sprintf("motor speed is nearly the max rev_per_min (%f)", max), nil
+	default:
+		return "", nil
+	}
+}
+
 // GoFor sets the given direction and an arbitrary power percentage.
 // If rpm is 0, the motor should immediately move to the final position.
 func (m *Motor) GoFor(ctx context.Context, rpm, revolutions float64, extra map[string]interface{}) error {
-	switch speed := math.Abs(rpm); {
-	case speed < 0.1:
-		m.Logger.Warn("motor speed is nearly 0 rev_per_min")
-		return motor.NewZeroRPMError()
-	case m.MaxRPM > 0 && speed > m.MaxRPM-0.1:
-		m.Logger.Warnf("motor speed is nearly the max rev_per_min (%f)", m.MaxRPM)
-	default:
+	warning, err := checkSpeed(rpm, m.MaxRPM)
+	if warning != "" {
+		m.Logger.CWarn(ctx, warning)
+	}
+	if err != nil {
+		return err
+	}
+
+	if err := motor.CheckRevolutions(revolutions); err != nil {
+		return err
 	}
 
 	powerPct, waitDur, dir := goForMath(m.MaxRPM, rpm, revolutions)
@@ -277,13 +308,9 @@ func (m *Motor) GoFor(ctx context.Context, rpm, revolutions float64, extra map[s
 		finalPos = curPos + dir*math.Abs(revolutions)
 	}
 
-	err := m.SetPower(ctx, powerPct, nil)
+	err = m.SetPower(ctx, powerPct, nil)
 	if err != nil {
 		return err
-	}
-
-	if revolutions == 0 {
-		return nil
 	}
 
 	if m.OpMgr.NewTimedWaitOp(ctx, waitDur) {
@@ -293,7 +320,7 @@ func (m *Motor) GoFor(ctx context.Context, rpm, revolutions float64, extra map[s
 		}
 
 		if m.Encoder != nil {
-			return m.Encoder.SetPosition(ctx, int64(finalPos*float64(m.TicksPerRotation)))
+			return m.Encoder.SetPosition(ctx, finalPos*float64(m.TicksPerRotation))
 		}
 	}
 	return nil
@@ -305,20 +332,21 @@ func (m *Motor) GoTo(ctx context.Context, rpm, pos float64, extra map[string]int
 		return errors.New("encoder is not defined")
 	}
 
-	switch speed := math.Abs(rpm); {
-	case speed < 0.1:
-		m.Logger.Warn("motor speed is nearly 0 rev_per_min")
-	case m.MaxRPM > 0 && speed > m.MaxRPM-0.1:
-		m.Logger.Warnf("motor speed is nearly the max rev_per_min (%f)", m.MaxRPM)
-	default:
+	warning, err := checkSpeed(rpm, m.MaxRPM)
+	if warning != "" {
+		m.Logger.CWarn(ctx, warning)
+	}
+	if err != nil {
+		return err
 	}
 
 	curPos, err := m.Position(ctx, nil)
 	if err != nil {
 		return err
 	}
-	if curPos == pos {
-		return nil
+
+	if err := motor.CheckRevolutions(pos - curPos); err != nil {
+		return err
 	}
 
 	revolutions := pos - curPos
@@ -330,20 +358,30 @@ func (m *Motor) GoTo(ctx context.Context, rpm, pos float64, extra map[string]int
 		return err
 	}
 
-	if revolutions == 0 {
-		return nil
-	}
-
 	if m.OpMgr.NewTimedWaitOp(ctx, waitDur) {
 		err = m.Stop(ctx, nil)
 		if err != nil {
 			return err
 		}
 
-		return m.Encoder.SetPosition(ctx, int64(pos*float64(m.TicksPerRotation)))
+		return m.Encoder.SetPosition(ctx, pos*float64(m.TicksPerRotation))
 	}
 
 	return nil
+}
+
+// SetRPM instructs the motor to move at the specified RPM indefinitely.
+func (m *Motor) SetRPM(ctx context.Context, rpm float64, extra map[string]interface{}) error {
+	warning, err := checkSpeed(rpm, m.MaxRPM)
+	if warning != "" {
+		m.Logger.CWarn(ctx, warning)
+	}
+	if err != nil {
+		return err
+	}
+
+	powerPct := rpm / m.MaxRPM
+	return m.SetPower(ctx, powerPct, nil)
 }
 
 // Stop has the motor pretend to be off.
@@ -351,7 +389,7 @@ func (m *Motor) Stop(ctx context.Context, extra map[string]interface{}) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.Logger.Debug("Motor Stopped")
+	m.Logger.CDebug(ctx, "Motor Stopped")
 	m.setPowerPct(0.0)
 	if m.Encoder != nil {
 		err := m.Encoder.SetSpeed(ctx, 0.0)
@@ -372,7 +410,7 @@ func (m *Motor) ResetZeroPosition(ctx context.Context, offset float64, extra map
 		return errors.New("need nonzero TicksPerRotation for motor")
 	}
 
-	err := m.Encoder.ResetPosition(ctx, extra)
+	err := m.Encoder.SetPosition(ctx, -1*offset)
 	if err != nil {
 		return errors.Wrapf(err, "error in ResetZeroPosition from motor (%s)", m.Name())
 	}

@@ -10,125 +10,60 @@ import (
 	"context"
 	"testing"
 
-	"github.com/edaniels/golog"
 	"go.viam.com/test"
 
 	"go.viam.com/rdk/components/board"
+	"go.viam.com/rdk/components/board/mcp3008helper"
+	"go.viam.com/rdk/logging"
+	"go.viam.com/rdk/resource"
 )
 
 func TestGenericLinux(t *testing.T) {
-	ctx := context.Background()
-
 	b := &Board{
-		logger: golog.NewTestLogger(t),
+		logger: logging.NewTestLogger(t),
 	}
 
 	t.Run("test empty sysfs board", func(t *testing.T) {
-		test.That(t, b.GPIOPinNames(), test.ShouldBeNil)
-		test.That(t, b.SPINames(), test.ShouldBeNil)
 		_, err := b.GPIOPinByName("10")
 		test.That(t, err, test.ShouldNotBeNil)
 	})
 
-	boardSPIs := map[string]*spiBus{
-		"closed": {
-			openHandle: &spiHandle{bus: &spiBus{}, isClosed: true},
-		},
-		"open": {
-			openHandle: &spiHandle{bus: &spiBus{}, isClosed: false},
-		},
-	}
-	oneStr := "1"
-	twoStr := "1"
-	boardSPIs["closed"].bus.Store(&oneStr)
-	boardSPIs["closed"].openHandle.bus.bus.Store(&oneStr)
-	boardSPIs["open"].bus.Store(&twoStr)
-	boardSPIs["open"].openHandle.bus.bus.Store(&twoStr)
-
 	b = &Board{
-		Named:        board.Named("foo").AsNamed(),
-		gpioMappings: nil,
-		spis:         boardSPIs,
-		analogs:      map[string]*wrappedAnalog{"an": {}},
-		logger:       golog.NewTestLogger(t),
-		cancelCtx:    ctx,
-		cancelFunc: func() {
-		},
+		Named:         board.Named("foo").AsNamed(),
+		gpioMappings:  nil,
+		analogReaders: map[string]*wrappedAnalogReader{"an": {}},
+		logger:        logging.NewTestLogger(t),
 	}
 
-	t.Run("test analogs spis i2cs digital-interrupts and gpio names", func(t *testing.T) {
-		ans := b.AnalogReaderNames()
-		test.That(t, ans, test.ShouldResemble, []string{"an"})
+	t.Run("test analog-readers digital-interrupts and gpio names", func(t *testing.T) {
+		an1, err := b.AnalogByName("an")
+		test.That(t, an1, test.ShouldHaveSameTypeAs, &wrappedAnalogReader{})
+		test.That(t, err, test.ShouldBeNil)
 
-		an1, ok := b.AnalogReaderByName("an")
-		test.That(t, an1, test.ShouldHaveSameTypeAs, &wrappedAnalog{})
-		test.That(t, ok, test.ShouldBeTrue)
-
-		an2, ok := b.AnalogReaderByName("missing")
+		an2, err := b.AnalogByName("missing")
 		test.That(t, an2, test.ShouldBeNil)
-		test.That(t, ok, test.ShouldBeFalse)
+		test.That(t, err, test.ShouldNotBeNil)
 
-		sns := b.SPINames()
-		test.That(t, len(sns), test.ShouldEqual, 2)
-
-		sn1, ok := b.SPIByName("closed")
-		test.That(t, sn1, test.ShouldHaveSameTypeAs, &spiBus{})
-		test.That(t, ok, test.ShouldBeTrue)
-
-		sn2, ok := b.SPIByName("missing")
-		test.That(t, sn2, test.ShouldBeNil)
-		test.That(t, ok, test.ShouldBeFalse)
-
-		ins := b.I2CNames()
-		test.That(t, ins, test.ShouldBeNil)
-
-		in1, ok := b.I2CByName("in")
-		test.That(t, in1, test.ShouldBeNil)
-		test.That(t, ok, test.ShouldBeFalse)
-
-		dns := b.DigitalInterruptNames()
-		test.That(t, dns, test.ShouldBeNil)
-
-		dn1, ok := b.DigitalInterruptByName("dn")
+		dn1, err := b.DigitalInterruptByName("dn")
 		test.That(t, dn1, test.ShouldBeNil)
-		test.That(t, ok, test.ShouldBeFalse)
-
-		gns := b.GPIOPinNames()
-		test.That(t, gns, test.ShouldResemble, []string(nil))
+		test.That(t, err, test.ShouldNotBeNil)
 
 		gn1, err := b.GPIOPinByName("10")
 		test.That(t, err, test.ShouldNotBeNil)
 		test.That(t, gn1, test.ShouldBeNil)
-	})
-
-	t.Run("test spi functionality", func(t *testing.T) {
-		spi1 := b.spis["closed"]
-		spi2 := b.spis["open"]
-		sph1, err := spi1.OpenHandle()
-		test.That(t, sph1, test.ShouldHaveSameTypeAs, &spiHandle{})
-		test.That(t, err, test.ShouldBeNil)
-		sph2, err := spi2.OpenHandle()
-		test.That(t, sph2, test.ShouldHaveSameTypeAs, &spiHandle{})
-		test.That(t, err, test.ShouldBeNil)
-
-		err = sph2.Close()
-		test.That(t, err, test.ShouldBeNil)
-		rx, err := sph2.Xfer(ctx, 1, "1", 1, []byte{})
-		test.That(t, err.Error(), test.ShouldContainSubstring, "closed")
-		test.That(t, rx, test.ShouldBeNil)
 	})
 }
 
 func TestConfigValidate(t *testing.T) {
 	validConfig := Config{}
 
-	validConfig.Analogs = []board.AnalogConfig{{}}
+	validConfig.AnalogReaders = []mcp3008helper.MCP3008AnalogConfig{{}}
 	_, err := validConfig.Validate("path")
 	test.That(t, err, test.ShouldNotBeNil)
 	test.That(t, err.Error(), test.ShouldContainSubstring, `path.analogs.0`)
-	test.That(t, err.Error(), test.ShouldContainSubstring, `"name" is required`)
+	test.That(t, resource.GetFieldFromFieldRequiredError(err), test.ShouldEqual, "name")
 
-	validConfig.Analogs = []board.AnalogConfig{{Name: "bar"}}
+	validConfig.AnalogReaders = []mcp3008helper.MCP3008AnalogConfig{{Name: "bar"}}
 	_, err = validConfig.Validate("path")
 	test.That(t, err, test.ShouldBeNil)
 
@@ -136,15 +71,68 @@ func TestConfigValidate(t *testing.T) {
 	_, err = validConfig.Validate("path")
 	test.That(t, err, test.ShouldNotBeNil)
 	test.That(t, err.Error(), test.ShouldContainSubstring, `path.digital_interrupts.0`)
-	test.That(t, err.Error(), test.ShouldContainSubstring, `"name" is required`)
+	test.That(t, resource.GetFieldFromFieldRequiredError(err), test.ShouldEqual, "name")
 
 	validConfig.DigitalInterrupts = []board.DigitalInterruptConfig{{Name: "bar"}}
 	_, err = validConfig.Validate("path")
 	test.That(t, err, test.ShouldNotBeNil)
 	test.That(t, err.Error(), test.ShouldContainSubstring, `path.digital_interrupts.0`)
-	test.That(t, err.Error(), test.ShouldContainSubstring, `"pin" is required`)
+	test.That(t, resource.GetFieldFromFieldRequiredError(err), test.ShouldEqual, "pin")
 
 	validConfig.DigitalInterrupts = []board.DigitalInterruptConfig{{Name: "bar", Pin: "3"}}
 	_, err = validConfig.Validate("path")
 	test.That(t, err, test.ShouldBeNil)
+}
+
+func TestNewBoard(t *testing.T) {
+	logger := logging.NewTestLogger(t)
+	ctx := context.Background()
+
+	// Create a fake board mapping with two pins for testing.
+	testBoardMappings := make(map[string]GPIOBoardMapping, 2)
+	testBoardMappings["1"] = GPIOBoardMapping{
+		GPIOChipDev:    "gpiochip0",
+		GPIO:           1,
+		GPIOName:       "1",
+		PWMSysFsDir:    "",
+		PWMID:          -1,
+		HWPWMSupported: false,
+	}
+	testBoardMappings["2"] = GPIOBoardMapping{
+		GPIOChipDev:    "gpiochip0",
+		GPIO:           2,
+		GPIOName:       "2",
+		PWMSysFsDir:    "pwm.00",
+		PWMID:          1,
+		HWPWMSupported: true,
+	}
+
+	conf := &Config{}
+	conf.AnalogReaders = []mcp3008helper.MCP3008AnalogConfig{{Name: "an1", Channel: "1"}}
+
+	config := resource.Config{
+		Name:                "board1",
+		ConvertedAttributes: conf,
+	}
+	b, err := NewBoard(ctx, config, ConstPinDefs(testBoardMappings), logger)
+	test.That(t, err, test.ShouldBeNil)
+	test.That(t, b, test.ShouldNotBeNil)
+	defer b.Close(ctx)
+
+	gn1, err := b.GPIOPinByName("1")
+	test.That(t, err, test.ShouldBeNil)
+	// Our test framework uses reflection to walk the structs it asserts on. However, gn1 (and
+	// later gn2) contains a mutex that was locked and unlocked by a background goroutine when it
+	// was constructed at the beginning of the test. That was so recent that the Go runtime
+	// environment will think there is a race condition when the test framework walks that part of
+	// the struct. To avoid that, we don't use the test framework directly here.
+	if gn1 == nil {
+		t.FailNow()
+	}
+
+	gn2, err := b.GPIOPinByName("2")
+	test.That(t, err, test.ShouldBeNil)
+	if gn2 == nil {
+		t.FailNow()
+	}
 }

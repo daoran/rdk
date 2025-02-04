@@ -5,7 +5,11 @@ import (
 	"os"
 
 	"github.com/pkg/errors"
+	"golang.org/x/exp/maps"
 )
+
+// ErrNoModelInformation is used when there is no model information.
+var ErrNoModelInformation = errors.New("no model information")
 
 // ModelConfig represents all supported fields in a kinematics JSON file.
 type ModelConfig struct {
@@ -14,6 +18,32 @@ type ModelConfig struct {
 	Links        []LinkConfig    `json:"links,omitempty"`
 	Joints       []JointConfig   `json:"joints,omitempty"`
 	DHParams     []DHParamConfig `json:"dhParams,omitempty"`
+	OriginalFile *ModelFile
+}
+
+// ModelFile is a struct that stores the raw bytes of the file used to create the model as well as its extension,
+// which is useful for knowing how to unmarhsal it.
+type ModelFile struct {
+	Bytes     []byte
+	Extension string
+}
+
+// UnmarshalModelJSON will parse the given JSON data into a kinematics model. modelName sets the name of the model,
+// will use the name from the JSON if string is empty.
+func UnmarshalModelJSON(jsonData []byte, modelName string) (Model, error) {
+	m := &ModelConfig{OriginalFile: &ModelFile{Bytes: jsonData, Extension: "json"}}
+
+	// empty data probably means that the robot component has no model information
+	if len(jsonData) == 0 {
+		return nil, ErrNoModelInformation
+	}
+
+	err := json.Unmarshal(jsonData, m)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to unmarshal json file")
+	}
+
+	return m.ParseConfig(modelName)
 }
 
 // ParseConfig converts the ModelConfig struct into a full Model with the name modelName.
@@ -34,12 +64,12 @@ func (cfg *ModelConfig) ParseConfig(modelName string) (Model, error) {
 	case "SVA", "":
 		for _, link := range cfg.Links {
 			if link.ID == World {
-				return nil, NewReservedWordError("link", "world")
+				return nil, NewReservedWordError("link", World)
 			}
 		}
 		for _, joint := range cfg.Joints {
 			if joint.ID == World {
-				return nil, NewReservedWordError("joint", "world")
+				return nil, NewReservedWordError("joint", World)
 			}
 		}
 
@@ -85,32 +115,8 @@ func (cfg *ModelConfig) ParseConfig(modelName string) (Model, error) {
 		return nil, errors.Errorf("unsupported param type: %s, supported params are SVA and DH", cfg.KinParamType)
 	}
 
-	// Determine which transforms have no children
-	parents := map[string]Frame{}
-	// First create a copy of the map
-	for id, trans := range transforms {
-		parents[id] = trans
-	}
-	// Now remove all parents
-	for _, trans := range transforms {
-		delete(parents, parentMap[trans.Name()])
-	}
-
-	if len(parents) > 1 {
-		return nil, errors.New("more than one end effector not supported")
-	}
-	if len(parents) < 1 {
-		return nil, ErrAtLeastOneEndEffector
-	}
-	var eename string
-	// TODO(pl): is there a better way to do all this? Annoying to iterate over a map three times. Maybe if we
-	// implement Child() as well as Parent()?
-	for id := range parents {
-		eename = id
-	}
-
 	// Create an ordered list of transforms
-	model.OrdTransforms, err = sortTransforms(transforms, parentMap, eename, World)
+	model.OrdTransforms, err = sortTransforms(transforms, parentMap)
 	if err != nil {
 		return nil, err
 	}
@@ -128,23 +134,54 @@ func ParseModelJSONFile(filename, modelName string) (Model, error) {
 	return UnmarshalModelJSON(jsonData, modelName)
 }
 
-// ErrNoModelInformation is used when there is no model information.
-var ErrNoModelInformation = errors.New("no model information")
-
-// UnmarshalModelJSON will parse the given JSON data into a kinematics model. modelName sets the name of the model,
-// will use the name from the JSON if string is empty.
-func UnmarshalModelJSON(jsonData []byte, modelName string) (Model, error) {
-	m := &ModelConfig{}
-
-	// empty data probably means that the robot component has no model information
-	if len(jsonData) == 0 {
-		return nil, ErrNoModelInformation
+// Create an ordered list of transforms given a mapping of child to parent frames.
+func sortTransforms(transforms map[string]Frame, parents map[string]string) ([]Frame, error) {
+	// find the end effector first - determine which transforms have no children
+	// copy the map of children -> parents
+	ees := map[string]string{}
+	for child, parent := range parents {
+		ees[child] = parent
+	}
+	// now remove all parents
+	for _, parent := range parents {
+		delete(ees, parent)
+	}
+	// ensure there is only on end effector
+	if len(ees) != 1 {
+		return nil, ErrNeedOneEndEffector
 	}
 
-	err := json.Unmarshal(jsonData, m)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to unmarshal json file")
+	// start the search from the end effector
+	curr := maps.Keys(ees)[0]
+	seen := map[string]bool{curr: true}
+	orderedTransforms := []Frame{}
+	for i := 0; i < len(parents); i++ {
+		frame, ok := transforms[curr]
+		if !ok {
+			return nil, NewFrameNotInListOfTransformsError(curr)
+		}
+		orderedTransforms = append(orderedTransforms, frame)
+
+		// find the parent of the current transform
+		parent, ok := parents[curr]
+		if !ok {
+			return nil, NewParentFrameNotInMapOfParentsError(curr)
+		}
+
+		// make sure it wasn't seen, mark it seen, then add it to the list
+		if seen[parent] {
+			return nil, ErrCircularReference
+		}
+		seen[parent] = true
+
+		// update the frame to add next
+		curr = parent
 	}
 
-	return m.ParseConfig(modelName)
+	// After the above loop, the transforms are in reverse order, so we reverse the list.
+	for i, j := 0, len(orderedTransforms)-1; i < j; i, j = i+1, j-1 {
+		orderedTransforms[i], orderedTransforms[j] = orderedTransforms[j], orderedTransforms[i]
+	}
+
+	return orderedTransforms, nil
 }

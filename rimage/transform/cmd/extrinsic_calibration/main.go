@@ -12,10 +12,11 @@ import (
 	"io"
 	"os"
 
-	"github.com/edaniels/golog"
 	"github.com/pkg/errors"
 	"go.viam.com/utils"
+	"gonum.org/v1/gonum/optimize"
 
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/rimage/transform"
 	"go.viam.com/rdk/spatialmath"
 )
@@ -23,12 +24,14 @@ import (
 func main() {
 	confPtr := flag.String("conf", "", "path of configuration for extrinsic parameter finding")
 	flag.Parse()
-	logger := golog.NewLogger("extrinsic_calibration")
-	calibrate(*confPtr, logger)
+	logger := logging.NewLogger("extrinsic_calibration")
+	calibrate(*confPtr, logger, transform.RunPinholeExtrinsicCalibration)
 	os.Exit(0)
 }
 
-func calibrate(conf string, logger golog.Logger) {
+type calibrationFn = func(prob *optimize.Problem, logger logging.Logger) (spatialmath.Pose, error)
+
+func calibrate(conf string, logger logging.Logger, fn calibrationFn) {
 	cfg, err := readConfig(conf)
 	if err != nil {
 		logger.Fatal(err)
@@ -39,7 +42,7 @@ func calibrate(conf string, logger golog.Logger) {
 		logger.Fatal(err)
 	}
 	// solve the problem
-	pose, err := transform.RunPinholeExtrinsicCalibration(problem, logger)
+	pose, err := fn(problem, logger)
 	// print result to output stream
 	logger.Infof("\nrotation:\n%v\ntranslation:\n%.3f\n", printRot(pose.Orientation()), pose.Point())
 	if err != nil {

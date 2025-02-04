@@ -17,7 +17,7 @@ Viam provides an open source robot architecture that provides robotics functiona
 * Discord: <https://discord.gg/viam>
 * Support: <https://support.viam.com>
 
-If you have a bug or an idea, please open an issue  in our [JIRA project](https://viam.atlassian.net/).
+If you have a bug or an idea, please open an issue [here](https://viam.atlassian.net/servicedesk/customer/portal/7).
 
 ## Building and Using
 
@@ -31,12 +31,11 @@ If you have a bug or an idea, please open an issue  in our [JIRA project](https:
 * Build: `make server`. Then run `./bin/<your architecture>/server [parameters]`
 * Run without building: `go run web/cmd/server/main.go [parameters]`
 
-Example with a dummy configuration: `go run web/cmd/server/main.go -config etc/configs/fake.json`. Then visit http://localhost:8080 to access remote control.
+Example with a dummy configuration: `go run web/cmd/server/main.go -config etc/configs/fake.json`.
 
 ### Examples
+* [CustomResources](https://pkg.go.dev/go.viam.com/rdk/examples/customresources) - example for creating custom resources.
 * [SimpleServer](https://pkg.go.dev/go.viam.com/rdk/examples/simpleserver) - example for creating a simple custom server.
-* [MySensor](https://pkg.go.dev/go.viam.com/rdk/examples/mysensor) - example for creating a custom sensor.
-* [MyComponent](https://pkg.go.dev/go.viam.com/rdk/examples/mycomponent) - example for creating a custom resource API.
 
 ### SDKs
 
@@ -47,6 +46,13 @@ Multiple SDKs are available for writing client applications that interface with 
 * Typescript: [Docs](https://ts.viam.dev/), [Repository](https://github.com/viamrobotics/viam-typescript-sdk/)
 * C++: [Docs](https://cpp.viam.dev/), [Repository](https://github.com/viamrobotics/viam-cpp-sdk/)
 * Rust: [Repository](https://github.com/viamrobotics/viam-rust-sdk)
+
+### Environment Variable Settings
+
+| **Environment Variable**            | **Behavior**                                                   | **Default Value**    |
+|-------------------------------------|----------------------------------------------------------------|----------------------|
+| VIAM_RESOURCE_CONFIGURATION_TIMEOUT | Duration for which resources are allowed to (re)configure.     | 1 minute             |
+| VIAM_MODULE_STARTUP_TIMEOUT         | Duration for which modules are allowed to startup.             | 5 minutes            |
 
 ## Development
 
@@ -76,20 +82,6 @@ The API is defined with Protocol Buffers/gRPC which can be found at https://gith
 > archive, summarize the relevant points of the discussion.
 
 
-### Frontend
-
-See documentation in [Frontend Readme](./web/frontend/README.md).
-
-To start the client development environment, first run the same `go run` command mentioned in Building and Using, but with the environmental variable `ENV=development` (e.g. `ENV=development go run web/cmd/server/main.go -debug -config etc/configs/fake.json`).
-
-If you are in the `web/frontend` directory this is aliased as `npm run server`.
-
-You will additionally need to start a development server for client assets. To do this, navigate to `web/frontend` and run `npm start` (and `npm install` if doing this for the first time) in a new terminal tab. Visit `localhost:8080` to view the app, not `localhost:5173`. The latter is the above-mentioned hot module replacement server that rebuilds frontend asset changes.
-
-#### Frontend against a remote host
-
-See documentation in [Direct Remote Control](./web/cmd/directremotecontrol/main.go).
-
 ### License check
 
 We run [LicenseFinder](https://github.com/pivotal/LicenseFinder) in CI to verify 3rd-party libraries have approved software licenses.
@@ -97,7 +89,7 @@ If you add a 3rd-party library to this project, please run `make license-check` 
 
 For maintainers, here is how to make some common license policy changes:
 
-#### Permit a new license (e.g. MIT): 
+#### Permit a new license (e.g. MIT):
 https://github.com/pivotal/LicenseFinder#permitting-licenses
 ```
 license_finder permitted_licenses add MIT
@@ -131,10 +123,10 @@ Support is not well tested yet.
 #### Known Issues
 
 * motion planning is not supported yet (https://viam.atlassian.net/browse/RSDK-1772).
-* video streaming is not supported yet (https://viam.atlassian.net/browse/RSDK-1771). 
+* video streaming is not supported yet (https://viam.atlassian.net/browse/RSDK-1771).
 * rpc: ICE between local connections found via ICE mDNS appear to be flaky in the establishment phase.
 
 ## License
-Copyright 2021-2022 Viam Inc.
+Copyright 2021-2024 Viam Inc.
 
 AGPLv3 - See [LICENSE](https://github.com/viamrobotics/rdk/blob/main/LICENSE) file

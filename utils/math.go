@@ -11,6 +11,16 @@ import (
 	"gonum.org/v1/gonum/stat/distuv"
 )
 
+// MetersToMM converts a value in meters to a value in mm.
+func MetersToMM(m float64) float64 {
+	return m * 1000
+}
+
+// MMToMeters converts a value in mm to a value in meters.
+func MMToMeters(mm float64) float64 {
+	return 0.001 * mm
+}
+
 // DegToRad converts degrees to radians.
 func DegToRad(degrees float64) float64 {
 	return degrees * math.Pi / 180
@@ -136,6 +146,11 @@ func SampleRandomIntRange(min, max int, r *rand.Rand) int {
 
 // Float64AlmostEqual compares two float64s and returns if the difference between them is less than epsilon.
 func Float64AlmostEqual(a, b, epsilon float64) bool {
+	return (a-b) < epsilon && (b-a) < epsilon
+}
+
+// Float32AlmostEqual compares two float32s and returns if the difference between them is less than epsilon.
+func Float32AlmostEqual(a, b, epsilon float32) bool {
 	return (a-b) < epsilon && (b-a) < epsilon
 }
 

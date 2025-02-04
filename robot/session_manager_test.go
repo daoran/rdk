@@ -5,11 +5,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/edaniels/golog"
 	"go.viam.com/test"
 	"go.viam.com/utils/testutils"
 
 	"go.viam.com/rdk/config"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/robot"
 	"go.viam.com/rdk/session"
 	"go.viam.com/rdk/testutils/inject"
@@ -17,14 +17,16 @@ import (
 
 func TestSessionManager(t *testing.T) {
 	ctx := context.Background()
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	r := &inject.Robot{}
 
-	r.LoggerFunc = func() golog.Logger {
+	r.LoggerFunc = func() logging.Logger {
 		return logger
 	}
 
 	sm := robot.NewSessionManager(r, config.DefaultSessionHeartbeatWindow)
+	// The deferred Close is necessary in case any of the asserts between here and the second Close fail.
+	// Double closing the session manager will not cause issues.
 	defer sm.Close()
 
 	// Start two arbitrary sessions.
@@ -51,6 +53,12 @@ func TestSessionManager(t *testing.T) {
 
 	// Assert that fooSess and barSess can be found with All.
 	allSessions := sm.All()
+
+	// The following test assertions use reflection to deep-equals the session objects.
+	// The session manager's expireLoop might be writing to those fields while reflection is reading those fields.
+	// Thus we close the session manager before proceeding to avoid a data race.
+	sm.Close()
+
 	test.That(t, len(allSessions), test.ShouldEqual, 2)
 	test.That(t, allSessions[0], test.ShouldBeIn, fooSess, barSess)
 	test.That(t, allSessions[1], test.ShouldBeIn, fooSess, barSess)
@@ -58,10 +66,10 @@ func TestSessionManager(t *testing.T) {
 
 func TestSessionManagerExpiredSessions(t *testing.T) {
 	ctx := context.Background()
-	logger, logs := golog.NewObservedTestLogger(t)
+	logger, logs := logging.NewObservedTestLogger(t)
 	r := &inject.Robot{}
 
-	r.LoggerFunc = func() golog.Logger {
+	r.LoggerFunc = func() logging.Logger {
 		return logger
 	}
 

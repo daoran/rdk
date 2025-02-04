@@ -16,7 +16,7 @@ import (
 
 // ParallelFactor controls the max level of parallelization. This might be useful
 // to set in tests where too much parallelism actually slows tests down in
-// aggregate.
+// aggregate. MUST NOT be used with t.Parallel() or via init()!
 var ParallelFactor = runtime.GOMAXPROCS(0)
 
 func init() {
@@ -46,7 +46,7 @@ func GroupWorkParallel(ctx context.Context, totalSize int, before BeforeParallel
 	if totalSize > ParallelFactor {
 		extra = totalSize % ParallelFactor
 	}
-	groupSize := int(math.Ceil(float64(totalSize) / float64(ParallelFactor)))
+	groupSize := int(math.Floor(float64(totalSize) / float64(ParallelFactor)))
 
 	numGroups := ParallelFactor
 	before(numGroups)

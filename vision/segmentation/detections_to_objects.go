@@ -2,8 +2,9 @@ package segmentation
 
 import (
 	"context"
+	"image"
 
-	"github.com/mitchellh/mapstructure"
+	"github.com/go-viper/mapstructure/v2"
 	"github.com/pkg/errors"
 
 	"go.viam.com/rdk/components/camera"
@@ -34,6 +35,30 @@ func (dsc *DetectionSegmenterConfig) ConvertAttributes(am utils.AttributeMap) er
 	return decoder.Decode(am)
 }
 
+func cameraToProjector(
+	ctx context.Context,
+	source camera.Camera,
+) (transform.Projector, error) {
+	if source == nil {
+		return nil, errors.New("cannot have a nil source")
+	}
+	props, err := source.Properties(ctx)
+	if err != nil {
+		return nil, camera.NewPropertiesError("source camera")
+	}
+	if props.IntrinsicParams == nil {
+		return &transform.ParallelProjection{}, nil
+	}
+	cameraModel := transform.PinholeCameraModel{}
+	cameraModel.PinholeCameraIntrinsics = props.IntrinsicParams
+
+	if props.DistortionParams != nil {
+		cameraModel.Distortion = props.DistortionParams
+	}
+
+	return &cameraModel, nil
+}
+
 // DetectionSegmenter will take an objectdetector.Detector and turn it into a Segementer.
 // The params for the segmenter are "mean_k" and "sigma" for the statistical filter on the point clouds.
 func DetectionSegmenter(detector objectdetection.Detector, meanK int, sigma, confidenceThresh float64) (Segmenter, error) {
@@ -51,17 +76,31 @@ func DetectionSegmenter(detector objectdetection.Detector, meanK int, sigma, con
 		}
 	}
 	// return the segmenter
-	seg := func(ctx context.Context, src camera.VideoSource) ([]*vision.Object, error) {
-		proj, err := src.Projector(ctx)
+	seg := func(ctx context.Context, src camera.Camera) ([]*vision.Object, error) {
+		proj, err := cameraToProjector(ctx, src)
 		if err != nil {
 			return nil, err
 		}
 		// get the 3D detections, and turn them into 2D image and depthmap
-		pc, err := src.NextPointCloud(ctx)
+		imgs, _, err := src.Images(ctx)
 		if err != nil {
 			return nil, errors.Wrapf(err, "detection segmenter")
 		}
-		img, dm, err := proj.PointCloudToRGBD(pc)
+		var img *rimage.Image
+		var dmimg image.Image
+		for _, i := range imgs {
+			thisI := i
+			if i.SourceName == "color" {
+				img = rimage.ConvertImage(thisI.Image)
+			}
+			if i.SourceName == "depth" {
+				dmimg = thisI.Image
+			}
+		}
+		if img == nil || dmimg == nil {
+			return nil, errors.New("source camera's getImages method did not have 'color' and 'depth' images")
+		}
+		dm, err := rimage.ConvertImageToDepthMap(ctx, dmimg)
 		if err != nil {
 			return nil, err
 		}

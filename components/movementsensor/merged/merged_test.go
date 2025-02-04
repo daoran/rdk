@@ -7,12 +7,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/edaniels/golog"
 	"github.com/golang/geo/r3"
 	geo "github.com/kellydunn/golang-geo"
 	"go.viam.com/test"
 
 	"go.viam.com/rdk/components/movementsensor"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/spatialmath"
 	"go.viam.com/rdk/testutils/inject"
@@ -79,11 +79,19 @@ func setupMovementSensor(
 		}
 		return &prop, nil
 	}
-	ms.AccuracyFunc = func(ctx context.Context, exta map[string]interface{}) (map[string]float32, error) {
+	ms.AccuracyFunc = func(ctx context.Context, exta map[string]interface{}) (*movementsensor.Accuracy, error,
+	) {
 		if errAcc {
 			return nil, errAccuracy
 		}
-		return map[string]float32{"accuracy": 32}, nil
+		acc := &movementsensor.Accuracy{
+			AccuracyMap:        map[string]float32{"accuracy": 32},
+			Hdop:               float32(math.NaN()),
+			Vdop:               float32(math.NaN()),
+			NmeaFix:            -1,
+			CompassDegreeError: float32(math.NaN()),
+		}
+		return acc, nil
 	}
 
 	switch {
@@ -156,7 +164,7 @@ func TestValidate(t *testing.T) {
 
 func TestCreation(t *testing.T) {
 	ctx := context.Background()
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 
 	// doesn't pass configuration
 	conf := setUpCfg(
@@ -240,7 +248,7 @@ func TestCreation(t *testing.T) {
 
 	accuracies, err := ms.Accuracy(ctx, nil)
 	test.That(t, err, test.ShouldBeNil)
-	test.That(t, accuracies, test.ShouldResemble,
+	test.That(t, accuracies.AccuracyMap, test.ShouldResemble,
 		map[string]float32{
 			"goodAngVel_accuracy": 32,
 			"goodLinVel_accuracy": 32,
@@ -314,7 +322,7 @@ func TestCreation(t *testing.T) {
 
 	accuracies, err = ms.Accuracy(ctx, nil)
 	test.That(t, err, test.ShouldBeNil)
-	test.That(t, accuracies, test.ShouldResemble,
+	test.That(t, accuracies.AccuracyMap, test.ShouldResemble,
 		map[string]float32{
 			"goodOri_accuracy":     32,
 			"goodPos_accuracy":     32,
@@ -343,8 +351,7 @@ func TestCreation(t *testing.T) {
 
 	accuracies, err = ms.Accuracy(ctx, nil)
 	test.That(t, err, test.ShouldNotBeNil)
-
-	for k, v := range accuracies {
+	for k, v := range accuracies.AccuracyMap {
 		test.That(t, k, test.ShouldContainSubstring, errStrAccuracy)
 		test.That(t, math.IsNaN(float64(v)), test.ShouldBeTrue)
 	}
