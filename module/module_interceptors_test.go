@@ -2,18 +2,18 @@ package module_test
 
 import (
 	"context"
+	"fmt"
 	"os"
-	"strconv"
+	"runtime"
 	"testing"
+	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/google/uuid"
 	commonpb "go.viam.com/api/common/v1"
 	genericpb "go.viam.com/api/component/generic/v1"
 	robotpb "go.viam.com/api/robot/v1"
 	"go.viam.com/test"
 	goutils "go.viam.com/utils"
-	"go.viam.com/utils/pexec"
 	"go.viam.com/utils/testutils"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
@@ -21,35 +21,47 @@ import (
 
 	"go.viam.com/rdk/components/generic"
 	"go.viam.com/rdk/config"
+	rdkgrpc "go.viam.com/rdk/grpc"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
+	robotimpl "go.viam.com/rdk/robot/impl"
 	rtestutils "go.viam.com/rdk/testutils"
 	"go.viam.com/rdk/testutils/robottestutils"
-	"go.viam.com/rdk/utils"
 )
 
 func TestOpID(t *testing.T) {
-	logger := golog.NewTestLogger(t)
-	cfgFilename, port, err := makeConfig(t, logger)
-	test.That(t, err, test.ShouldBeNil)
-	defer func() {
-		test.That(t, os.Remove(cfgFilename), test.ShouldBeNil)
-	}()
+	ctx := context.Background()
 
-	serverPath, err := rtestutils.BuildTempModule(t, "web/cmd/server/")
-	test.That(t, err, test.ShouldBeNil)
+	if runtime.GOARCH == "arm" {
+		t.Skip("skipping on 32-bit ARM -- subprocess build warnings cause failure")
+	}
+	logger, logObserver := logging.NewObservedTestLogger(t)
 
-	server := pexec.NewManagedProcess(pexec.ProcessConfig{
-		Name: serverPath,
-		Args: []string{"-config", cfgFilename},
-		CWD:  utils.ResolveFile("./"),
-		Log:  true,
-	}, logger)
+	var port int
+	var success bool
+	for portTryNum := 0; portTryNum < 10; portTryNum++ {
+		cfgFilename, p, err := makeConfig(t, logger)
+		port = p
+		test.That(t, err, test.ShouldBeNil)
+		defer func() {
+			test.That(t, os.Remove(cfgFilename), test.ShouldBeNil)
+		}()
 
-	err = server.Start(context.Background())
-	test.That(t, err, test.ShouldBeNil)
-	defer func() {
-		test.That(t, server.Stop(), test.ShouldBeNil)
-	}()
+		server := robottestutils.ServerAsSeparateProcess(t, cfgFilename, logger)
+		err = server.Start(context.Background())
+		test.That(t, err, test.ShouldBeNil)
+
+		if success = robottestutils.WaitForServing(logObserver, port); success {
+			defer func() {
+				test.That(t, server.Stop(), test.ShouldBeNil)
+			}()
+			break
+		}
+		logger.Infow("Port in use. Restarting on new port.", "port", port, "err", err)
+		server.Stop()
+		continue
+	}
+	test.That(t, success, test.ShouldBeTrue)
 
 	conn, err := robottestutils.Connect(port)
 	test.That(t, err, test.ShouldBeNil)
@@ -63,6 +75,16 @@ func TestOpID(t *testing.T) {
 	var opIDIncoming string
 	md := metadata.New(map[string]string{"opid": opIDOutgoing})
 	mdCtx := metadata.NewOutgoingContext(ctx, md)
+
+	// Wait for generic helper to build on machine (machine to report a state of "running.")
+	for {
+		mStatus, err := rc.GetMachineStatus(ctx, &robotpb.GetMachineStatusRequest{})
+		test.That(t, err, test.ShouldBeNil)
+		if mStatus.State == robotpb.GetMachineStatusResponse_STATE_RUNNING {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 
 	// Do this twice, once with no opID set, and a second with a set opID.
 	for name, cCtx := range map[string]context.Context{"default context": ctx, "context with opid set": mdCtx} {
@@ -132,25 +154,74 @@ func TestOpID(t *testing.T) {
 	}
 }
 
-func makeConfig(t *testing.T, logger golog.Logger) (string, string, error) {
-	// Precompile module to avoid timeout issues when building takes too long.
-	modPath, err := rtestutils.BuildTempModule(t, "module/testmodule")
-	if err != nil {
-		return "", "", err
-	}
+func TestModuleClientTimeoutInterceptor(t *testing.T) {
+	ctx := context.Background()
+	logger := logging.NewTestLogger(t)
 
-	p, err := goutils.TryReserveRandomPort()
-	if err != nil {
-		return "", "", err
+	// Precompile module to avoid timeout issues when building takes too long.
+	modPath := rtestutils.BuildTempModule(t, "module/testmodule")
+	cfg := &config.Config{
+		Modules: []config.Module{{
+			Name:    "test",
+			ExePath: modPath,
+		}},
+		Components: []resource.Config{{
+			API:   generic.API,
+			Model: resource.NewModel("rdk", "test", "helper"),
+			Name:  "helper1",
+		}},
 	}
-	port := strconv.Itoa(p)
+	r, err := robotimpl.New(ctx, cfg, logger)
+	test.That(t, err, test.ShouldBeNil)
+	defer func() {
+		test.That(t, r.Close(ctx), test.ShouldBeNil)
+	}()
+
+	helper1, err := r.ResourceByName(generic.Named("helper1"))
+	test.That(t, err, test.ShouldBeNil)
+
+	// Artificially set default method timeout to have timed out in the past.
+	origDefaultMethodTimeout := rdkgrpc.DefaultMethodTimeout
+	rdkgrpc.DefaultMethodTimeout = -time.Nanosecond
+	defer func() {
+		rdkgrpc.DefaultMethodTimeout = origDefaultMethodTimeout
+	}()
+
+	t.Run("client respects default timeout", func(t *testing.T) {
+		_, err = helper1.DoCommand(ctx, map[string]interface{}{"command": "echo"})
+
+		test.That(t, err, test.ShouldNotBeNil)
+		test.That(t, err.Error(), test.ShouldResemble,
+			"rpc error: code = DeadlineExceeded desc = context deadline exceeded")
+	})
+	t.Run("deadline not overwritten", func(t *testing.T) {
+		ctxWithDeadline, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+
+		_, err = helper1.DoCommand(ctxWithDeadline, map[string]interface{}{"command": "echo"})
+		test.That(t, err, test.ShouldBeNil)
+	})
+}
+
+func makeConfig(t *testing.T, logger logging.Logger) (string, int, error) {
+	// Precompile module to avoid timeout issues when building takes too long.
+	modPath := rtestutils.BuildTempModule(t, "module/testmodule")
+
+	port, err := goutils.TryReserveRandomPort()
+	if err != nil {
+		return "", 0, err
+	}
 
 	cfg := config.Config{
 		Modules: []config.Module{{
 			Name:    "TestModule",
 			ExePath: modPath,
 		}},
-		Network: config.NetworkConfig{NetworkConfigData: config.NetworkConfigData{BindAddress: "localhost:" + port}},
+		Network: config.NetworkConfig{
+			NetworkConfigData: config.NetworkConfigData{
+				BindAddress: fmt.Sprintf("localhost:%d", port),
+			},
+		},
 		Components: []resource.Config{{
 			API:   generic.API,
 			Model: resource.NewModel("rdk", "test", "helper"),

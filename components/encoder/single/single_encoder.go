@@ -27,13 +27,20 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/edaniels/golog"
 	"github.com/pkg/errors"
+	"go.uber.org/multierr"
 	"go.viam.com/utils"
 
 	"go.viam.com/rdk/components/board"
 	"go.viam.com/rdk/components/encoder"
+	"go.viam.com/rdk/components/motor"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
+)
+
+const (
+	isSingle          = "single"
+	directionAttached = "direction"
 )
 
 var singleModel = resource.DefaultModelFamily.WithModel("single")
@@ -66,11 +73,9 @@ type Encoder struct {
 	diPinName string
 
 	positionType encoder.PositionType
-	logger       golog.Logger
+	logger       logging.Logger
 
-	cancelCtx               context.Context
-	cancelFunc              func()
-	activeBackgroundWorkers sync.WaitGroup
+	workers *utils.StoppableWorkers
 }
 
 // Pin describes the configuration of Pins for a Single encoder.
@@ -89,11 +94,11 @@ func (conf *Config) Validate(path string) ([]string, error) {
 	var deps []string
 
 	if conf.Pins.I == "" {
-		return nil, utils.NewConfigValidationFieldRequiredError(path, "i")
+		return nil, resource.NewConfigValidationFieldRequiredError(path, "i")
 	}
 
 	if len(conf.BoardName) == 0 {
-		return nil, utils.NewConfigValidationFieldRequiredError(path, "board")
+		return nil, resource.NewConfigValidationFieldRequiredError(path, "board")
 	}
 	deps = append(deps, conf.BoardName)
 
@@ -103,8 +108,8 @@ func (conf *Config) Validate(path string) ([]string, error) {
 // AttachDirectionalAwareness to pre-created encoder.
 func (e *Encoder) AttachDirectionalAwareness(da DirectionAware) {
 	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.m = da
-	e.mu.Unlock()
 }
 
 // NewSingleEncoder creates a new Encoder.
@@ -112,14 +117,11 @@ func NewSingleEncoder(
 	ctx context.Context,
 	deps resource.Dependencies,
 	conf resource.Config,
-	logger golog.Logger,
+	logger logging.Logger,
 ) (encoder.Encoder, error) {
-	cancelCtx, cancelFunc := context.WithCancel(context.Background())
 	e := &Encoder{
 		Named:        conf.ResourceName().AsNamed(),
 		logger:       logger,
-		cancelCtx:    cancelCtx,
-		cancelFunc:   cancelFunc,
 		position:     0,
 		positionType: encoder.PositionTypeTicks,
 	}
@@ -135,15 +137,16 @@ func (e *Encoder) Reconfigure(
 	deps resource.Dependencies,
 	conf resource.Config,
 ) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	newConf, err := resource.NativeConfig[*Config](conf)
 	if err != nil {
 		return err
 	}
 
-	e.mu.Lock()
 	existingBoardName := e.boardName
 	existingDIPinName := e.diPinName
-	e.mu.Unlock()
 
 	needRestart := existingBoardName != newConf.BoardName ||
 		existingDIPinName != newConf.Pins.I
@@ -153,48 +156,50 @@ func (e *Encoder) Reconfigure(
 		return err
 	}
 
-	di, ok := board.DigitalInterruptByName(newConf.Pins.I)
-	if !ok {
-		return errors.Errorf("cannot find pin (%s) for Encoder", newConf.Pins.I)
+	di, err := board.DigitalInterruptByName(newConf.Pins.I)
+	if err != nil {
+		return multierr.Combine(errors.Errorf("cannot find pin (%s) for Encoder", newConf.Pins.I), err)
 	}
 
 	if !needRestart {
 		return nil
 	}
-	utils.UncheckedError(e.Close(ctx))
-	cancelCtx, cancelFunc := context.WithCancel(context.Background())
-	e.cancelCtx = cancelCtx
-	e.cancelFunc = cancelFunc
 
-	e.mu.Lock()
 	e.I = di
 	e.boardName = newConf.BoardName
 	e.diPinName = newConf.Pins.I
 	// state is not really valid anymore
 	atomic.StoreInt64(&e.position, 0)
-	e.mu.Unlock()
 
-	e.Start(ctx)
-
+	if e.workers != nil {
+		e.workers.Stop() // Shut down the old interrupt stream
+	}
+	e.start(board) // Start up the new interrupt stream
 	return nil
 }
 
-// Start starts the Encoder background thread.
-func (e *Encoder) Start(ctx context.Context) {
+// start starts the Encoder background thread. It should only be called when the encoder's
+// background workers have been stopped (or never started).
+func (e *Encoder) start(b board.Board) {
+	e.workers = utils.NewBackgroundStoppableWorkers()
+
 	encoderChannel := make(chan board.Tick)
-	e.I.AddCallback(encoderChannel)
-	e.activeBackgroundWorkers.Add(1)
-	utils.ManagedGo(func() {
-		defer e.I.RemoveCallback(encoderChannel)
+	err := b.StreamTicks(e.workers.Context(), []board.DigitalInterrupt{e.I}, encoderChannel, nil)
+	if err != nil {
+		utils.Logger.Errorw("error getting interrupt ticks", "error", err)
+		return
+	}
+
+	e.workers.Add(func(cancelCtx context.Context) {
 		for {
 			select {
-			case <-e.cancelCtx.Done():
+			case <-cancelCtx.Done():
 				return
 			default:
 			}
 
 			select {
-			case <-e.cancelCtx.Done():
+			case <-cancelCtx.Done():
 				return
 			case <-encoderChannel:
 			}
@@ -208,10 +213,12 @@ func (e *Encoder) Start(ctx context.Context) {
 					atomic.AddInt64(&e.position, dir)
 				}
 			} else {
-				e.logger.Warn("received tick for encoder that isn't connected to a motor; ignoring")
+				// if no motor is attached to the encoder, increase in positive direction.
+				e.logger.Debug("no motor is attached to the encoder, increasing ticks count in the positive direction only")
+				atomic.AddInt64(&e.position, 1)
 			}
 		}
-	}, e.activeBackgroundWorkers.Done)
+	})
 }
 
 // Position returns the current position in terms of ticks or
@@ -221,6 +228,9 @@ func (e *Encoder) Position(
 	positionType encoder.PositionType,
 	extra map[string]interface{},
 ) (float64, encoder.PositionType, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	if positionType == encoder.PositionTypeDegrees {
 		return math.NaN(), encoder.PositionTypeUnspecified, encoder.NewPositionTypeUnsupportedError(positionType)
 	}
@@ -245,7 +255,26 @@ func (e *Encoder) Properties(ctx context.Context, extra map[string]interface{}) 
 
 // Close shuts down the Encoder.
 func (e *Encoder) Close(ctx context.Context) error {
-	e.cancelFunc()
-	e.activeBackgroundWorkers.Wait()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// In unit tests, we construct encoders without calling NewSingleEncoder(), which means they
+	// might not have called e.start(), so might not have initialized e.workers. Don't crash if
+	// that happens.
+	if e.workers != nil {
+		e.workers.Stop() // This also shuts down the interrupt stream.
+	}
 	return nil
+}
+
+// DoCommand uses a map string to run custom functionality of a single encoder.
+func (e *Encoder) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
+	resp := make(map[string]interface{})
+
+	if m, ok := cmd[isSingle].(motor.Motor); ok {
+		e.AttachDirectionalAwareness(m.(DirectionAware))
+		resp[directionAttached] = true
+	}
+
+	return resp, nil
 }

@@ -4,11 +4,12 @@ import (
 	"context"
 	"testing"
 
-	"github.com/edaniels/golog"
 	"go.viam.com/test"
 	"go.viam.com/utils/artifact"
 
+	"go.viam.com/rdk/logging"
 	pc "go.viam.com/rdk/pointcloud"
+	"go.viam.com/rdk/spatialmath"
 	"go.viam.com/rdk/testutils/inject"
 	"go.viam.com/rdk/utils"
 	"go.viam.com/rdk/vision"
@@ -54,7 +55,7 @@ func TestRadiusClusteringValidate(t *testing.T) {
 // get a segmentation of a pointcloud and calculate each object's center.
 func TestPixelSegmentation(t *testing.T) {
 	t.Parallel()
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	injectCamera := &inject.Camera{}
 	injectCamera.NextPointCloudFunc = func(ctx context.Context) (pc.PointCloud, error) {
 		return pc.NewFromLASFile(artifact.MustPath("pointcloud/test.las"), logger)
@@ -80,7 +81,7 @@ func TestPixelSegmentation(t *testing.T) {
 
 func TestPixelSegmentationNoFiltering(t *testing.T) {
 	t.Parallel()
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	injectCamera := &inject.Camera{}
 	injectCamera.NextPointCloudFunc = func(ctx context.Context) (pc.PointCloud, error) {
 		return pc.NewFromLASFile(artifact.MustPath("pointcloud/test.las"), logger)
@@ -117,7 +118,7 @@ func testSegmentation(t *testing.T, segments []*vision.Object, expectedLabel str
 		}
 		test.That(t, box, test.ShouldNotBeNil)
 		test.That(t, err, test.ShouldBeNil)
-		test.That(t, box.AlmostEqual(seg.Geometry), test.ShouldBeTrue)
+		test.That(t, spatialmath.GeometriesAlmostEqual(box, seg.Geometry), test.ShouldBeTrue)
 		test.That(t, box.Label(), test.ShouldEqual, expectedLabel)
 	}
 }

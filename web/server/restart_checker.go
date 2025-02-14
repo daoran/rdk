@@ -5,12 +5,11 @@ import (
 	"context"
 	"time"
 
-	"github.com/edaniels/golog"
 	apppb "go.viam.com/api/app/v1"
-	"go.viam.com/utils"
 	"go.viam.com/utils/rpc"
 
 	"go.viam.com/rdk/config"
+	"go.viam.com/rdk/logging"
 )
 
 const (
@@ -20,22 +19,21 @@ const (
 
 type needsRestartChecker interface {
 	needsRestart(ctx context.Context) (bool, time.Duration, error)
-	close()
 }
 
 type needsRestartCheckerGRPC struct {
 	cfg    *config.Cloud
-	logger golog.Logger
+	logger logging.Logger
 	client rpc.ClientConn
 }
 
-func (c *needsRestartCheckerGRPC) close() {
-	if c.client != nil {
-		utils.UncheckedErrorFunc(c.client.Close)
-	}
-}
+// ForceRestart lets random other parts of the app request an exit.
+var ForceRestart bool
 
 func (c *needsRestartCheckerGRPC) needsRestart(ctx context.Context) (bool, time.Duration, error) {
+	if ForceRestart {
+		return true, minNeedsRestartCheckInterval, nil
+	}
 	service := apppb.NewRobotServiceClient(c.client)
 	res, err := service.NeedsRestart(ctx, &apppb.NeedsRestartRequest{Id: c.cfg.ID})
 	if err != nil {
@@ -53,15 +51,10 @@ func (c *needsRestartCheckerGRPC) needsRestart(ctx context.Context) (bool, time.
 	return res.MustRestart, restartInterval, nil
 }
 
-func newRestartChecker(ctx context.Context, cfg *config.Cloud, logger golog.Logger) (needsRestartChecker, error) {
-	client, err := config.CreateNewGRPCClient(ctx, cfg, logger)
-	if err != nil {
-		return nil, err
-	}
-
+func newRestartChecker(cfg *config.Cloud, logger logging.Logger, client rpc.ClientConn) needsRestartChecker {
 	return &needsRestartCheckerGRPC{
 		cfg:    cfg,
 		logger: logger,
 		client: client,
-	}, nil
+	}
 }

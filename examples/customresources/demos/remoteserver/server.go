@@ -5,16 +5,16 @@ import (
 	"context"
 	"errors"
 
-	"github.com/edaniels/golog"
 	goutils "go.viam.com/utils"
 
 	"go.viam.com/rdk/config"
 	_ "go.viam.com/rdk/examples/customresources/models/mygizmo"
+	"go.viam.com/rdk/logging"
 	robotimpl "go.viam.com/rdk/robot/impl"
 	"go.viam.com/rdk/robot/web"
 )
 
-var logger = golog.NewDebugLogger("gizmoserver")
+var logger = logging.NewDebugLogger("gizmoserver")
 
 // Arguments for the command.
 type Arguments struct {
@@ -25,7 +25,7 @@ func main() {
 	goutils.ContextualMain(mainWithArgs, logger)
 }
 
-func mainWithArgs(ctx context.Context, args []string, logger golog.Logger) (err error) {
+func mainWithArgs(ctx context.Context, args []string, logger logging.Logger) (err error) {
 	var argsParsed Arguments
 	if err := goutils.ParseFlags(args, &argsParsed); err != nil {
 		return err
@@ -35,7 +35,7 @@ func mainWithArgs(ctx context.Context, args []string, logger golog.Logger) (err 
 		return errors.New("please specify a config file through the -config parameter")
 	}
 
-	cfg, err := config.Read(ctx, argsParsed.ConfigFile, logger)
+	cfg, err := config.Read(ctx, argsParsed.ConfigFile, logger, nil)
 	if err != nil {
 		return err
 	}

@@ -2,9 +2,7 @@ package motion
 
 import (
 	"context"
-	"math"
 
-	geo "github.com/kellydunn/golang-geo"
 	"github.com/pkg/errors"
 	commonpb "go.viam.com/api/common/v1"
 	pb "go.viam.com/api/service/motion/v1"
@@ -12,7 +10,6 @@ import (
 	"go.viam.com/rdk/protoutils"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/resource"
-	"go.viam.com/rdk/spatialmath"
 )
 
 // serviceServer implements the MotionService from motion.proto.
@@ -32,18 +29,11 @@ func (server *serviceServer) Move(ctx context.Context, req *pb.MoveRequest) (*pb
 	if err != nil {
 		return nil, err
 	}
-	worldState, err := referenceframe.WorldStateFromProtobuf(req.GetWorldState())
+	r, err := MoveReqFromProto(req)
 	if err != nil {
 		return nil, err
 	}
-	success, err := svc.Move(
-		ctx,
-		protoutils.ResourceNameFromProto(req.GetComponentName()),
-		referenceframe.ProtobufToPoseInFrame(req.GetDestination()),
-		worldState,
-		req.GetConstraints(),
-		req.Extra.AsMap(),
-	)
+	success, err := svc.Move(ctx, r)
 	return &pb.MoveResponse{Success: success}, err
 }
 
@@ -52,14 +42,17 @@ func (server *serviceServer) MoveOnMap(ctx context.Context, req *pb.MoveOnMapReq
 	if err != nil {
 		return nil, err
 	}
-	success, err := svc.MoveOnMap(
-		ctx,
-		protoutils.ResourceNameFromProto(req.GetComponentName()),
-		spatialmath.NewPoseFromProtobuf(req.GetDestination()),
-		protoutils.ResourceNameFromProto(req.GetSlamServiceName()),
-		req.Extra.AsMap(),
-	)
-	return &pb.MoveOnMapResponse{Success: success}, err
+	r, err := moveOnMapRequestFromProto(req)
+	if err != nil {
+		return nil, err
+	}
+
+	id, err := svc.MoveOnMap(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+
+	return &pb.MoveOnMapResponse{ExecutionId: id.String()}, nil
 }
 
 func (server *serviceServer) MoveOnGlobe(ctx context.Context, req *pb.MoveOnGlobeRequest) (*pb.MoveOnGlobeResponse, error) {
@@ -67,78 +60,17 @@ func (server *serviceServer) MoveOnGlobe(ctx context.Context, req *pb.MoveOnGlob
 	if err != nil {
 		return nil, err
 	}
-	if req.Destination == nil {
-		return nil, errors.New("Must provide a destination")
+	r, err := moveOnGlobeRequestFromProto(req)
+	if err != nil {
+		return nil, err
 	}
 
-	// Optionals
-	heading := math.NaN()
-	if req.Heading != nil {
-		heading = req.GetHeading()
-	}
-	obstaclesProto := req.GetObstacles()
-	obstacles := make([]*spatialmath.GeoObstacle, 0, len(obstaclesProto))
-	for _, eachProtoObst := range obstaclesProto {
-		convObst, err := spatialmath.GeoObstacleFromProtobuf(eachProtoObst)
-		if err != nil {
-			return nil, err
-		}
-		obstacles = append(obstacles, convObst)
-	}
-	motionCfg := setupMotionConfiguration(req.MotionConfiguration)
-
-	success, err := svc.MoveOnGlobe(
-		ctx,
-		protoutils.ResourceNameFromProto(req.GetComponentName()),
-		geo.NewPoint(req.GetDestination().GetLatitude(), req.GetDestination().GetLongitude()),
-		heading,
-		protoutils.ResourceNameFromProto(req.GetMovementSensorName()),
-		obstacles,
-		&motionCfg,
-		req.Extra.AsMap(),
-	)
-	return &pb.MoveOnGlobeResponse{Success: success}, err
-}
-
-func setupMotionConfiguration(motionCfg *pb.MotionConfiguration) MotionConfiguration {
-	visionSvc := []resource.Name{}
-	planDeviationM := 0.
-	positionPollingHz := 0.
-	obstaclePollingHz := 0.
-	linearMPerSec := 0.
-	angularDegsPerSec := 0.
-
-	if motionCfg != nil {
-		if motionCfg.VisionServices != nil {
-			for _, name := range motionCfg.GetVisionServices() {
-				visionSvc = append(visionSvc, protoutils.ResourceNameFromProto(name))
-			}
-		}
-		if motionCfg.PositionPollingFrequencyHz != nil {
-			positionPollingHz = motionCfg.GetPositionPollingFrequencyHz()
-		}
-		if motionCfg.ObstaclePollingFrequencyHz != nil {
-			obstaclePollingHz = motionCfg.GetObstaclePollingFrequencyHz()
-		}
-		if motionCfg.PlanDeviationM != nil {
-			planDeviationM = motionCfg.GetPlanDeviationM()
-		}
-		if motionCfg.LinearMPerSec != nil {
-			linearMPerSec = motionCfg.GetLinearMPerSec()
-		}
-		if motionCfg.AngularDegsPerSec != nil {
-			angularDegsPerSec = motionCfg.GetAngularDegsPerSec()
-		}
+	id, err := svc.MoveOnGlobe(ctx, r)
+	if err != nil {
+		return nil, err
 	}
 
-	return MotionConfiguration{
-		VisionServices:        visionSvc,
-		PositionPollingFreqHz: positionPollingHz,
-		ObstaclePollingFreqHz: obstaclePollingHz,
-		PlanDeviationMM:       1e3 * planDeviationM,
-		LinearMPerSec:         linearMPerSec,
-		AngularDegsPerSec:     angularDegsPerSec,
-	}
+	return &pb.MoveOnGlobeResponse{ExecutionId: id.String()}, nil
 }
 
 func (server *serviceServer) GetPose(ctx context.Context, req *pb.GetPoseRequest) (*pb.GetPoseResponse, error) {
@@ -158,6 +90,68 @@ func (server *serviceServer) GetPose(ctx context.Context, req *pb.GetPoseRequest
 		return nil, err
 	}
 	return &pb.GetPoseResponse{Pose: referenceframe.PoseInFrameToProtobuf(pose)}, nil
+}
+
+func (server *serviceServer) StopPlan(ctx context.Context, req *pb.StopPlanRequest) (*pb.StopPlanResponse, error) {
+	svc, err := server.coll.Resource(req.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	componentName := protoutils.ResourceNameFromProto(req.GetComponentName())
+	r := StopPlanReq{ComponentName: componentName, Extra: req.Extra.AsMap()}
+	err = svc.StopPlan(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+
+	return &pb.StopPlanResponse{}, nil
+}
+
+func (server *serviceServer) ListPlanStatuses(ctx context.Context, req *pb.ListPlanStatusesRequest) (*pb.ListPlanStatusesResponse, error) {
+	svc, err := server.coll.Resource(req.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	r := ListPlanStatusesReq{OnlyActivePlans: req.GetOnlyActivePlans(), Extra: req.Extra.AsMap()}
+	statuses, err := svc.ListPlanStatuses(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+
+	protoStatuses := make([]*pb.PlanStatusWithID, 0, len(statuses))
+	for _, status := range statuses {
+		protoStatuses = append(protoStatuses, status.ToProto())
+	}
+
+	return &pb.ListPlanStatusesResponse{PlanStatusesWithIds: protoStatuses}, nil
+}
+
+func (server *serviceServer) GetPlan(ctx context.Context, req *pb.GetPlanRequest) (*pb.GetPlanResponse, error) {
+	svc, err := server.coll.Resource(req.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	r, err := getPlanRequestFromProto(req)
+	if err != nil {
+		return nil, err
+	}
+
+	planHistory, err := svc.PlanHistory(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+
+	cpws := planHistory[0].ToProto()
+
+	history := []*pb.PlanWithStatus{}
+	for _, plan := range planHistory[1:] {
+		history = append(history, plan.ToProto())
+	}
+
+	return &pb.GetPlanResponse{CurrentPlanWithStatus: cpws, ReplanHistory: history}, nil
 }
 
 // DoCommand receives arbitrary commands.

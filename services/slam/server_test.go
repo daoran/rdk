@@ -8,7 +8,6 @@ import (
 	"math"
 	"os"
 	"testing"
-	"time"
 
 	"github.com/golang/geo/r3"
 	commonpb "go.viam.com/api/common/v1"
@@ -71,15 +70,17 @@ func TestWorkingServer(t *testing.T) {
 	test.That(t, err, test.ShouldBeNil)
 	slamServer := slam.NewRPCServiceServer(injectAPISvc).(pb.SLAMServiceServer)
 	cloudPath := artifact.MustPath("slam/mock_lidar/0.pcd")
+	cloudPathEdited := artifact.MustPath("slam/mock_lidar/1.pcd")
 	pcd, err := os.ReadFile(cloudPath)
+	test.That(t, err, test.ShouldBeNil)
+	pcdEdited, err := os.ReadFile(cloudPathEdited)
 	test.That(t, err, test.ShouldBeNil)
 
 	t.Run("working GetPosition", func(t *testing.T) {
 		poseSucc := spatial.NewPose(r3.Vector{X: 1, Y: 2, Z: 3}, &spatial.OrientationVector{Theta: math.Pi / 2, OX: 0, OY: 0, OZ: -1})
-		componentRefSucc := "cam"
 
-		injectSvc.PositionFunc = func(ctx context.Context) (spatial.Pose, string, error) {
-			return poseSucc, componentRefSucc, nil
+		injectSvc.PositionFunc = func(ctx context.Context) (spatial.Pose, error) {
+			return poseSucc, nil
 		}
 
 		reqPos := &pb.GetPositionRequest{
@@ -88,12 +89,17 @@ func TestWorkingServer(t *testing.T) {
 		respPos, err := slamServer.GetPosition(context.Background(), reqPos)
 		test.That(t, err, test.ShouldBeNil)
 		test.That(t, spatial.PoseAlmostEqual(poseSucc, spatial.NewPoseFromProtobuf(respPos.Pose)), test.ShouldBeTrue)
-		test.That(t, respPos.ComponentReference, test.ShouldEqual, componentRefSucc)
 	})
 
 	t.Run("working GetPointCloudMap", func(t *testing.T) {
-		injectSvc.PointCloudMapFunc = func(ctx context.Context) (func() ([]byte, error), error) {
-			reader := bytes.NewReader(pcd)
+		injectSvc.PointCloudMapFunc = func(ctx context.Context, returnEditedMap bool) (func() ([]byte, error), error) {
+			var reader *bytes.Reader
+			if returnEditedMap {
+				reader = bytes.NewReader(pcdEdited)
+			} else {
+				reader = bytes.NewReader(pcd)
+			}
+
 			serverBuffer := make([]byte, chunkSizeServer)
 			f := func() ([]byte, error) {
 				n, err := reader.Read(serverBuffer)
@@ -107,7 +113,7 @@ func TestWorkingServer(t *testing.T) {
 			return f, nil
 		}
 
-		reqPointCloudMap := &pb.GetPointCloudMapRequest{Name: testSlamServiceName}
+		reqPointCloudMap := &pb.GetPointCloudMapRequest{Name: testSlamServiceName, ReturnEditedMap: nil}
 		mockServer := makePointCloudServerMock()
 		err = slamServer.GetPointCloudMap(reqPointCloudMap, mockServer)
 		test.That(t, err, test.ShouldBeNil)
@@ -116,6 +122,39 @@ func TestWorkingServer(t *testing.T) {
 		test.That(t, mockServer.rawBytes, test.ShouldResemble, pcd)
 		// comparing pointclouds to ensure PCDs are correct
 		testhelper.TestComparePointCloudsFromPCDs(t, mockServer.rawBytes, pcd)
+	})
+	t.Run("working GetPointCloudMap with an edited map", func(t *testing.T) {
+		injectSvc.PointCloudMapFunc = func(ctx context.Context, returnEditedMap bool) (func() ([]byte, error), error) {
+			var reader *bytes.Reader
+			if returnEditedMap {
+				reader = bytes.NewReader(pcdEdited)
+			} else {
+				reader = bytes.NewReader(pcd)
+			}
+
+			serverBuffer := make([]byte, chunkSizeServer)
+			f := func() ([]byte, error) {
+				n, err := reader.Read(serverBuffer)
+				if err != nil {
+					return nil, err
+				}
+
+				return serverBuffer[:n], err
+			}
+
+			return f, nil
+		}
+		returnEditedMap := true
+		reqPointCloudMap := &pb.GetPointCloudMapRequest{Name: testSlamServiceName, ReturnEditedMap: &returnEditedMap}
+		mockServer := makePointCloudServerMock()
+		err = slamServer.GetPointCloudMap(reqPointCloudMap, mockServer)
+		test.That(t, err, test.ShouldBeNil)
+
+		// comparing raw bytes to ensure order is correct
+		test.That(t, mockServer.rawBytes, test.ShouldResemble, pcdEdited)
+		test.That(t, mockServer.rawBytes, test.ShouldNotResemble, pcd)
+		// comparing pointclouds to ensure PCDs are correct
+		testhelper.TestComparePointCloudsFromPCDs(t, mockServer.rawBytes, pcdEdited)
 	})
 
 	t.Run("working GetInternalState", func(t *testing.T) {
@@ -144,19 +183,35 @@ func TestWorkingServer(t *testing.T) {
 		test.That(t, mockServer.rawBytes, test.ShouldResemble, internalStateSucc)
 	})
 
-	t.Run("working GetLatestMapInfo", func(t *testing.T) {
-		timestamp := time.Now().UTC()
-		injectSvc.LatestMapInfoFunc = func(ctx context.Context) (time.Time, error) {
-			return timestamp, nil
+	t.Run("working GetProperties", func(t *testing.T) {
+		prop := slam.Properties{
+			CloudSlam:             false,
+			MappingMode:           slam.MappingModeNewMap,
+			InternalStateFileType: ".pbstream",
+			SensorInfo: []slam.SensorInfo{
+				{Name: "my-camera", Type: slam.SensorTypeCamera},
+				{Name: "my-movement-sensor", Type: slam.SensorTypeMovementSensor},
+			},
+		}
+		injectSvc.PropertiesFunc = func(ctx context.Context) (slam.Properties, error) {
+			return prop, nil
 		}
 
-		reqInfo := &pb.GetLatestMapInfoRequest{
+		reqInfo := &pb.GetPropertiesRequest{
 			Name: testSlamServiceName,
 		}
 
-		respInfo, err := slamServer.GetLatestMapInfo(context.Background(), reqInfo)
+		sensorInfoSuccess := []*pb.SensorInfo{
+			{Name: prop.SensorInfo[0].Name, Type: pb.SensorType_SENSOR_TYPE_CAMERA},
+			{Name: prop.SensorInfo[1].Name, Type: pb.SensorType_SENSOR_TYPE_MOVEMENT_SENSOR},
+		}
+
+		respInfo, err := slamServer.GetProperties(context.Background(), reqInfo)
 		test.That(t, err, test.ShouldBeNil)
-		test.That(t, respInfo.LastMapUpdate.AsTime(), test.ShouldResemble, timestamp)
+		test.That(t, respInfo.CloudSlam, test.ShouldResemble, prop.CloudSlam)
+		test.That(t, respInfo.MappingMode, test.ShouldEqual, pb.MappingMode_MAPPING_MODE_CREATE_NEW_MAP)
+		test.That(t, *respInfo.InternalStateFileType, test.ShouldEqual, prop.InternalStateFileType)
+		test.That(t, respInfo.SensorInfo, test.ShouldResemble, sensorInfoSuccess)
 	})
 
 	t.Run("Multiple services Valid", func(t *testing.T) {
@@ -168,13 +223,12 @@ func TestWorkingServer(t *testing.T) {
 		test.That(t, err, test.ShouldBeNil)
 		slamServer = slam.NewRPCServiceServer(injectAPISvc).(pb.SLAMServiceServer)
 		poseSucc := spatial.NewPose(r3.Vector{X: 1, Y: 2, Z: 3}, &spatial.OrientationVector{Theta: math.Pi / 2, OX: 0, OY: 0, OZ: -1})
-		componentRefSucc := "cam"
 
-		injectSvc.PositionFunc = func(ctx context.Context) (spatial.Pose, string, error) {
-			return poseSucc, componentRefSucc, nil
+		injectSvc.PositionFunc = func(ctx context.Context) (spatial.Pose, error) {
+			return poseSucc, nil
 		}
 
-		injectSvc.PointCloudMapFunc = func(ctx context.Context) (func() ([]byte, error), error) {
+		injectSvc.PointCloudMapFunc = func(ctx context.Context, returnEditedMap bool) (func() ([]byte, error), error) {
 			reader := bytes.NewReader(pcd)
 			serverBuffer := make([]byte, chunkSizeServer)
 			f := func() ([]byte, error) {
@@ -192,13 +246,11 @@ func TestWorkingServer(t *testing.T) {
 		respPos, err := slamServer.GetPosition(context.Background(), reqPos)
 		test.That(t, err, test.ShouldBeNil)
 		test.That(t, spatial.PoseAlmostEqual(poseSucc, spatial.NewPoseFromProtobuf(respPos.Pose)), test.ShouldBeTrue)
-		test.That(t, respPos.ComponentReference, test.ShouldEqual, componentRefSucc)
 
 		reqPos = &pb.GetPositionRequest{Name: testSlamServiceName2}
 		respPos, err = slamServer.GetPosition(context.Background(), reqPos)
 		test.That(t, err, test.ShouldBeNil)
 		test.That(t, spatial.PoseAlmostEqual(poseSucc, spatial.NewPoseFromProtobuf(respPos.Pose)), test.ShouldBeTrue)
-		test.That(t, respPos.ComponentReference, test.ShouldEqual, componentRefSucc)
 
 		// test streaming endpoint using GetPointCloudMap
 		reqGetPointCloudMap := &pb.GetPointCloudMapRequest{Name: testSlamServiceName}
@@ -231,8 +283,8 @@ func TestFailingServer(t *testing.T) {
 	slamServer := slam.NewRPCServiceServer(injectAPISvc).(pb.SLAMServiceServer)
 
 	t.Run("failing GetPosition", func(t *testing.T) {
-		injectSvc.PositionFunc = func(ctx context.Context) (spatial.Pose, string, error) {
-			return nil, "", errors.New("failure to get position")
+		injectSvc.PositionFunc = func(ctx context.Context) (spatial.Pose, error) {
+			return nil, errors.New("failure to get position")
 		}
 
 		req := &pb.GetPositionRequest{
@@ -245,7 +297,7 @@ func TestFailingServer(t *testing.T) {
 
 	t.Run("failing GetPointCloudMap", func(t *testing.T) {
 		// PointCloudMapFunc failure
-		injectSvc.PointCloudMapFunc = func(ctx context.Context) (func() ([]byte, error), error) {
+		injectSvc.PointCloudMapFunc = func(ctx context.Context, returnEditedMap bool) (func() ([]byte, error), error) {
 			return nil, errors.New("failure to get pointcloud map")
 		}
 
@@ -256,7 +308,7 @@ func TestFailingServer(t *testing.T) {
 		test.That(t, err.Error(), test.ShouldContainSubstring, "failure to get pointcloud map")
 
 		// Callback failure
-		injectSvc.PointCloudMapFunc = func(ctx context.Context) (func() ([]byte, error), error) {
+		injectSvc.PointCloudMapFunc = func(ctx context.Context, returnEditedMap bool) (func() ([]byte, error), error) {
 			f := func() ([]byte, error) {
 				return []byte{}, errors.New("callback error")
 			}
@@ -291,14 +343,14 @@ func TestFailingServer(t *testing.T) {
 		test.That(t, err.Error(), test.ShouldContainSubstring, "callback error")
 	})
 
-	t.Run("failing GetLatestMapInfo", func(t *testing.T) {
-		injectSvc.LatestMapInfoFunc = func(ctx context.Context) (time.Time, error) {
-			return time.Time{}, errors.New("failure to get latest map info")
+	t.Run("failing GetProperties", func(t *testing.T) {
+		injectSvc.PropertiesFunc = func(ctx context.Context) (slam.Properties, error) {
+			return slam.Properties{}, errors.New("failure to get properties")
 		}
-		reqInfo := &pb.GetLatestMapInfoRequest{Name: testSlamServiceName}
+		reqInfo := &pb.GetPropertiesRequest{Name: testSlamServiceName}
 
-		respInfo, err := slamServer.GetLatestMapInfo(context.Background(), reqInfo)
-		test.That(t, err.Error(), test.ShouldContainSubstring, "failure to get latest map info")
+		respInfo, err := slamServer.GetProperties(context.Background(), reqInfo)
+		test.That(t, err, test.ShouldBeError, errors.New("failure to get properties"))
 		test.That(t, respInfo, test.ShouldBeNil)
 	})
 

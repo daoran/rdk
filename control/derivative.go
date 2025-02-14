@@ -6,8 +6,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/pkg/errors"
+
+	"go.viam.com/rdk/logging"
 )
 
 type finiteDifferenceType string
@@ -62,10 +63,10 @@ type derivative struct {
 	stencil derivativeStencil
 	px      [][]float64
 	y       []*Signal
-	logger  golog.Logger
+	logger  logging.Logger
 }
 
-func newDerivative(config BlockConfig, logger golog.Logger) (Block, error) {
+func newDerivative(config BlockConfig, logger logging.Logger) (Block, error) {
 	d := &derivative{cfg: config, logger: logger}
 	if err := d.reset(); err != nil {
 		return nil, err
@@ -86,9 +87,14 @@ func derive(x []float64, dt time.Duration, stencil *derivativeStencil) (float64,
 }
 
 func (d *derivative) Next(ctx context.Context, x []*Signal, dt time.Duration) ([]*Signal, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if d.stencil.Type == "backward" {
 		for idx, s := range x {
 			d.px[idx] = append(d.px[idx][1:], s.GetSignalValueAt(0))
+			if math.IsNaN(d.px[idx][0]) {
+				continue
+			}
 			y, err := derive(d.px[idx], dt, &d.stencil)
 			d.y[idx].SetSignalValueAt(0, y)
 			if err != nil {
@@ -107,7 +113,7 @@ func (d *derivative) reset() error {
 	if len(d.cfg.DependsOn) != 1 {
 		return errors.Errorf("derive block %s only supports one input got %d", d.cfg.Name, len(d.cfg.DependsOn))
 	}
-	switch finiteDifferenceType(d.cfg.Attribute.String("derive_type")) {
+	switch finiteDifferenceType(d.cfg.Attribute["derive_type"].(string)) {
 	case backward1st1:
 		d.stencil = backward1st1Stencil
 	case backward1st2:
@@ -119,13 +125,16 @@ func (d *derivative) reset() error {
 	case backward2nd2:
 		d.stencil = backward2nd2Stencil
 	default:
-		return errors.Errorf("unsupported derive_type %s for block %s", d.cfg.Attribute.String("derive_type"), d.cfg.Name)
+		return errors.Errorf("unsupported derive_type %s for block %s", d.cfg.Attribute["derive_type"].(string), d.cfg.Name)
 	}
 	d.px = make([][]float64, len(d.cfg.DependsOn))
 	d.y = make([]*Signal, len(d.cfg.DependsOn))
 	for i := range d.px {
 		d.px[i] = make([]float64, len(d.stencil.Coeffs))
-		d.y[i] = makeSignal(d.cfg.Name)
+		for j := range d.px[i] {
+			d.px[i][j] = math.NaN()
+		}
+		d.y[i] = makeSignal(d.cfg.Name, d.cfg.Type)
 	}
 	return nil
 }

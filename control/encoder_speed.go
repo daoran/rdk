@@ -5,8 +5,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/pkg/errors"
+
+	"go.viam.com/rdk/logging"
 )
 
 type encoderToRPM struct {
@@ -15,10 +16,10 @@ type encoderToRPM struct {
 	y                  []*Signal
 	ticksPerRevolution int
 	prevEncCount       int
-	logger             golog.Logger
+	logger             logging.Logger
 }
 
-func newEncoderSpeed(config BlockConfig, logger golog.Logger) (Block, error) {
+func newEncoderSpeed(config BlockConfig, logger logging.Logger) (Block, error) {
 	e := &encoderToRPM{cfg: config, logger: logger}
 	if err := e.reset(); err != nil {
 		return nil, err
@@ -27,6 +28,8 @@ func newEncoderSpeed(config BlockConfig, logger golog.Logger) (Block, error) {
 }
 
 func (b *encoderToRPM) Next(ctx context.Context, x []*Signal, dt time.Duration) ([]*Signal, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	currEncCount := int(x[0].GetSignalValueAt(0))
 	b.y[0].SetSignalValueAt(0, (float64(currEncCount-b.prevEncCount)/float64(b.ticksPerRevolution))*60.0/(dt.Seconds()))
 	b.prevEncCount = currEncCount
@@ -40,10 +43,10 @@ func (b *encoderToRPM) reset() error {
 	if len(b.cfg.DependsOn) != 1 {
 		return errors.Errorf("invalid number of inputs for encoderToRPM block %s expected 1 got %d", b.cfg.Name, len(b.cfg.DependsOn))
 	}
-	b.ticksPerRevolution = b.cfg.Attribute.Int("ticks_per_revolution", 0)
+	b.ticksPerRevolution = b.cfg.Attribute["ticks_per_revolution"].(int) // default 0
 	b.prevEncCount = 0
 	b.y = make([]*Signal, 1)
-	b.y[0] = makeSignal(b.cfg.Name)
+	b.y[0] = makeSignal(b.cfg.Name, b.cfg.Type)
 	return nil
 }
 

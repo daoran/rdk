@@ -4,12 +4,16 @@ import pb "go.viam.com/api/component/movementsensor/v1"
 
 // Properties is a structure representing features
 // of a movementsensor.
+// The order is in terms of order of derivatives in time
+// with position, orientation, compassheading at the top (zeroth derivative)
+// linear and angular velocities next (first derivative)
+// linear acceleration last (second derivative).
 type Properties struct {
+	PositionSupported           bool
+	OrientationSupported        bool
+	CompassHeadingSupported     bool
 	LinearVelocitySupported     bool
 	AngularVelocitySupported    bool
-	OrientationSupported        bool
-	PositionSupported           bool
-	CompassHeadingSupported     bool
 	LinearAccelerationSupported bool
 }
 
@@ -17,11 +21,11 @@ type Properties struct {
 // an equivalent Properties struct.
 func ProtoFeaturesToProperties(resp *pb.GetPropertiesResponse) *Properties {
 	return &Properties{
+		PositionSupported:           resp.PositionSupported,
+		OrientationSupported:        resp.OrientationSupported,
+		CompassHeadingSupported:     resp.CompassHeadingSupported,
 		LinearVelocitySupported:     resp.LinearVelocitySupported,
 		AngularVelocitySupported:    resp.AngularVelocitySupported,
-		OrientationSupported:        resp.OrientationSupported,
-		PositionSupported:           resp.PositionSupported,
-		CompassHeadingSupported:     resp.CompassHeadingSupported,
 		LinearAccelerationSupported: resp.LinearAccelerationSupported,
 	}
 }
@@ -32,11 +36,11 @@ func PropertiesToProtoResponse(
 	features *Properties,
 ) (*pb.GetPropertiesResponse, error) {
 	return &pb.GetPropertiesResponse{
+		PositionSupported:           features.PositionSupported,
+		OrientationSupported:        features.OrientationSupported,
+		CompassHeadingSupported:     features.CompassHeadingSupported,
 		LinearVelocitySupported:     features.LinearVelocitySupported,
 		AngularVelocitySupported:    features.AngularVelocitySupported,
-		OrientationSupported:        features.OrientationSupported,
-		PositionSupported:           features.PositionSupported,
-		CompassHeadingSupported:     features.CompassHeadingSupported,
 		LinearAccelerationSupported: features.LinearAccelerationSupported,
 	}, nil
 }

@@ -1,3 +1,5 @@
+//go:build !no_cgo
+
 // Package kinematicbase contains wrappers that augment bases with information needed for higher level
 // control over the base
 package kinematicbase
@@ -5,30 +7,41 @@ package kinematicbase
 import (
 	"context"
 	"errors"
-	"fmt"
 	"math"
+	"sync"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/golang/geo/r3"
 	utils "go.viam.com/utils"
 
 	"go.viam.com/rdk/components/base"
+	"go.viam.com/rdk/logging"
+	"go.viam.com/rdk/motionplan"
 	"go.viam.com/rdk/motionplan/ik"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/services/motion"
 	"go.viam.com/rdk/spatialmath"
 )
 
-// ErrMovementTimeout is used for when a movement call times out after no movement for some time.
-var ErrMovementTimeout = errors.New("movement has timed out")
+// The pause time when not using a localizer before moving on to next move step.
+const (
+	defaultNoLocalizerDelay  = 250 * time.Millisecond
+	defaultCollisionBufferMM = 1e-8
+)
+
+var (
+	// errMovementTimeout is used for when a movement call times out after no movement for some time.
+	errMovementTimeout = errors.New("movement has timed out")
+	// Input representation of origin.
+	originInputs = []referenceframe.Input{{Value: 0}, {Value: 0}, {Value: 0}}
+)
 
 // wrapWithDifferentialDriveKinematics takes a wheeledBase component and adds a localizer to it
 // It also adds kinematic model so that it can be controlled.
 func wrapWithDifferentialDriveKinematics(
 	ctx context.Context,
 	b base.Base,
-	logger golog.Logger,
+	logger logging.Logger,
 	localizer motion.Localizer,
 	limits []referenceframe.Limit,
 	options Options,
@@ -39,48 +52,84 @@ func wrapWithDifferentialDriveKinematics(
 		logger:    logger,
 		options:   options,
 	}
+	ddk.mutex.Lock()
+	defer ddk.mutex.Unlock()
 
 	geometries, err := b.Geometries(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	// RSDK-4131 will update this so it is no longer necessary
-	var geometry spatialmath.Geometry
+	var geometry, boundingSphere spatialmath.Geometry
 	if len(geometries) > 1 {
-		ddk.logger.Warn("multiple geometries specified for differential drive kinematic base, only can use the first at this time")
+		ddk.logger.CWarn(ctx, "multiple geometries specified for differential drive kinematic base, only can use the first at this time")
 	}
 	if len(geometries) > 0 {
 		geometry = geometries[0]
 	}
-	ddk.executionFrame, err = referenceframe.New2DMobileModelFrame(b.Name().ShortName(), limits, geometry)
+	if geometry != nil {
+		boundingSphere, err = spatialmath.BoundingSphere(geometry)
+	}
+	if boundingSphere == nil || err != nil {
+		logger.CWarnf(
+			ctx, "base %s not configured with a geometry, will be considered a 300mm sphere for collision detection purposes.",
+			b.Name().Name,
+		)
+		boundingSphere, err = spatialmath.NewSphere(spatialmath.NewZeroPose(), 150., b.Name().ShortName())
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	ddk.localizationFrame, err = referenceframe.New2DMobileModelFrame(b.Name().ShortName(), limits, boundingSphere)
 	if err != nil {
 		return nil, err
 	}
 
 	if options.PositionOnlyMode {
-		ddk.planningFrame, err = referenceframe.New2DMobileModelFrame(b.Name().ShortName(), limits[:2], geometry)
+		ddk.planningFrame, err = referenceframe.New2DMobileModelFrame(b.Name().ShortName(), limits[:2], boundingSphere)
 		if err != nil {
 			return nil, err
 		}
 	} else {
-		ddk.planningFrame = ddk.executionFrame
+		ddk.planningFrame = ddk.localizationFrame
 	}
+
+	ddk.noLocalizerCacheInputs = originInputs
 	return ddk, nil
 }
 
 type differentialDriveKinematics struct {
 	base.Base
 	motion.Localizer
-	logger                        golog.Logger
-	planningFrame, executionFrame referenceframe.Model
-	options                       Options
+	logger                           logging.Logger
+	planningFrame, localizationFrame referenceframe.Frame
+	options                          Options
+	noLocalizerCacheInputs           []referenceframe.Input
+	currentTrajectory                [][]referenceframe.Input
+	currentIdx                       int
+	mutex                            sync.RWMutex
 }
 
 func (ddk *differentialDriveKinematics) Kinematics() referenceframe.Frame {
 	return ddk.planningFrame
 }
 
+func (ddk *differentialDriveKinematics) LocalizationFrame() referenceframe.Frame {
+	return ddk.localizationFrame
+}
+
 func (ddk *differentialDriveKinematics) CurrentInputs(ctx context.Context) ([]referenceframe.Input, error) {
+	// If no localizer is present, CurrentInputs returns the expected position of the robot assuming after
+	// each part of move command was completed accurately.
+	if ddk.Localizer == nil {
+		ddk.mutex.RLock()
+		defer ddk.mutex.RUnlock()
+		currentInputs := ddk.noLocalizerCacheInputs
+
+		return currentInputs, nil
+	}
+
 	// TODO(rb): make a transformation from the component reference to the base frame
 	pif, err := ddk.CurrentPosition(ctx)
 	if err != nil {
@@ -93,9 +142,26 @@ func (ddk *differentialDriveKinematics) CurrentInputs(ctx context.Context) ([]re
 	return []referenceframe.Input{{Value: pt.X}, {Value: pt.Y}, {Value: theta}}, nil
 }
 
-func (ddk *differentialDriveKinematics) GoToInputs(ctx context.Context, desired []referenceframe.Input) (err error) {
+func (ddk *differentialDriveKinematics) GoToInputs(ctx context.Context, desiredSteps ...[]referenceframe.Input) error {
+	ddk.mutex.Lock()
+	ddk.currentTrajectory = desiredSteps
+	ddk.mutex.Unlock()
+	for i, desired := range desiredSteps {
+		ddk.mutex.Lock()
+		ddk.currentIdx = i
+		ddk.mutex.Unlock()
+		err := ddk.goToInputs(ctx, desired)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (ddk *differentialDriveKinematics) goToInputs(ctx context.Context, desired []referenceframe.Input) error {
 	// create capsule which defines the valid region for a base to be when driving to desired waypoint
 	// deviationThreshold defines max distance base can be from path without error being thrown
+	var err error
 	current, inputsErr := ddk.CurrentInputs(ctx)
 	if inputsErr != nil {
 		return inputsErr
@@ -110,12 +176,21 @@ func (ddk *differentialDriveKinematics) GoToInputs(ctx context.Context, desired 
 	cancelContext, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	if ddk.Localizer == nil {
+		defer func() {
+			ddk.mutex.Lock()
+			defer ddk.mutex.Unlock()
+			ddk.noLocalizerCacheInputs = originInputs
+		}()
+	}
+
 	utils.PanicCapturingGo(func() {
 		// this loop polls the error state and issues a corresponding command to move the base to the objective
 		// when the base is within the positional threshold of the goal, exit the loop
 		for err := cancelContext.Err(); err == nil; err = cancelContext.Err() {
 			utils.SelectContextOrWait(ctx, 10*time.Millisecond)
-			col, err := validRegion.CollidesWith(spatialmath.NewPoint(r3.Vector{X: current[0].Value, Y: current[1].Value}, ""))
+			point := spatialmath.NewPoint(r3.Vector{X: current[0].Value, Y: current[1].Value}, "")
+			col, err := validRegion.CollidesWith(point, defaultCollisionBufferMM)
 			if err != nil {
 				movementErr <- err
 				return
@@ -127,7 +202,7 @@ func (ddk *differentialDriveKinematics) GoToInputs(ctx context.Context, desired 
 
 			// get to the x, y location first - note that from the base's perspective +y is forward
 			desiredHeading := math.Atan2(desired[1].Value-current[1].Value, desired[0].Value-current[0].Value)
-			commanded, err := ddk.issueCommand(cancelContext, current, []referenceframe.Input{desired[0], desired[1], {desiredHeading}})
+			commanded, err := ddk.issueCommand(cancelContext, current, []referenceframe.Input{desired[0], desired[1], {Value: desiredHeading}})
 			if err != nil {
 				movementErr <- err
 				return
@@ -150,13 +225,12 @@ func (ddk *differentialDriveKinematics) GoToInputs(ctx context.Context, desired 
 					return
 				}
 			}
-
 			current, err = ddk.CurrentInputs(cancelContext)
 			if err != nil {
 				movementErr <- err
 				return
 			}
-			ddk.logger.Infof("current inputs: %v", current)
+			ddk.logger.CInfof(ctx, "current inputs: %v", current)
 		}
 		movementErr <- err
 	})
@@ -172,6 +246,7 @@ func (ddk *differentialDriveKinematics) GoToInputs(ctx context.Context, desired 
 			return err
 		default:
 		}
+
 		currentInputs, err := ddk.CurrentInputs(ctx)
 		if err != nil {
 			cancel()
@@ -191,7 +266,7 @@ func (ddk *differentialDriveKinematics) GoToInputs(ctx context.Context, desired 
 		} else if time.Since(lastUpdate) > ddk.options.Timeout {
 			cancel()
 			<-movementErr
-			return ErrMovementTimeout
+			return errMovementTimeout
 		}
 	}
 }
@@ -204,13 +279,31 @@ func (ddk *differentialDriveKinematics) issueCommand(ctx context.Context, curren
 	if err != nil {
 		return false, err
 	}
-	ddk.logger.Debug("distErr: %f\theadingErr %f", distErr, headingErr)
+	ddk.logger.CDebugf(ctx, "distErr: %.2f\theadingErr %.2f", distErr, headingErr)
 	if distErr > ddk.options.GoalRadiusMM && math.Abs(headingErr) > ddk.options.HeadingThresholdDegrees {
 		// base is headed off course; spin to correct
-		return true, ddk.Spin(ctx, math.Min(headingErr, ddk.options.MaxSpinAngleDeg), ddk.options.AngularVelocityDegsPerSec, nil)
+		err := ddk.Spin(ctx, math.Min(headingErr, ddk.options.MaxSpinAngleDeg), ddk.options.AngularVelocityDegsPerSec, nil)
+
+		// Update the cached current inputs to the resultant position of the spin command when the localizer is nil
+		if ddk.Localizer == nil {
+			ddk.mutex.Lock()
+			defer ddk.mutex.Unlock()
+			ddk.noLocalizerCacheInputs = []referenceframe.Input{{Value: 0}, {Value: 0}, desired[2]}
+			time.Sleep(defaultNoLocalizerDelay)
+		}
+		return true, err
 	} else if distErr > ddk.options.GoalRadiusMM {
 		// base is pointed the correct direction but not there yet; forge onward
-		return true, ddk.MoveStraight(ctx, int(math.Min(distErr, ddk.options.MaxMoveStraightMM)), ddk.options.LinearVelocityMMPerSec, nil)
+		err := ddk.MoveStraight(ctx, int(math.Min(distErr, ddk.options.MaxMoveStraightMM)), ddk.options.LinearVelocityMMPerSec, nil)
+
+		// Update the cached current inputs to the resultant position of the move straight command when the localizer is nil
+		if ddk.Localizer == nil {
+			ddk.mutex.Lock()
+			defer ddk.mutex.Unlock()
+			ddk.noLocalizerCacheInputs = desired
+			time.Sleep(defaultNoLocalizerDelay)
+		}
+		return true, err
 	}
 	return false, nil
 }
@@ -224,7 +317,7 @@ func (ddk *differentialDriveKinematics) inputDiff(current, desired []referencefr
 	)
 
 	// transform the goal pose such that it is in the base frame
-	currentPose, err := ddk.executionFrame.Transform(current)
+	currentPose, err := ddk.localizationFrame.Transform(current)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -236,50 +329,13 @@ func (ddk *differentialDriveKinematics) inputDiff(current, desired []referencefr
 	return positionErr, headingErr, nil
 }
 
-// CollisionGeometry returns a spherical geometry that will encompass the base if it were to rotate the geometry specified in the config
-// 360 degrees about the Z axis of the reference frame specified in the config.
-func CollisionGeometry(cfg *referenceframe.LinkConfig) ([]spatialmath.Geometry, error) {
-	// TODO(RSDK-1014): the orientation of this model will matter for collision checking,
-	// and should match the convention of +Y being forward for bases
-	if cfg == nil || cfg.Geometry == nil {
-		return nil, errors.New("not configured with a geometry use caution if using motion service - collisions will not be accounted for")
-	}
-	geoCfg := cfg.Geometry
-	r := geoCfg.TranslationOffset.Norm()
-	switch geoCfg.Type {
-	case spatialmath.BoxType:
-		r += r3.Vector{X: geoCfg.X, Y: geoCfg.Y, Z: geoCfg.Z}.Norm() / 2
-	case spatialmath.SphereType:
-		r += geoCfg.R
-	case spatialmath.CapsuleType:
-		r += geoCfg.L / 2
-	case spatialmath.UnknownType:
-		// no type specified, iterate through supported types and try to infer intent
-		if norm := (r3.Vector{X: geoCfg.X, Y: geoCfg.Y, Z: geoCfg.Z}).Norm(); norm > 0 {
-			r += norm / 2
-		} else if geoCfg.L != 0 {
-			r += geoCfg.L / 2
-		} else {
-			r += geoCfg.R
-		}
-	case spatialmath.PointType:
-	default:
-		return nil, spatialmath.ErrGeometryTypeUnsupported
-	}
-	sphere, err := spatialmath.NewSphere(spatialmath.NewZeroPose(), r, geoCfg.Label)
-	if err != nil {
-		return nil, err
-	}
-	return []spatialmath.Geometry{sphere}, nil
-}
-
 // newValidRegionCapsule returns a capsule which defines the valid regions for a base to be when moving to a waypoint.
 // The valid region is all points that are deviationThreshold (mm) distance away from the line segment between the
 // starting and ending waypoints. This capsule is used to detect whether a base leaves this region and has thus deviated
 // too far from its path.
 func (ddk *differentialDriveKinematics) newValidRegionCapsule(starting, desired []referenceframe.Input) (spatialmath.Geometry, error) {
 	pt := r3.Vector{X: (desired[0].Value + starting[0].Value) / 2, Y: (desired[1].Value + starting[1].Value) / 2}
-	positionErr, _, err := ddk.inputDiff(starting, []referenceframe.Input{desired[0], desired[1], {0}})
+	positionErr, _, err := ddk.inputDiff(starting, []referenceframe.Input{desired[0], desired[1], {Value: 0}})
 	if err != nil {
 		return nil, err
 	}
@@ -310,42 +366,6 @@ func (ddk *differentialDriveKinematics) newValidRegionCapsule(starting, desired 
 	return capsule, nil
 }
 
-func (ddk *differentialDriveKinematics) ErrorState(
-	ctx context.Context,
-	plan [][]referenceframe.Input,
-	currentNode int,
-) (spatialmath.Pose, error) {
-	if currentNode <= 0 || currentNode >= len(plan) {
-		return nil, fmt.Errorf("cannot get ErrorState for node %d, must be > 0 and less than plan length %d", currentNode, len(plan))
-	}
-
-	// Get pose-in-frame of the base via its localizer. The offset between the localizer and its base should already be accounted for.
-	actualPIF, err := ddk.CurrentPosition(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	var nominalPose spatialmath.Pose
-
-	// Determine the nominal pose, that is, the pose where the robot ought be if it had followed the plan perfectly up until this point.
-	// This is done differently depending on what sort of frame we are working with.
-	if len(plan) < 2 {
-		return nil, errors.New("diff drive motion plan must have at least two waypoints")
-	}
-	nominalPose, err = ddk.executionFrame.Transform(plan[currentNode])
-	if err != nil {
-		return nil, err
-	}
-	pastPose, err := ddk.executionFrame.Transform(plan[currentNode-1])
-	if err != nil {
-		return nil, err
-	}
-	// diff drive bases don't have a notion of "distance along the trajectory between waypoints", so instead we compare to the
-	// nearest point on the straight line path.
-	nominalPoint := spatialmath.ClosestPointSegmentPoint(pastPose.Point(), nominalPose.Point(), actualPIF.Pose().Point())
-	pointDiff := nominalPose.Point().Sub(pastPose.Point())
-	desiredHeading := math.Atan2(pointDiff.Y, pointDiff.X)
-	nominalPose = spatialmath.NewPose(nominalPoint, &spatialmath.OrientationVector{OZ: 1, Theta: desiredHeading})
-
-	return spatialmath.PoseBetween(nominalPose, actualPIF.Pose()), nil
+func (ddk *differentialDriveKinematics) ExecutionState(ctx context.Context) (motionplan.ExecutionState, error) {
+	return motionplan.ExecutionState{}, errors.New("differentialDriveKinematics does not support executionState")
 }

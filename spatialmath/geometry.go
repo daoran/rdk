@@ -2,28 +2,44 @@ package spatialmath
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/golang/geo/r3"
 	commonpb "go.viam.com/api/common/v1"
 )
 
-// Geometry is an entry point with which to access all types of collision geometries.
+// Geometry is an interface defining a 3D solid.
 type Geometry interface {
+	// Pose returns the Pose of the center of the Geometry
 	Pose() Pose
-	AlmostEqual(Geometry) bool
+
+	// Transform returns a copy of the Geometry that has been transformed by the given Pose
 	Transform(Pose) Geometry
-	ToProtobuf() *commonpb.Geometry
-	CollidesWith(Geometry) (bool, error)
+
+	// CollidesWith returns a bool describing if the two geometries are within the given float of colliding with each other.
+	CollidesWith(Geometry, float64) (bool, error)
+
 	// If DistanceFrom is negative, it represents the penetration depth of the two geometries, which are in collision.
 	// Penetration depth magnitude is defined as the minimum translation which would result in the geometries not colliding.
 	// For certain entity pairs (box-box) this may be a conservative estimate of separation distance rather than exact.
 	DistanceFrom(Geometry) (float64, error)
+
+	// EncompassedBy returns a bool describing if a given Geometry is completely encompassed by the Geometry passed as an argument.
 	EncompassedBy(Geometry) (bool, error)
-	SetLabel(string) // SetLabel sets the name of the geometry
-	Label() string   // Label is the name of the geometry
-	String() string  // String is a string representation of the geometry data structure
+
+	// SetLabel sets the name of the geometry
+	SetLabel(string)
+
+	// Label returns the name of the geometry
+	Label() string
+
+	// ToPoints returns a vector of points that together represent a point cloud of the Geometry
 	ToPoints(float64) []r3.Vector
+
+	// ToProtobuf converts a Geometry to its protobuf representation.
+	ToProtobuf() *commonpb.Geometry
+
 	json.Marshaler
 }
 
@@ -32,18 +48,20 @@ type GeometryType string
 
 // The set of allowed representations for orientation.
 const (
-	UnknownType     = GeometryType("")
-	BoxType         = GeometryType("box")
-	SphereType      = GeometryType("sphere")
-	CapsuleType     = GeometryType("capsule")
-	PointType       = GeometryType("point")
-	CollisionBuffer = 1e-8 // objects must be separated by this many mm to not be in collision
+	UnknownType = GeometryType("")
+	BoxType     = GeometryType("box")
+	SphereType  = GeometryType("sphere")
+	CapsuleType = GeometryType("capsule")
+	PointType   = GeometryType("point")
+
+	// objects must be separated by this many mm to not be in collision.
+	defaultCollisionBufferMM = 1e-8
 
 	// Point density corresponding to how many points per square mm.
 	defaultPointDensity = .5
 )
 
-// GeometryConfig specifies the format of geometries specified through the configuration file.
+// GeometryConfig specifies the format of geometries specified through JSON configuration files.
 type GeometryConfig struct {
 	Type GeometryType `json:"type"`
 
@@ -66,31 +84,31 @@ type GeometryConfig struct {
 }
 
 // NewGeometryConfig creates a config for a Geometry from an offset Pose.
-func NewGeometryConfig(gc Geometry) (*GeometryConfig, error) {
+func NewGeometryConfig(g Geometry) (*GeometryConfig, error) {
 	config := &GeometryConfig{}
-	switch gcType := gc.(type) {
+	switch gType := g.(type) {
 	case *box:
 		config.Type = BoxType
-		config.X = gc.(*box).halfSize[0] * 2
-		config.Y = gc.(*box).halfSize[1] * 2
-		config.Z = gc.(*box).halfSize[2] * 2
-		config.Label = gc.(*box).label
+		config.X = gType.halfSize[0] * 2
+		config.Y = gType.halfSize[1] * 2
+		config.Z = gType.halfSize[2] * 2
+		config.Label = gType.label
 	case *sphere:
 		config.Type = SphereType
-		config.R = gc.(*sphere).radius
-		config.Label = gc.(*sphere).label
+		config.R = gType.radius
+		config.Label = gType.label
 	case *capsule:
 		config.Type = CapsuleType
-		config.R = gc.(*capsule).radius
-		config.L = gc.(*capsule).length
-		config.Label = gc.(*capsule).label
+		config.R = gType.radius
+		config.L = gType.length
+		config.Label = gType.label
 	case *point:
 		config.Type = PointType
-		config.Label = gc.(*point).label
+		config.Label = gType.label
 	default:
-		return nil, fmt.Errorf("%w %s", ErrGeometryTypeUnsupported, fmt.Sprintf("%T", gcType))
+		return nil, fmt.Errorf("%w %s", errGeometryTypeUnsupported, fmt.Sprintf("%T", gType))
 	}
-	offset := gc.Pose()
+	offset := g.Pose()
 	o := offset.Orientation()
 	config.TranslationOffset = offset.Point()
 	orientationConfig, err := NewOrientationConfig(o)
@@ -136,11 +154,39 @@ func (config *GeometryConfig) ParseConfig() (Geometry, error) {
 		}
 		// never try to infer point geometry if nothing is specified
 	}
-	return nil, fmt.Errorf("%w %s", ErrGeometryTypeUnsupported, string(config.Type))
+	return nil, fmt.Errorf("%w %s", errGeometryTypeUnsupported, string(config.Type))
+}
+
+// ToProtobuf converts a GeometryConfig to Protobuf.
+func (config *GeometryConfig) ToProtobuf() (*commonpb.Geometry, error) {
+	creator, err := config.ParseConfig()
+	if err != nil {
+		return nil, err
+	}
+	return creator.ToProtobuf(), nil
+}
+
+// GeometriesAlmostEqual returns a bool describing if the two input Geometries are equal.
+func GeometriesAlmostEqual(a, b Geometry) bool {
+	switch gType := a.(type) {
+	case *box:
+		return gType.almostEqual(b)
+	case *sphere:
+		return gType.almostEqual(b)
+	case *capsule:
+		return gType.almostEqual(b)
+	case *point:
+		return gType.almostEqual(b)
+	default:
+		return false
+	}
 }
 
 // NewGeometryFromProto instantiates a new Geometry from a protobuf Geometry message.
 func NewGeometryFromProto(geometry *commonpb.Geometry) (Geometry, error) {
+	if geometry.Center == nil {
+		return nil, errors.New("cannot have nil pose for geometry")
+	}
 	pose := NewPoseFromProtobuf(geometry.Center)
 	if box := geometry.GetBox().GetDimsMm(); box != nil {
 		return NewBox(pose, r3.Vector{X: box.X, Y: box.Y, Z: box.Z}, geometry.Label)
@@ -154,11 +200,14 @@ func NewGeometryFromProto(geometry *commonpb.Geometry) (Geometry, error) {
 		}
 		return NewSphere(pose, sphere.RadiusMm, geometry.Label)
 	}
-	return nil, ErrGeometryTypeUnsupported
+	return nil, errGeometryTypeUnsupported
 }
 
 // NewGeometriesFromProto converts a list of Geometries from protobuf.
 func NewGeometriesFromProto(proto []*commonpb.Geometry) ([]Geometry, error) {
+	if proto == nil {
+		return nil, nil
+	}
 	geometries := []Geometry{}
 	for _, geometry := range proto {
 		g, err := NewGeometryFromProto(geometry)
@@ -177,13 +226,4 @@ func NewGeometriesToProto(geometries []Geometry) []*commonpb.Geometry {
 		proto = append(proto, geometry.ToProtobuf())
 	}
 	return proto
-}
-
-// ToProtobuf converts a GeometryConfig to Protobuf.
-func (config *GeometryConfig) ToProtobuf() (*commonpb.Geometry, error) {
-	creator, err := config.ParseConfig()
-	if err != nil {
-		return nil, err
-	}
-	return creator.ToProtobuf(), nil
 }

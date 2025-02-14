@@ -14,15 +14,22 @@ import (
 	"strings"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/golang-jwt/jwt/v4"
 	"github.com/pkg/errors"
 	"github.com/urfave/cli/v2"
+	"go.uber.org/multierr"
+	buildpb "go.viam.com/api/app/build/v1"
 	datapb "go.viam.com/api/app/data/v1"
+	datasetpb "go.viam.com/api/app/dataset/v1"
+	mlinferencepb "go.viam.com/api/app/mlinference/v1"
+	mltrainingpb "go.viam.com/api/app/mltraining/v1"
 	packagepb "go.viam.com/api/app/packages/v1"
 	apppb "go.viam.com/api/app/v1"
 	"go.viam.com/utils"
 	"go.viam.com/utils/rpc"
+	"golang.org/x/term"
+
+	"go.viam.com/rdk/logging"
 )
 
 type authFlow struct {
@@ -36,20 +43,20 @@ type authFlow struct {
 	disableBrowserOpen bool
 
 	httpClient *http.Client
-	logger     golog.Logger
+	logger     logging.Logger
 	console    io.Writer
 }
 
 const (
 	defaultOpenIDDiscoveryPath = "/.well-known/openid-configuration"
 
-	prodAuthDomain = "https://auth.viam.com"
-	prodAudience   = "https://app.viam.com/"
-	prodClientID   = "HysEkkRKn6cDr2W6UFI6UYJHpiVwXFCk" // native client ID
+	prodAuthDomain = "https://viam-prod.fusionauth.io"
+	prodAudience   = "c1e41724-9b29-479f-abcc-7bfbe2e3309a"
+	prodClientID   = "c1e41724-9b29-479f-abcc-7bfbe2e3309a" // native client ID
 
-	stgAuthDomain = "https://auth.viam.dev"
-	stgAudience   = "https://app.viam.dev/"
-	stgClientID   = "o75PSAO21337n6SE0IV2BF9Aj9Er9NF6" // native client ID
+	stgAuthDomain = "https://viam.fusionauth.io"
+	stgAudience   = "d7eb6419-301c-4ef1-a5e5-8e8bf28a87c0"
+	stgClientID   = "d7eb6419-301c-4ef1-a5e5-8e8bf28a87c0" // native client ID
 
 	defaultWaitInterval = time.Second * 1
 
@@ -112,9 +119,13 @@ type apiKey struct {
 	KeyCrypto string `json:"key_crypto"`
 }
 
+type loginActionArgs struct {
+	DisableBrowserOpen bool
+}
+
 // LoginAction is the corresponding Action for 'login'.
-func LoginAction(cCtx *cli.Context) error {
-	c, err := newViamClient(cCtx)
+func LoginAction(cCtx *cli.Context, args loginActionArgs) error {
+	c, err := newViamClientInner(cCtx, args.DisableBrowserOpen)
 	if err != nil {
 		return err
 	}
@@ -126,7 +137,10 @@ func (c *viamClient) loginAction(cCtx *cli.Context) error {
 		already := "Already l"
 		if !alreadyLoggedIn {
 			already = "L"
-			viamLogo(cCtx.App.Writer)
+			// only print the viam logo if we are in an interative terminal
+			if term.IsTerminal(int(os.Stdout.Fd())) {
+				viamLogo(cCtx.App.Writer)
+			}
 		}
 
 		printf(cCtx.App.Writer, "%sogged in as %q, expires %s", already, t.User.Email,
@@ -134,7 +148,7 @@ func (c *viamClient) loginAction(cCtx *cli.Context) error {
 	}
 
 	if _, isAPIKey := c.conf.Auth.(*apiKey); isAPIKey {
-		warningf(c.c.App.Writer, "was logged in with an api-key. logging out")
+		warningf(c.c.App.ErrWriter, "was logged in with an api-key. logging out")
 		utils.UncheckedError(c.logout())
 	}
 	currentToken, _ := c.conf.Auth.(*token) // currentToken can be nil
@@ -145,16 +159,23 @@ func (c *viamClient) loginAction(cCtx *cli.Context) error {
 
 	var t *token
 	var err error
+	globalArgs, err := getGlobalArgs(c.c)
+	if err != nil {
+		return err
+	}
 	if currentToken != nil && currentToken.canRefresh() {
 		t, err = c.authFlow.refreshToken(c.c.Context, currentToken)
 		if err != nil {
-			utils.UncheckedError(c.logout())
-			return err
+			debugf(c.c.App.Writer, globalArgs.Debug, "Token refresh error: %v", err)
+			utils.UncheckedError(c.logout()) // clear cache if failed to refresh
 		}
-	} else {
-		t, err = c.authFlow.loginAsUser(c.c.Context)
+	}
+	if t == nil { // either there was no current token, or the current token couldn't be refreshed
+		t, err = c.authFlow.loginAsUser(c.c)
 		if err != nil {
-			return err
+			debugf(c.c.App.Writer, globalArgs.Debug, "Login error: %v", err)
+
+			return errors.New("error while logging in. Please try again")
 		}
 	}
 
@@ -168,19 +189,24 @@ func (c *viamClient) loginAction(cCtx *cli.Context) error {
 	return nil
 }
 
+type loginWithAPIKeyArgs struct {
+	KeyID string
+	Key   string
+}
+
 // LoginWithAPIKeyAction is the corresponding Action for `login api-key`.
-func LoginWithAPIKeyAction(cCtx *cli.Context) error {
+func LoginWithAPIKeyAction(cCtx *cli.Context, args loginWithAPIKeyArgs) error {
 	c, err := newViamClient(cCtx)
 	if err != nil {
 		return err
 	}
-	return c.loginWithAPIKeyAction(cCtx)
+	return c.loginWithAPIKeyAction(cCtx, args)
 }
 
-func (c viamClient) loginWithAPIKeyAction(cCtx *cli.Context) error {
+func (c viamClient) loginWithAPIKeyAction(cCtx *cli.Context, args loginWithAPIKeyArgs) error {
 	key := apiKey{
-		KeyID:     cCtx.String(loginFlagKeyID),
-		KeyCrypto: cCtx.String(loginFlagKey),
+		KeyID:     args.KeyID,
+		KeyCrypto: args.Key,
 	}
 	c.conf.Auth = &key
 	if err := storeConfigToCache(c.conf); err != nil {
@@ -195,7 +221,7 @@ func (c viamClient) loginWithAPIKeyAction(cCtx *cli.Context) error {
 }
 
 // PrintAccessTokenAction is the corresponding Action for 'print-access-token'.
-func PrintAccessTokenAction(cCtx *cli.Context) error {
+func PrintAccessTokenAction(cCtx *cli.Context, args emptyArgs) error {
 	c, err := newViamClient(cCtx)
 	if err != nil {
 		return err
@@ -217,14 +243,14 @@ func (c *viamClient) printAccessTokenAction(cCtx *cli.Context) error {
 }
 
 // LogoutAction is the corresponding Action for 'logout'.
-func LogoutAction(cCtx *cli.Context) error {
+func LogoutAction(cCtx *cli.Context, args emptyArgs) error {
 	// Create basic viam client; no need to check base URL.
-	conf, err := configFromCache()
+	conf, err := ConfigFromCache(cCtx)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return err
 		}
-		conf = &config{}
+		conf = &Config{}
 	}
 
 	vc := &viamClient{
@@ -248,7 +274,7 @@ func (c *viamClient) logoutAction(cCtx *cli.Context) error {
 }
 
 // WhoAmIAction is the corresponding Action for 'whoami'.
-func WhoAmIAction(cCtx *cli.Context) error {
+func WhoAmIAction(cCtx *cli.Context, args emptyArgs) error {
 	c, err := newViamClient(cCtx)
 	if err != nil {
 		return err
@@ -266,34 +292,43 @@ func (c *viamClient) whoAmIAction(cCtx *cli.Context) error {
 	return nil
 }
 
-// OrganizationAPIKeyCreateAction corresponds to `organization api-key create`.
-func OrganizationAPIKeyCreateAction(cCtx *cli.Context) error {
+func (c *viamClient) generateDefaultKeyName() string {
+	// Default name is in the form myusername@gmail.com-2009-11-10T23:00:00Z
+	// or key-uuid-2009-11-10T23:00:00Z if it was created by a key
+	return fmt.Sprintf("%s-%s", c.conf.Auth, time.Now().Format(time.RFC3339))
+}
+
+type organizationsAPIKeyCreateArgs struct {
+	OrgID string
+	Name  string
+}
+
+// OrganizationsAPIKeyCreateAction corresponds to `organizations api-key create`.
+func OrganizationsAPIKeyCreateAction(cCtx *cli.Context, args organizationsAPIKeyCreateArgs) error {
 	c, err := newViamClient(cCtx)
 	if err != nil {
 		return err
 	}
-	return c.organizationAPIKeyCreateAction(cCtx)
+	return c.organizationsAPIKeyCreateAction(cCtx, args)
 }
 
-func (c *viamClient) organizationAPIKeyCreateAction(cCtx *cli.Context) error {
+func (c *viamClient) organizationsAPIKeyCreateAction(cCtx *cli.Context, args organizationsAPIKeyCreateArgs) error {
 	if err := c.ensureLoggedIn(); err != nil {
 		return err
 	}
-	orgID := cCtx.String(apiKeyCreateFlagOrgID)
-	keyName := cCtx.String(apiKeyCreateFlagName)
+	orgID := args.OrgID
+	keyName := args.Name
 	if keyName == "" {
-		// Default name is in the form myusername@gmail.com-2009-11-10T23:00:00Z
-		// or key-uuid-2009-11-10T23:00:00Z if it was created by a key
-		keyName = fmt.Sprintf("%s-%s", c.conf.Auth, time.Now().Format(time.RFC3339))
-		infof(cCtx.App.Writer, "Using default key name of %q", keyName)
+		keyName = c.generateDefaultKeyName()
+		infof(cCtx.App.Writer, "using default key name of %q", keyName)
 	}
 	resp, err := c.createOrganizationAPIKey(orgID, keyName)
 	if err != nil {
 		return err
 	}
 	infof(cCtx.App.Writer, "Successfully created key:")
-	printf(cCtx.App.Writer, "Key ID: %s\n", resp.GetId())
-	printf(cCtx.App.Writer, "Key Value: %s\n\n", resp.GetKey())
+	printf(cCtx.App.Writer, "Key ID: %s ", resp.GetId())
+	printf(cCtx.App.Writer, "Key Value: %s", resp.GetKey())
 	warningf(cCtx.App.Writer, "Keep this key somewhere safe; it has full write access to your organization")
 	return nil
 }
@@ -320,7 +355,142 @@ func (c *viamClient) createOrganizationAPIKey(orgID, keyName string) (*apppb.Cre
 	return c.client.CreateKey(c.c.Context, req)
 }
 
-func (c *viamClient) ensureLoggedIn() error {
+type locationAPIKeyCreateArgs struct {
+	LocationID string
+	OrgID      string
+	Name       string
+}
+
+// LocationAPIKeyCreateAction corresponds to `location api-key create`.
+func LocationAPIKeyCreateAction(cCtx *cli.Context, args locationAPIKeyCreateArgs) error {
+	c, err := newViamClient(cCtx)
+	if err != nil {
+		return err
+	}
+
+	err = c.locationAPIKeyCreateAction(cCtx, args)
+	return err
+}
+
+func (c *viamClient) locationAPIKeyCreateAction(cCtx *cli.Context, args locationAPIKeyCreateArgs) error {
+	if err := c.ensureLoggedIn(); err != nil {
+		return err
+	}
+
+	locationID := args.LocationID
+	orgID := args.OrgID
+	keyName := args.Name
+
+	if locationID == "" {
+		return errors.New("cannot create an api-key for a location without an ID")
+	}
+
+	if keyName == "" {
+		keyName = c.generateDefaultKeyName()
+		infof(cCtx.App.Writer, "using default key name of %s", keyName)
+	}
+
+	req := &apppb.CreateKeyRequest{
+		Name: keyName,
+		Authorizations: []*apppb.Authorization{
+			{
+				AuthorizationType: "role",
+				AuthorizationId:   "location_owner",
+				ResourceType:      "location",
+				ResourceId:        locationID,
+				OrganizationId:    orgID,
+				IdentityType:      "api-key",
+				IdentityId:        "",
+			},
+		},
+	}
+
+	key, err := c.client.CreateKey(c.c.Context, req)
+	if err != nil {
+		if strings.Contains(err.Error(), "multiple orgs") {
+			return errors.Errorf("cannot create api-key for location: %s as there are multiple orgs on the location. "+
+				"Please re-run the command with an organization-id flag set", locationID)
+		}
+		return err
+	}
+
+	infof(cCtx.App.Writer, "Successfully created key: ")
+	printf(cCtx.App.Writer, "Key ID: %s", key.GetId())
+	printf(cCtx.App.Writer, "Key Value: %s", key.GetKey())
+	warningf(cCtx.App.Writer, "Keep this key somewhere safe; it has full write access to your location")
+	return nil
+}
+
+type robotAPIKeyCreateArgs struct {
+	MachineID string
+	Name      string
+	OrgID     string
+}
+
+// RobotAPIKeyCreateAction corresponds to `machine api-key create`.
+func RobotAPIKeyCreateAction(cCtx *cli.Context, args robotAPIKeyCreateArgs) error {
+	c, err := newViamClient(cCtx)
+	if err != nil {
+		return err
+	}
+	err = c.robotAPIKeyCreateAction(cCtx, args)
+	return err
+}
+
+func (c *viamClient) robotAPIKeyCreateAction(cCtx *cli.Context, args robotAPIKeyCreateArgs) error {
+	if err := c.ensureLoggedIn(); err != nil {
+		return err
+	}
+
+	robotID := args.MachineID
+	keyName := args.Name
+	orgID := args.OrgID
+
+	if robotID == "" {
+		return errors.New("cannot create an api-key for a machine without an ID")
+	}
+
+	if keyName == "" {
+		keyName = c.generateDefaultKeyName()
+		infof(cCtx.App.Writer, "using default key name of %q", keyName)
+	}
+
+	// If we pass in an empty OrgID the CreateAPIKey endpoint
+	// will try and tie it to the default org on the location tied to the robot
+	// This only works if there is a single org on the robot
+
+	req := &apppb.CreateKeyRequest{
+		Name: keyName,
+		Authorizations: []*apppb.Authorization{
+			{
+				AuthorizationType: "role",
+				AuthorizationId:   "robot_owner",
+				ResourceType:      "robot",
+				ResourceId:        robotID,
+				OrganizationId:    orgID,
+				IdentityType:      "api-key",
+				IdentityId:        "",
+			},
+		},
+	}
+
+	key, err := c.client.CreateKey(c.c.Context, req)
+	if err != nil {
+		if strings.Contains(err.Error(), "multiple orgs") {
+			return errors.New("cannot create the machine api-key as there are multiple orgs on the location. " +
+				"Please re-run the command with an organization-id flag set")
+		}
+		return err
+	}
+	infof(cCtx.App.Writer, "Successfully created key:")
+	printf(cCtx.App.Writer, "Key ID: %s", key.GetId())
+	printf(cCtx.App.Writer, "Key Value: %s", key.GetKey())
+	warningf(cCtx.App.Writer, "Keep this key somewhere safe; it has full write access to your machine")
+
+	return nil
+}
+
+func (c *viamClient) ensureLoggedInInner() error {
 	if c.client != nil {
 		return nil
 	}
@@ -333,14 +503,19 @@ func (c *viamClient) ensureLoggedIn() error {
 	if ok && authToken.isExpired() {
 		if !authToken.canRefresh() {
 			utils.UncheckedError(c.logout())
-			return errors.New("token expired and cannot refresh")
+			return errors.New("token expired and cannot refresh, logging out. Please log in again")
 		}
 
 		// expired.
 		newToken, err := c.authFlow.refreshToken(c.c.Context, authToken)
 		if err != nil {
+			globalArgs, err := getGlobalArgs(c.c)
+			if err != nil {
+				return err
+			}
+			debugf(c.c.App.Writer, globalArgs.Debug, "Token refresh error: %v", err)
 			utils.UncheckedError(c.logout()) // clear cache if failed to refresh
-			return errors.Wrapf(err, "error while refreshing token")
+			return errors.New("error while refreshing token, logging out. Please log in again")
 		}
 
 		// write token to config.
@@ -350,7 +525,10 @@ func (c *viamClient) ensureLoggedIn() error {
 		}
 	}
 
-	rpcOpts := append(c.copyRPCOpts(), c.conf.Auth.dialOpts())
+	rpcOpts, err := c.conf.DialOptions()
+	if err != nil {
+		return err
+	}
 
 	conn, err := rpc.DialDirectGRPC(
 		c.c.Context,
@@ -365,7 +543,45 @@ func (c *viamClient) ensureLoggedIn() error {
 	c.client = apppb.NewAppServiceClient(conn)
 	c.dataClient = datapb.NewDataServiceClient(conn)
 	c.packageClient = packagepb.NewPackageServiceClient(conn)
+	c.datasetClient = datasetpb.NewDatasetServiceClient(conn)
+	c.mlTrainingClient = mltrainingpb.NewMLTrainingServiceClient(conn)
+	c.mlInferenceClient = mlinferencepb.NewMLInferenceServiceClient(conn)
+	c.buildClient = buildpb.NewBuildServiceClient(conn)
+
 	return nil
+}
+
+func (c *viamClient) ensureLoggedIn() error {
+	firstPassErr := c.ensureLoggedInInner()
+	// if err is nil we're good, if we have no profile set then trying to login with a profile is meaningless
+	if firstPassErr == nil || c.conf.profile == "" {
+		return firstPassErr
+	}
+
+	// at this point we know that we're using a profile and are not logged in, so let's try logging in
+	warningf(c.c.App.ErrWriter, "Currently logged out with profile %s, attempting to log back in...", c.conf.profile)
+
+	profiles, err := getProfiles()
+	if err != nil {
+		return multierr.Combine(firstPassErr, err)
+	}
+	profile, ok := profiles[c.conf.profile]
+	if !ok {
+		return errors.Errorf("Unable to login: profile %s not found", c.conf.profile)
+	}
+
+	args := loginWithAPIKeyArgs{
+		Key:   profile.APIKey.KeyCrypto,
+		KeyID: profile.APIKey.KeyID,
+	}
+
+	// login using the API key associated with the profile
+	if err = c.loginWithAPIKeyAction(c.c, args); err != nil {
+		return multierr.Combine(firstPassErr, err)
+	}
+
+	// ensure logged in and set clients
+	return c.ensureLoggedInInner()
 }
 
 // logout logs out the client and clears the config.
@@ -373,7 +589,7 @@ func (c *viamClient) logout() error {
 	if err := removeConfigFromCache(); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	c.conf = &config{}
+	c.conf = &Config{}
 	return nil
 }
 
@@ -395,23 +611,30 @@ func (c *viamClient) prepareDial(
 	if err != nil {
 		return nil, "", nil, err
 	}
+	return c.prepareDialInner(part.Fqdn, debug)
+}
 
+func (c *viamClient) prepareDialInner(
+	partFqdn string,
+	debug bool,
+) (context.Context, string, []rpc.DialOption, error) {
 	rpcDialer := rpc.NewCachedDialer()
 	defer func() {
 		utils.UncheckedError(rpcDialer.Close())
 	}()
 	dialCtx := rpc.ContextWithDialer(c.c.Context, rpcDialer)
 
-	rpcOpts := append(c.copyRPCOpts(),
-		rpc.WithExternalAuth(c.baseURL.Host, part.Fqdn),
-		c.conf.Auth.dialOpts(),
-	)
+	rpcOpts, err := c.conf.DialOptions()
+	if err != nil {
+		return nil, "", nil, err
+	}
+	rpcOpts = append(rpcOpts, rpc.WithExternalAuth(c.baseURL.Host, partFqdn))
 
 	if debug {
 		rpcOpts = append(rpcOpts, rpc.WithDialDebug())
 	}
 
-	return dialCtx, part.Fqdn, rpcOpts, nil
+	return dialCtx, partFqdn, rpcOpts, nil
 }
 
 func (t *token) isExpired() bool {
@@ -456,28 +679,30 @@ type tokenErrorResponse struct {
 	ErrorDescription string `json:"error_description"`
 }
 
-func newCLIAuthFlow(console io.Writer) *authFlow {
-	return newCLIAuthFlowWithAuthDomain(prodAuthDomain, prodAudience, prodClientID, console)
+func newCLIAuthFlow(console io.Writer, disableBrowserOpen bool) *authFlow {
+	return newCLIAuthFlowWithAuthDomain(prodAuthDomain, prodAudience, prodClientID, console, disableBrowserOpen)
 }
 
-func newStgCLIAuthFlow(console io.Writer) *authFlow {
-	return newCLIAuthFlowWithAuthDomain(stgAuthDomain, stgAudience, stgClientID, console)
+func newStgCLIAuthFlow(console io.Writer, disableBrowserOpen bool) *authFlow {
+	return newCLIAuthFlowWithAuthDomain(stgAuthDomain, stgAudience, stgClientID, console, disableBrowserOpen)
 }
 
-func newCLIAuthFlowWithAuthDomain(authDomain, audience, clientID string, console io.Writer) *authFlow {
+func newCLIAuthFlowWithAuthDomain(authDomain, audience, clientID string, console io.Writer, disableBrowserOpen bool) *authFlow {
 	return &authFlow{
 		clientID:              clientID,
 		scopes:                []string{"email", "openid", "offline_access"},
 		audience:              audience,
 		oidcDiscoveryEndpoint: fmt.Sprintf("%s%s", authDomain, defaultOpenIDDiscoveryPath),
 
-		httpClient: &http.Client{Timeout: time.Second * 30},
-		logger:     golog.Global(),
-		console:    console,
+		disableBrowserOpen: disableBrowserOpen,
+		httpClient:         &http.Client{Timeout: time.Second * 30},
+		logger:             logging.Global(),
+		console:            console,
 	}
 }
 
-func (a *authFlow) loginAsUser(ctx context.Context) (*token, error) {
+func (a *authFlow) loginAsUser(c *cli.Context) (*token, error) {
+	ctx := c.Context
 	discovery, err := a.loadOIDiscoveryEndpoint(ctx)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed retrieving discovery endpoint")
@@ -490,7 +715,9 @@ func (a *authFlow) loginAsUser(ctx context.Context) (*token, error) {
 
 	err = a.directUser(deviceCode)
 	if err != nil {
-		return nil, err
+		warningf(c.App.ErrWriter, "unable to open the browser to complete the login flow due to %q. "+
+			"Please go to the provided URL to log in; you can use the --%s flag to skip this warning in the future",
+			err.Error(), loginFlagDisableBrowser)
 	}
 
 	token, err := a.waitForUser(ctx, deviceCode, discovery)
@@ -557,9 +784,13 @@ func (a *authFlow) makeDeviceCodeRequest(ctx context.Context, discovery *openIDD
 }
 
 func (a *authFlow) directUser(code *deviceCodeResponse) error {
-	infof(a.console, `You can log into Viam through the opened browser window or follow the URL below.
+	suggestedLoginMethods := ""
+	if !a.disableBrowserOpen {
+		suggestedLoginMethods = " through the opened browser window or"
+	}
+	infof(a.console, `You can log into Viam%s by following the URL below.
 Ensure the code in the URL matches the one shown in your browser.
-  %s`, code.VerificationURIComplete)
+  %s`, suggestedLoginMethods, code.VerificationURIComplete)
 
 	if a.disableBrowserOpen {
 		return nil

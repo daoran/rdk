@@ -4,11 +4,11 @@ package gantry
 import (
 	"context"
 
-	"github.com/edaniels/golog"
 	pb "go.viam.com/api/component/gantry/v1"
 	"go.viam.com/utils/protoutils"
 	"go.viam.com/utils/rpc"
 
+	"go.viam.com/rdk/logging"
 	rprotoutils "go.viam.com/rdk/protoutils"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/resource"
@@ -21,7 +21,7 @@ type client struct {
 	resource.TriviallyCloseable
 	name   string
 	client pb.GantryServiceClient
-	logger golog.Logger
+	logger logging.Logger
 }
 
 // NewClientFromConn constructs a new Client from connection passed in.
@@ -30,7 +30,7 @@ func NewClientFromConn(
 	conn rpc.ClientConn,
 	remoteName string,
 	name resource.Name,
-	logger golog.Logger,
+	logger logging.Logger,
 ) (Gantry, error) {
 	c := pb.NewGantryServiceClient(conn)
 	return &client{
@@ -91,6 +91,14 @@ func (c *client) MoveToPosition(ctx context.Context, positionsMm, speedsMmPerSec
 	if err != nil {
 		return err
 	}
+
+	if speedsMmPerSec == nil {
+		c.logger.Warnf("%s MoveToPosition: speedMmPerSec is nil", c.name)
+	}
+
+	if positionsMm == nil {
+		c.logger.Warnf("%s MoveToPosition: positionsMm is nil", c.name)
+	}
 	_, err = c.client.MoveToPosition(ctx, &pb.MoveToPositionRequest{
 		Name:           c.name,
 		PositionsMm:    positionsMm,
@@ -122,9 +130,15 @@ func (c *client) CurrentInputs(ctx context.Context) ([]referenceframe.Input, err
 	return referenceframe.FloatsToInputs(res), nil
 }
 
-func (c *client) GoToInputs(ctx context.Context, goal []referenceframe.Input) error {
-	speeds := []float64{}
-	return c.MoveToPosition(ctx, referenceframe.InputsToFloats(goal), speeds, nil)
+func (c *client) GoToInputs(ctx context.Context, inputSteps ...[]referenceframe.Input) error {
+	for _, goal := range inputSteps {
+		speeds := []float64{}
+		err := c.MoveToPosition(ctx, referenceframe.InputsToFloats(goal), speeds, nil)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *client) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {

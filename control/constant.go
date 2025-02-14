@@ -5,8 +5,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/pkg/errors"
+
+	"go.viam.com/rdk/logging"
 )
 
 type constant struct {
@@ -14,10 +15,10 @@ type constant struct {
 	cfg      BlockConfig
 	y        []*Signal
 	constant float64
-	logger   golog.Logger
+	logger   logging.Logger
 }
 
-func newConstant(config BlockConfig, logger golog.Logger) (Block, error) {
+func newConstant(config BlockConfig, logger logging.Logger) (Block, error) {
 	c := &constant{cfg: config, logger: logger}
 	if err := c.reset(); err != nil {
 		return nil, err
@@ -26,6 +27,8 @@ func newConstant(config BlockConfig, logger golog.Logger) (Block, error) {
 }
 
 func (b *constant) Next(ctx context.Context, x []*Signal, dt time.Duration) ([]*Signal, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return b.y, true
 }
 
@@ -36,9 +39,9 @@ func (b *constant) reset() error {
 	if len(b.cfg.DependsOn) > 0 {
 		return errors.Errorf("invalid number of inputs for constant block %s expected 0 got %d", b.cfg.Name, len(b.cfg.DependsOn))
 	}
-	b.constant = b.cfg.Attribute.Float64("constant_val", 0.0)
+	b.constant = b.cfg.Attribute["constant_val"].(float64) // default 0
 	b.y = make([]*Signal, 1)
-	b.y[0] = makeSignal(b.cfg.Name)
+	b.y[0] = makeSignal(b.cfg.Name, b.cfg.Type)
 	b.y[0].SetSignalValueAt(0, b.constant)
 	return nil
 }
@@ -61,5 +64,7 @@ func (b *constant) Output(ctx context.Context) []*Signal {
 }
 
 func (b *constant) Config(ctx context.Context) BlockConfig {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return b.cfg
 }

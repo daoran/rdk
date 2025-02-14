@@ -1,6 +1,7 @@
 package referenceframe
 
 import (
+	"fmt"
 	"strconv"
 
 	"github.com/jedib0t/go-pretty/v6/table"
@@ -115,7 +116,7 @@ func (ws *WorldState) String() string {
 		for _, geometry := range geometries.geometries {
 			t.AppendRow([]interface{}{
 				geometry.Label(),
-				geometry.String(),
+				fmt.Sprint(geometry),
 				geometries.frame,
 			})
 		}
@@ -146,7 +147,7 @@ func (ws *WorldState) Transforms() []*LinkInFrame {
 
 // ObstaclesInWorldFrame takes a frame system and a set of inputs for that frame system and converts all the obstacles
 // in the WorldState such that they are in the frame system's World reference frame.
-func (ws *WorldState) ObstaclesInWorldFrame(fs FrameSystem, inputs map[string][]Input) (*GeometriesInFrame, error) {
+func (ws *WorldState) ObstaclesInWorldFrame(fs FrameSystem, inputs FrameSystemInputs) (*GeometriesInFrame, error) {
 	if ws == nil {
 		return NewGeometriesInFrame(World, []spatialmath.Geometry{}), nil
 	}

@@ -6,16 +6,15 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/edaniels/golog"
 	"go.viam.com/test"
 	"go.viam.com/utils/pexec"
-	"go.viam.com/utils/rpc"
 
 	"go.viam.com/rdk/components/arm"
 	"go.viam.com/rdk/components/base"
 	"go.viam.com/rdk/components/board"
 	fakeboard "go.viam.com/rdk/components/board/fake"
 	"go.viam.com/rdk/config"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/utils"
 )
@@ -68,8 +67,22 @@ func TestDiffConfigs(t *testing.T) {
 				Model: fakeModel,
 
 				API: board.API,
+				Attributes: utils.AttributeMap{
+					"analogs": []interface{}{
+						map[string]interface{}{
+							"name": "analog1",
+							"pin":  "0",
+						},
+					},
+					"digital_interrupts": []interface{}{
+						map[string]interface{}{
+							"name": "encoder",
+							"pin":  "14",
+						},
+					},
+				},
 				ConvertedAttributes: &fakeboard.Config{
-					Analogs: []board.AnalogConfig{
+					AnalogReaders: []board.AnalogReaderConfig{
 						{
 							Name: "analog1",
 							Pin:  "0",
@@ -141,8 +154,22 @@ func TestDiffConfigs(t *testing.T) {
 				Model: fakeModel,
 
 				API: board.API,
+				Attributes: utils.AttributeMap{
+					"analogs": []interface{}{
+						map[string]interface{}{
+							"name": "analog1",
+							"pin":  "1",
+						},
+					},
+					"digital_interrupts": []interface{}{
+						map[string]interface{}{
+							"name": "encoder",
+							"pin":  "15",
+						},
+					},
+				},
 				ConvertedAttributes: &fakeboard.Config{
-					Analogs: []board.AnalogConfig{
+					AnalogReaders: []board.AnalogReaderConfig{
 						{
 							Name: "analog1",
 							Pin:  "1",
@@ -256,6 +283,14 @@ func TestDiffConfigs(t *testing.T) {
 
 							API:   board.API,
 							Model: fakeModel,
+							Attributes: utils.AttributeMap{
+								"digital_interrupts": []interface{}{
+									map[string]interface{}{
+										"name": "encoder2",
+										"pin":  "16",
+									},
+								},
+							},
 							ConvertedAttributes: &fakeboard.Config{
 								DigitalInterrupts: []board.DigitalInterruptConfig{{Name: "encoder2", Pin: "16"}},
 							},
@@ -296,8 +331,16 @@ func TestDiffConfigs(t *testing.T) {
 
 							API:   board.API,
 							Model: fakeModel,
+							Attributes: utils.AttributeMap{
+								"analogs": []interface{}{
+									map[string]interface{}{
+										"name": "analog1",
+										"pin":  "1",
+									},
+								},
+							},
 							ConvertedAttributes: &fakeboard.Config{
-								Analogs: []board.AnalogConfig{{Name: "analog1", Pin: "1"}},
+								AnalogReaders: []board.AnalogReaderConfig{{Name: "analog1", Pin: "1"}},
 							},
 						},
 					},
@@ -345,7 +388,7 @@ func TestDiffConfigs(t *testing.T) {
 	} {
 		// test with revealSensitiveConfigDiffs = true
 		t.Run(tc.Name, func(t *testing.T) {
-			logger := golog.NewTestLogger(t)
+			logger := logging.NewTestLogger(t)
 			// ensure parts are valid for components, services, modules, and remotes
 			test.That(t, tc.Expected.Added.Ensure(false, logger), test.ShouldBeNil)
 			test.That(t, tc.Expected.Removed.Ensure(false, logger), test.ShouldBeNil)
@@ -355,10 +398,11 @@ func TestDiffConfigs(t *testing.T) {
 
 			for _, revealSensitiveConfigDiffs := range []bool{true, false} {
 				t.Run(fmt.Sprintf("revealSensitiveConfigDiffs=%t", revealSensitiveConfigDiffs), func(t *testing.T) {
-					logger := golog.NewTestLogger(t)
-					left, err := config.Read(context.Background(), tc.LeftFile, logger)
+					logger.Infof("Test name: %v LeftFile: `%v` RightFile: `%v`", tc.Name, tc.LeftFile, tc.RightFile)
+					logger := logging.NewTestLogger(t)
+					left, err := config.Read(context.Background(), tc.LeftFile, logger, nil)
 					test.That(t, err, test.ShouldBeNil)
-					right, err := config.Read(context.Background(), tc.RightFile, logger)
+					right, err := config.Read(context.Background(), tc.RightFile, logger, nil)
 					test.That(t, err, test.ShouldBeNil)
 
 					diff, err := config.DiffConfigs(*left, *right, revealSensitiveConfigDiffs)
@@ -374,7 +418,11 @@ func TestDiffConfigs(t *testing.T) {
 					tc.Expected.Left = diff.Left
 					tc.Expected.Right = diff.Right
 
-					test.That(t, diff, test.ShouldResemble, &tc.Expected)
+					test.That(t, diff.Added, test.ShouldResemble, tc.Expected.Added)
+					test.That(t, diff.Removed, test.ShouldResemble, tc.Expected.Removed)
+					test.That(t, diff.Modified, test.ShouldResemble, tc.Expected.Modified)
+					test.That(t, diff.ResourcesEqual, test.ShouldEqual, tc.Expected.ResourcesEqual)
+					test.That(t, diff.NetworkEqual, test.ShouldEqual, tc.Expected.NetworkEqual)
 				})
 			}
 		})
@@ -396,10 +444,10 @@ func TestDiffConfigHeterogenousTypes(t *testing.T) {
 		},
 	} {
 		t.Run(tc.Name, func(t *testing.T) {
-			logger := golog.NewTestLogger(t)
-			left, err := config.Read(context.Background(), tc.LeftFile, logger)
+			logger := logging.NewTestLogger(t)
+			left, err := config.Read(context.Background(), tc.LeftFile, logger, nil)
 			test.That(t, err, test.ShouldBeNil)
-			right, err := config.Read(context.Background(), tc.RightFile, logger)
+			right, err := config.Read(context.Background(), tc.RightFile, logger, nil)
 			test.That(t, err, test.ShouldBeNil)
 
 			_, err = config.DiffConfigs(*left, *right, true)
@@ -524,6 +572,18 @@ func TestDiffNetworkingCfg(t *testing.T) {
 			config.Config{Auth: auth2},
 			false,
 		},
+		{
+			"webprofile",
+			config.Config{},
+			config.Config{EnableWebProfile: true},
+			false,
+		},
+		{
+			"disable webprofile",
+			config.Config{EnableWebProfile: true},
+			config.Config{EnableWebProfile: false},
+			false,
+		},
 	} {
 		t.Run(tc.Name, func(t *testing.T) {
 			diff, err := config.DiffConfigs(tc.LeftCfg, tc.RightCfg, true)
@@ -563,11 +623,11 @@ func TestDiffSanitize(t *testing.T) {
 		{
 			Secret: "remsecret1",
 			Auth: config.RemoteAuth{
-				Credentials: &rpc.Credentials{
+				Credentials: &utils.Credentials{
 					Type:    "remauthtype1",
 					Payload: "payload1",
 				},
-				SignalingCreds: &rpc.Credentials{
+				SignalingCreds: &utils.Credentials{
 					Type:    "remauthtypesig1",
 					Payload: "payloadsig1",
 				},
@@ -576,11 +636,11 @@ func TestDiffSanitize(t *testing.T) {
 		{
 			Secret: "remsecret2",
 			Auth: config.RemoteAuth{
-				Credentials: &rpc.Credentials{
+				Credentials: &utils.Credentials{
 					Type:    "remauthtype2",
 					Payload: "payload2",
 				},
-				SignalingCreds: &rpc.Credentials{
+				SignalingCreds: &utils.Credentials{
 					Type:    "remauthtypesig2",
 					Payload: "payloadsig2",
 				},
@@ -671,4 +731,158 @@ func modifiedConfigDiffValidate(c *config.ModifiedConfigDiff) error {
 	}
 
 	return nil
+}
+
+func TestDiffRevision(t *testing.T) {
+	type testcase struct {
+		name         string
+		oldCfg       config.Config
+		newCfg       config.Config
+		expectedDiff config.Diff
+	}
+	for _, tc := range []testcase{
+		{
+			"no change",
+			config.Config{
+				Components: []resource.Config{{Name: "comp1"}},
+				Services:   []resource.Config{{Name: "serv1"}},
+			},
+			config.Config{
+				Components: []resource.Config{{Name: "comp1"}},
+				Services:   []resource.Config{{Name: "serv1"}},
+			},
+			config.Diff{
+				Added:    &config.Config{},
+				Modified: &config.ModifiedConfigDiff{},
+			},
+		},
+		{
+			"only change revision",
+			config.Config{
+				Components: []resource.Config{{Name: "comp1"}},
+				Services:   []resource.Config{{Name: "serv1"}},
+			},
+			config.Config{
+				Revision:   "some-revision",
+				Components: []resource.Config{{Name: "comp1"}},
+				Services:   []resource.Config{{Name: "serv1"}},
+			},
+			config.Diff{
+				Added:    &config.Config{},
+				Modified: &config.ModifiedConfigDiff{},
+				UnmodifiedResources: []resource.Config{
+					{Name: "comp1"},
+					{Name: "serv1"},
+				},
+			},
+		},
+		{
+			"add component",
+			config.Config{
+				Components: []resource.Config{{Name: "comp1"}},
+				Services:   []resource.Config{{Name: "serv1"}},
+			},
+			config.Config{
+				Revision:   "some-revision",
+				Components: []resource.Config{{Name: "comp1"}, {Name: "comp2"}},
+				Services:   []resource.Config{{Name: "serv1"}},
+			},
+			config.Diff{
+				Added: &config.Config{
+					Components: []resource.Config{{Name: "comp2"}},
+				},
+				Modified: &config.ModifiedConfigDiff{},
+				UnmodifiedResources: []resource.Config{
+					{Name: "comp1"},
+					{Name: "serv1"},
+				},
+			},
+		},
+		{
+			"add service",
+			config.Config{
+				Components: []resource.Config{{Name: "comp1"}},
+				Services:   []resource.Config{{Name: "serv1"}},
+			},
+			config.Config{
+				Revision:   "some-revision",
+				Components: []resource.Config{{Name: "comp1"}},
+				Services:   []resource.Config{{Name: "serv1"}, {Name: "serv2"}},
+			},
+			config.Diff{
+				Added: &config.Config{
+					Services: []resource.Config{{Name: "serv2"}},
+				},
+				Modified: &config.ModifiedConfigDiff{},
+				UnmodifiedResources: []resource.Config{
+					{Name: "comp1"},
+					{Name: "serv1"},
+				},
+			},
+		},
+		{
+			"modify component",
+			config.Config{
+				Components: []resource.Config{{Name: "comp1"}},
+				Services:   []resource.Config{{Name: "serv1"}},
+			},
+			config.Config{
+				Revision: "some-revision",
+				Components: []resource.Config{
+					{
+						Name:       "comp1",
+						Attributes: utils.AttributeMap{"value": 1},
+					},
+				},
+				Services: []resource.Config{{Name: "serv1"}},
+			},
+			config.Diff{
+				Added: &config.Config{},
+				Modified: &config.ModifiedConfigDiff{
+					Components: []resource.Config{
+						{
+							Name:       "comp1",
+							Attributes: utils.AttributeMap{"value": 1},
+						},
+					},
+				},
+				UnmodifiedResources: []resource.Config{{Name: "serv1"}},
+			},
+		},
+		{
+			"modify service",
+			config.Config{
+				Components: []resource.Config{{Name: "comp1"}},
+				Services:   []resource.Config{{Name: "serv1"}},
+			},
+			config.Config{
+				Revision:   "some-revision",
+				Components: []resource.Config{{Name: "comp1"}},
+				Services: []resource.Config{{
+					Name:       "serv1",
+					Attributes: utils.AttributeMap{"value": 1},
+				}},
+			},
+			config.Diff{
+				Added: &config.Config{},
+				Modified: &config.ModifiedConfigDiff{
+					Services: []resource.Config{
+						{
+							Name:       "serv1",
+							Attributes: utils.AttributeMap{"value": 1},
+						},
+					},
+				},
+				UnmodifiedResources: []resource.Config{{Name: "comp1"}},
+			},
+		},
+	} {
+		diff, err := config.DiffConfigs(tc.oldCfg, tc.newCfg, false)
+		test.That(t, err, test.ShouldBeNil)
+
+		test.That(t, diff.NewRevision(), test.ShouldEqual, tc.newCfg.Revision)
+		test.That(t, diff.Added, test.ShouldResemble, tc.expectedDiff.Added)
+		test.That(t, diff.Modified, test.ShouldResemble, tc.expectedDiff.Modified)
+		test.That(t, diff.UnmodifiedResources, test.ShouldResemble, tc.expectedDiff.UnmodifiedResources)
+	}
 }

@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"sync"
 
-	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	"github.com/pkg/errors"
 	"go.viam.com/utils/rpc"
 	"google.golang.org/grpc"
@@ -15,11 +14,8 @@ import (
 )
 
 // NewServer returns a new (module specific) rpc.Server.
-func NewServer(unary []grpc.UnaryServerInterceptor, stream []grpc.StreamServerInterceptor) rpc.Server {
-	s := &Server{server: grpc.NewServer(
-		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(unary...)),
-		grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(stream...)),
-	)}
+func NewServer(opts ...grpc.ServerOption) rpc.Server {
+	s := &Server{server: grpc.NewServer(opts...)}
 	reflection.Register(s.server)
 	return s
 }
@@ -41,6 +37,11 @@ func (s *Server) InternalAddr() net.Addr {
 // InstanceNames is unsupported.
 func (s *Server) InstanceNames() []string {
 	return []string{}
+}
+
+// EnsureAuthed is unsupported.
+func (s *Server) EnsureAuthed(ctx context.Context) (context.Context, error) {
+	return nil, errors.New("EnsureAuthed is unsupported")
 }
 
 // Start is unsupported.
@@ -96,6 +97,11 @@ func (s *Server) GRPCHandler() http.Handler {
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h := &httpHandler{}
 	h.ServeHTTP(w, r)
+}
+
+// Stats is unsupported.
+func (s *Server) Stats() any {
+	return nil
 }
 
 type httpHandler struct{}

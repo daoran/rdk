@@ -5,12 +5,13 @@ import (
 	"context"
 
 	"go.viam.com/rdk/config"
+	"go.viam.com/rdk/module"
 	"go.viam.com/rdk/resource"
 )
 
 // ModuleManager abstracts the module manager interface.
 type ModuleManager interface {
-	Add(ctx context.Context, cfg config.Module) error
+	Add(ctx context.Context, confs ...config.Module) error
 	Reconfigure(ctx context.Context, cfg config.Module) ([]resource.Name, error)
 	Remove(modName string) ([]resource.Name, error)
 
@@ -19,9 +20,16 @@ type ModuleManager interface {
 	RemoveResource(ctx context.Context, name resource.Name) error
 	IsModularResource(name resource.Name) bool
 	ValidateConfig(ctx context.Context, cfg resource.Config) ([]string, error)
+	ResolveImplicitDependenciesInConfig(ctx context.Context, conf *config.Diff) error
+	CleanModuleDataDirectory() error
 
 	Configs() []config.Module
+	AllModels() []resource.ModuleModelDiscovery
 	Provides(cfg resource.Config) bool
+	Handles() map[string]module.HandlerMap
+
+	FirstRun(ctx context.Context, conf config.Module) error
 
 	Close(ctx context.Context) error
+	Kill()
 }

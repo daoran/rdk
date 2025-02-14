@@ -5,28 +5,25 @@ import (
 	"sync"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
 	"go.viam.com/utils"
 
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/session"
 )
 
 // NewSessionManager creates a new manager for holding sessions.
 func NewSessionManager(robot Robot, heartbeatWindow time.Duration) *SessionManager {
-	cancelCtx, cancel := context.WithCancel(context.Background())
 	m := &SessionManager{
 		robot:             robot,
 		heartbeatWindow:   heartbeatWindow,
-		logger:            robot.Logger().Named("session_manager"),
+		logger:            robot.Logger().Sublogger("networking.session_manager"),
 		sessions:          map[uuid.UUID]*session.Session{},
 		resourceToSession: map[resource.Name]uuid.UUID{},
-		cancel:            cancel,
 	}
-	m.activeBackgroundWorkers.Add(1)
-	utils.ManagedGo(func() { m.expireLoop(cancelCtx) }, m.activeBackgroundWorkers.Done)
+	m.workers = utils.NewBackgroundStoppableWorkers(m.expireLoop)
 	return m
 }
 
@@ -35,15 +32,14 @@ func NewSessionManager(robot Robot, heartbeatWindow time.Duration) *SessionManag
 type SessionManager struct {
 	robot           Robot
 	heartbeatWindow time.Duration
-	logger          golog.Logger
+	logger          logging.Logger
 
 	sessionResourceMu sync.RWMutex
 	sessions          map[uuid.UUID]*session.Session
 
 	resourceToSession map[resource.Name]uuid.UUID
 
-	cancel                  func()
-	activeBackgroundWorkers sync.WaitGroup
+	workers *utils.StoppableWorkers
 }
 
 // All returns all active sessions.
@@ -139,13 +135,13 @@ func (m *SessionManager) expireLoop(ctx context.Context) {
 			for id := range toDelete {
 				deletedIDs = append(deletedIDs, id.String())
 			}
-			m.logger.Debugw("sessions expired", "session_ids", deletedIDs)
+			m.logger.CDebugw(ctx, "sessions expired", "session_ids", deletedIDs)
 		}
 		if len(toStop) != 0 {
-			m.logger.Debugw("tried to stop some resources", "resources", toStop)
+			m.logger.CDebugw(ctx, "tried to stop some resources", "resources", toStop)
 		}
 		if len(resourceErrs) != 0 {
-			m.logger.Errorw("failed to stop some resources", "errors", resourceErrs)
+			m.logger.CErrorw(ctx, "failed to stop some resources", "errors", resourceErrs)
 		}
 	}
 }
@@ -195,6 +191,5 @@ func (m *SessionManager) AssociateResource(id uuid.UUID, resourceName resource.N
 
 // Close stops the session manager but will not explicitly expire any sessions.
 func (m *SessionManager) Close() {
-	m.cancel()
-	m.activeBackgroundWorkers.Wait()
+	m.workers.Stop()
 }

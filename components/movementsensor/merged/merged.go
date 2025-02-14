@@ -7,13 +7,13 @@ import (
 	"math"
 	"sync"
 
-	"github.com/edaniels/golog"
 	"github.com/golang/geo/r3"
 	geo "github.com/kellydunn/golang-geo"
 	"go.uber.org/multierr"
 	"golang.org/x/exp/maps"
 
 	"go.viam.com/rdk/components/movementsensor"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/spatialmath"
 )
@@ -46,7 +46,7 @@ func (cfg *Config) Validate(path string) ([]string, error) {
 
 type merged struct {
 	resource.Named
-	logger golog.Logger
+	logger logging.Logger
 
 	mu sync.Mutex
 
@@ -66,7 +66,7 @@ func init() {
 		})
 }
 
-func newMergedModel(ctx context.Context, deps resource.Dependencies, conf resource.Config, logger golog.Logger) (
+func newMergedModel(ctx context.Context, deps resource.Dependencies, conf resource.Config, logger logging.Logger) (
 	movementsensor.MovementSensor, error,
 ) {
 	m := merged{
@@ -91,7 +91,7 @@ func (m *merged) Reconfigure(ctx context.Context, deps resource.Dependencies, co
 	defer m.mu.Unlock()
 
 	firstGoodSensorWithProperties := func(
-		deps resource.Dependencies, names []string, logger golog.Logger,
+		deps resource.Dependencies, names []string, logger logging.Logger,
 		want *movementsensor.Properties, propname string,
 	) (movementsensor.MovementSensor, error) {
 		// check if the config names and dependencies have been passed at all
@@ -101,14 +101,15 @@ func (m *merged) Reconfigure(ctx context.Context, deps resource.Dependencies, co
 
 		for _, name := range names {
 			ms, err := movementsensor.FromDependencies(deps, name)
+			msName := ms.Name().ShortName()
 			if err != nil {
-				logger.Debugf("error getting sensor %v from dependencies", ms.Name().ShortName())
+				logger.CDebugf(ctx, "error getting sensor %v from dependencies", msName)
 				continue
 			}
 
 			props, err := ms.Properties(ctx, nil)
 			if err != nil {
-				logger.Debugf("error in getting sensor %v properties", ms.Name().ShortName())
+				logger.CDebugf(ctx, "error in getting sensor %v properties", msName)
 				continue
 			}
 
@@ -139,6 +140,7 @@ func (m *merged) Reconfigure(ctx context.Context, deps resource.Dependencies, co
 			}
 
 			// we've found the sensor that reports everything we want
+			m.logger.Debugf("using sensor %v as %s sensor", msName, propname)
 			return ms, nil
 		}
 
@@ -269,7 +271,7 @@ func mapWithSensorName(name string, accMap map[string]float32) map[string]float3
 	return result
 }
 
-func (m *merged) Accuracy(ctx context.Context, extra map[string]interface{}) (map[string]float32, error) {
+func (m *merged) Accuracy(ctx context.Context, extra map[string]interface{}) (*movementsensor.Accuracy, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -280,70 +282,117 @@ func (m *merged) Accuracy(ctx context.Context, extra map[string]interface{}) (ma
 		oriAcc, err := m.ori.Accuracy(ctx, extra)
 		if err != nil {
 			// replace entire map with a map that shows that it has errors
-			oriAcc = map[string]float32{
-				m.ori.Name().ShortName() + errStrAccuracy: float32(math.NaN()),
+			errorAcc := &movementsensor.Accuracy{
+				AccuracyMap: map[string]float32{
+					m.ori.Name().ShortName() + errStrAccuracy: float32(math.NaN()),
+				},
 			}
+			oriAcc = errorAcc
 			errs = multierr.Combine(errs, err)
 		}
-		maps.Copy(accMap, mapWithSensorName(m.ori.Name().ShortName(), oriAcc))
+		if oriAcc != nil {
+			maps.Copy(accMap, mapWithSensorName(m.ori.Name().ShortName(), oriAcc.AccuracyMap))
+		}
 	}
+
+	hdop := float32(math.NaN())
+	vdop := float32(math.NaN())
+	nmeaFix := int32(-1)
 
 	if m.pos != nil {
 		posAcc, err := m.pos.Accuracy(ctx, extra)
 		if err != nil {
-			posAcc = map[string]float32{
-				m.pos.Name().ShortName() + errStrAccuracy: float32(math.NaN()),
+			errorAcc := &movementsensor.Accuracy{
+				AccuracyMap: map[string]float32{
+					m.pos.Name().ShortName() + errStrAccuracy: float32(math.NaN()),
+				},
 			}
+			posAcc = errorAcc
 			errs = multierr.Combine(errs, err)
 		}
-		maps.Copy(accMap, mapWithSensorName(m.pos.Name().ShortName(), posAcc))
+		if posAcc != nil {
+			maps.Copy(accMap, mapWithSensorName(m.pos.Name().ShortName(), posAcc.AccuracyMap))
+		}
+		hdop = posAcc.Hdop
+		vdop = posAcc.Vdop
+		nmeaFix = posAcc.NmeaFix
 	}
 
+	compassDegreeError := float32(math.NaN())
 	if m.compass != nil {
 		compassAcc, err := m.compass.Accuracy(ctx, extra)
 		if err != nil {
-			compassAcc = map[string]float32{
-				m.compass.Name().ShortName() + errStrAccuracy: float32(math.NaN()),
+			errorAcc := &movementsensor.Accuracy{
+				AccuracyMap: map[string]float32{
+					m.compass.Name().ShortName() + errStrAccuracy: float32(math.NaN()),
+				},
 			}
+			compassAcc = errorAcc
 			errs = multierr.Combine(errs, err)
 		}
-		maps.Copy(accMap, mapWithSensorName(m.compass.Name().ShortName(), compassAcc))
+		if compassAcc != nil {
+			maps.Copy(accMap, mapWithSensorName(m.compass.Name().ShortName(), compassAcc.AccuracyMap))
+		}
+		compassDegreeError = compassAcc.CompassDegreeError
 	}
 
 	if m.linVel != nil {
 		linvelAcc, err := m.linVel.Accuracy(ctx, extra)
 		if err != nil {
-			linvelAcc = map[string]float32{
-				m.linVel.Name().ShortName() + errStrAccuracy: float32(math.NaN()),
+			errorAcc := &movementsensor.Accuracy{
+				AccuracyMap: map[string]float32{
+					m.linVel.Name().ShortName() + errStrAccuracy: float32(math.NaN()),
+				},
 			}
+			linvelAcc = errorAcc
 			errs = multierr.Combine(errs, err)
 		}
-		maps.Copy(accMap, mapWithSensorName(m.linVel.Name().ShortName(), linvelAcc))
+		if linvelAcc != nil {
+			maps.Copy(accMap, mapWithSensorName(m.linVel.Name().ShortName(), linvelAcc.AccuracyMap))
+		}
 	}
 
 	if m.angVel != nil {
 		angvelAcc, err := m.angVel.Accuracy(ctx, extra)
 		if err != nil {
-			angvelAcc = map[string]float32{
-				m.angVel.Name().ShortName() + errStrAccuracy: float32(math.NaN()),
+			errorAcc := &movementsensor.Accuracy{
+				AccuracyMap: map[string]float32{
+					m.angVel.Name().ShortName() + errStrAccuracy: float32(math.NaN()),
+				},
 			}
+			angvelAcc = errorAcc
 			errs = multierr.Combine(errs, err)
 		}
-		maps.Copy(accMap, mapWithSensorName(m.angVel.Name().ShortName(), angvelAcc))
+		if angvelAcc != nil {
+			maps.Copy(accMap, mapWithSensorName(m.angVel.Name().ShortName(), angvelAcc.AccuracyMap))
+		}
 	}
 
 	if m.linAcc != nil {
 		linaccAcc, err := m.linAcc.Accuracy(ctx, extra)
 		if err != nil {
-			linaccAcc = map[string]float32{
-				m.linAcc.Name().ShortName() + errStrAccuracy: float32(math.NaN()),
+			errorAcc := &movementsensor.Accuracy{
+				AccuracyMap: map[string]float32{
+					m.linAcc.Name().ShortName() + errStrAccuracy: float32(math.NaN()),
+				},
 			}
+			linaccAcc = errorAcc
 			errs = multierr.Combine(errs, err)
 		}
-		maps.Copy(accMap, mapWithSensorName(m.linAcc.Name().ShortName(), linaccAcc))
+		if linaccAcc != nil {
+			maps.Copy(accMap, mapWithSensorName(m.linAcc.Name().ShortName(), linaccAcc.AccuracyMap))
+		}
 	}
 
-	return accMap, errs
+	acc := movementsensor.Accuracy{
+		AccuracyMap:        accMap,
+		Hdop:               hdop,
+		Vdop:               vdop,
+		NmeaFix:            nmeaFix,
+		CompassDegreeError: compassDegreeError,
+	}
+
+	return &acc, errs
 }
 
 func (m *merged) Properties(ctx context.Context, extra map[string]interface{}) (*movementsensor.Properties, error) {
@@ -363,7 +412,7 @@ func (m *merged) Properties(ctx context.Context, extra map[string]interface{}) (
 func (m *merged) Readings(ctx context.Context, extra map[string]interface{}) (map[string]interface{}, error) {
 	// we're already in lock in this driver
 	// don't lock the mutex again for the Readings call
-	return movementsensor.Readings(ctx, m, extra)
+	return movementsensor.DefaultAPIReadings(ctx, m, extra)
 }
 
 func (m *merged) Close(context.Context) error {

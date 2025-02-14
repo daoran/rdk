@@ -5,24 +5,25 @@ import (
 	"os"
 	"testing"
 
-	"github.com/edaniels/golog"
 	"go.viam.com/test"
 	"go.viam.com/utils/artifact"
+
+	"go.viam.com/rdk/components/camera"
+	"go.viam.com/rdk/logging"
+	"go.viam.com/rdk/utils"
 )
 
 func TestFFMPEGCamera(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	ctx := context.Background()
 	path := artifact.MustPath("components/camera/ffmpeg/testsrc.mpg")
 	cam, err := NewFFMPEGCamera(ctx, &Config{VideoPath: path}, logger)
 	test.That(t, err, test.ShouldBeNil)
-	stream, err := cam.Stream(ctx)
 	test.That(t, err, test.ShouldBeNil)
 	for i := 0; i < 5; i++ {
-		_, _, err := stream.Next(ctx)
+		_, err = camera.DecodeImageFromCamera(ctx, utils.MimeTypeJPEG, nil, cam)
 		test.That(t, err, test.ShouldBeNil)
 	}
-	test.That(t, stream.Close(context.Background()), test.ShouldBeNil)
 	test.That(t, cam.Close(context.Background()), test.ShouldBeNil)
 }
 

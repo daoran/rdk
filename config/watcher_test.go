@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/edaniels/golog"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	pb "go.viam.com/api/app/v1"
 	"go.viam.com/test"
@@ -18,13 +17,15 @@ import (
 	"go.viam.com/rdk/components/arm"
 	"go.viam.com/rdk/config"
 	"go.viam.com/rdk/config/testutils"
+	"go.viam.com/rdk/grpc"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	rutils "go.viam.com/rdk/utils"
 )
 
 func TestNewWatcherNoop(t *testing.T) {
-	logger := golog.NewTestLogger(t)
-	watcher, err := config.NewWatcher(context.Background(), &config.Config{}, logger)
+	logger := logging.NewTestLogger(t)
+	watcher, err := config.NewWatcher(context.Background(), &config.Config{}, logger, nil)
 	test.That(t, err, test.ShouldBeNil)
 
 	timer := time.NewTimer(time.Second)
@@ -39,13 +40,13 @@ func TestNewWatcherNoop(t *testing.T) {
 }
 
 func TestNewWatcherFile(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 
 	temp, err := os.CreateTemp(t.TempDir(), "*.json")
 	test.That(t, err, test.ShouldBeNil)
 	defer os.Remove(temp.Name())
 
-	watcher, err := config.NewWatcher(context.Background(), &config.Config{ConfigFilePath: temp.Name()}, logger)
+	watcher, err := config.NewWatcher(context.Background(), &config.Config{ConfigFilePath: temp.Name()}, logger, nil)
 	test.That(t, err, test.ShouldBeNil)
 
 	writeConf := func(conf *config.Config) {
@@ -130,7 +131,7 @@ func TestNewWatcherFile(t *testing.T) {
 		defer func() {
 			test.That(t, f.Close(), test.ShouldBeNil)
 		}()
-		_, err = f.Write([]byte("blahblah"))
+		_, err = f.WriteString("blahblah")
 		test.That(t, err, test.ShouldBeNil)
 		test.That(t, f.Sync(), test.ShouldBeNil)
 	}()
@@ -178,7 +179,7 @@ func TestNewWatcherFile(t *testing.T) {
 }
 
 func TestNewWatcherCloud(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 
 	certsToReturn := config.Cloud{
 		TLSCertificate: "hello",
@@ -187,11 +188,8 @@ func TestNewWatcherCloud(t *testing.T) {
 
 	deviceID := primitive.NewObjectID().Hex()
 
-	fakeServer, err := testutils.NewFakeCloudServer(context.Background(), logger)
-	test.That(t, err, test.ShouldBeNil)
-	defer func() {
-		test.That(t, fakeServer.Shutdown(), test.ShouldBeNil)
-	}()
+	fakeServer, cleanup := testutils.NewFakeCloudServer(t, context.Background(), logger)
+	defer cleanup()
 
 	storeConfigInServer := func(cfg config.Config) {
 		cloudConfProto, err := config.CloudConfigToProto(cfg.Cloud)
@@ -230,6 +228,9 @@ func TestNewWatcherCloud(t *testing.T) {
 			LocalFQDN:       "yee",
 			RefreshInterval: time.Second,
 			LocationSecrets: []config.LocationSecret{{ID: "1", Secret: "secret"}},
+			PrimaryOrgID:    "the-primary-org",
+			LocationID:      "the-location",
+			MachineID:       "the-machine",
 		}
 	}
 
@@ -259,15 +260,30 @@ func TestNewWatcherCloud(t *testing.T) {
 		}},
 	}
 
+	unprocessedFromCfg := func(cfg config.Config) *config.Config {
+		// the unprocessed config uses the original config read from the cloud,
+		// and the cloud config is missing a few fields in the proto, meaning a few fields need to be cleared out.
+		unprocessed, err := cfg.CopyOnlyPublicFields()
+		test.That(t, err, test.ShouldBeNil)
+		unprocessed.Cloud.AppAddress = ""
+		unprocessed.Cloud.RefreshInterval = 10 * time.Second
+		return unprocessed
+	}
+
 	storeConfigInServer(confToReturn)
 
-	watcher, err := config.NewWatcher(context.Background(), &config.Config{Cloud: newCloudConf()}, logger)
+	appConn, err := grpc.NewAppConn(context.Background(), confToReturn.Cloud.AppAddress, confToReturn.Cloud.Secret, confToReturn.Cloud.ID,
+		logger)
+	test.That(t, err, test.ShouldBeNil)
+	defer appConn.Close()
+	watcher, err := config.NewWatcher(context.Background(), &config.Config{Cloud: newCloudConf()}, logger, appConn)
 	test.That(t, err, test.ShouldBeNil)
 
 	confToExpect := confToReturn
 	confToExpect.Cloud.TLSCertificate = certsToReturn.TLSCertificate
 	confToExpect.Cloud.TLSPrivateKey = certsToReturn.TLSPrivateKey
 	test.That(t, confToExpect.Ensure(true, logger), test.ShouldBeNil)
+	confToExpect.SetToCache(unprocessedFromCfg(confToExpect))
 
 	newConf := <-watcher.Config()
 	test.That(t, newConf, test.ShouldResemble, &confToExpect)
@@ -305,6 +321,7 @@ func TestNewWatcherCloud(t *testing.T) {
 	confToExpect.Cloud.TLSCertificate = certsToReturn.TLSCertificate
 	confToExpect.Cloud.TLSPrivateKey = certsToReturn.TLSPrivateKey
 	test.That(t, confToExpect.Ensure(true, logger), test.ShouldBeNil)
+	confToExpect.SetToCache(unprocessedFromCfg(confToExpect))
 
 	newConf = <-watcher.Config()
 	test.That(t, newConf, test.ShouldResemble, &confToExpect)
@@ -356,6 +373,7 @@ func TestNewWatcherCloud(t *testing.T) {
 	confToExpect.Cloud.TLSCertificate = certsToReturn.TLSCertificate
 	confToExpect.Cloud.TLSPrivateKey = certsToReturn.TLSPrivateKey
 	test.That(t, confToExpect.Ensure(true, logger), test.ShouldBeNil)
+	confToExpect.SetToCache(unprocessedFromCfg(confToExpect))
 
 	newConf = <-watcher.Config()
 	test.That(t, newConf, test.ShouldResemble, &confToExpect)

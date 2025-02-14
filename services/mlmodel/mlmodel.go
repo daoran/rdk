@@ -1,5 +1,8 @@
 // Package mlmodel defines the client and server for a service that can take in a map of
 // input tensors/arrays, pass them through an inference engine, and then return a map output tensors/arrays.
+// For more information, see the [ML model service docs].
+//
+// [ML model service docs]: https://docs.viam.com/services/ml/deploy/
 package mlmodel
 
 import (
@@ -28,9 +31,45 @@ func init() {
 // Service defines the ML Model interface, which takes a map of inputs, runs it through
 // an inference engine, and creates a map of outputs. Metadata is necessary in order to build
 // the struct that will decode that map[string]interface{} correctly.
+// For more information, see the [ML model service docs].
+//
+// Infer example:
+//
+//	import (
+//		"go.viam.com/rdk/ml"
+//		"gorgonia.org/tensor"
+//	 )
+//
+//	myMLModel, err := mlmodel.FromRobot(machine, "my_mlmodel")
+//
+//	input_tensors := ml.Tensors{
+//		"image": tensor.New(
+//			tensor.Of(tensor.Uint8),
+//			tensor.WithShape(1, 384, 384, 3),
+//		        tensor.WithBacking(make([]uint8, 1*384*384*3)),
+//		),
+//	}
+//
+//	output_tensors, err := myMLModel.Infer(context.Background(), input_tensors)
+//
+// For more information, see the [Infer method docs].
+//
+// Metadata example:
+//
+//	myMLModel, err := mlmodel.FromRobot(machine, "my_mlmodel")
+//	metadata, err := myMLModel.Metadata(context.Background())
+//
+// For more information, see the [Metadata method docs].
+//
+// [ML model service docs]: https://docs.viam.com/data-ai/ai/deploy/
+// [Infer method docs]: https://docs.viam.com/dev/reference/apis/services/ml/#infer
+// [Metadata method docs]: https://docs.viam.com/dev/reference/apis/services/ml/#metadata
 type Service interface {
 	resource.Resource
-	Infer(ctx context.Context, tensors ml.Tensors, input map[string]interface{}) (ml.Tensors, map[string]interface{}, error)
+	// Infer returns an output tensor map after running an input tensor map through an interface model.
+	Infer(ctx context.Context, tensors ml.Tensors) (ml.Tensors, error)
+
+	// Metadata returns the metadata: name, data type, expected tensor/array shape, inputs, and outputs associated with the ML model.
 	Metadata(ctx context.Context) (MLMetadata, error)
 }
 
@@ -42,7 +81,7 @@ func TensorsToProto(ts ml.Tensors) (*servicepb.FlatTensors, error) {
 	for name, t := range ts {
 		tp, err := tensorToProto(t)
 		if err != nil {
-			return nil, errors.Wrap(err, "failed to convert tensor to proto message")
+			return nil, errors.Wrapf(err, "failed to convert tensor %q to proto message", name)
 		}
 		pbts.Tensors[name] = tp
 	}
@@ -67,6 +106,12 @@ func tensorToProto(t *tensor.Dense) (*servicepb.FlatTensor, error) {
 		ftpb.Tensor = &servicepb.FlatTensor_Uint8Tensor{
 			Uint8Tensor: &servicepb.FlatTensorDataUInt8{
 				Data: dataSlice,
+			},
+		}
+	case uint8:
+		ftpb.Tensor = &servicepb.FlatTensor_Uint8Tensor{
+			Uint8Tensor: &servicepb.FlatTensorDataUInt8{
+				Data: []uint8{dataSlice},
 			},
 		}
 	case []int16:
@@ -121,6 +166,12 @@ func tensorToProto(t *tensor.Dense) (*servicepb.FlatTensor, error) {
 				Data: dataSlice,
 			},
 		}
+	case float32:
+		ftpb.Tensor = &servicepb.FlatTensor_FloatTensor{
+			FloatTensor: &servicepb.FlatTensorDataFloat{
+				Data: []float32{dataSlice},
+			},
+		}
 	case []float64:
 		ftpb.Tensor = &servicepb.FlatTensor_DoubleTensor{
 			DoubleTensor: &servicepb.FlatTensorDataDouble{
@@ -128,7 +179,7 @@ func tensorToProto(t *tensor.Dense) (*servicepb.FlatTensor, error) {
 			},
 		}
 	default:
-		return nil, errors.Errorf("cannot turn underlying tensor data of type %T into proto message", dataSlice)
+		return nil, errors.Errorf("cannot turn underlying tensor data of type %T into proto message", data)
 	}
 	return ftpb, nil
 }

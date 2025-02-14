@@ -43,6 +43,7 @@ coverage.xml
 profile*.pdf
 code-coverage-results.md
 metadata
+data.ndjson
 
 *~
 *#
@@ -53,7 +54,6 @@ metadata
 # act
 .secrets
 
-/data/
 out/
 .idea/*
 bin/
@@ -79,3 +79,19 @@ google-credentials.json
 
 # frontend built artifacts are not committed (they are generated during appimage github workflow step)
 web/runtime-shared/static
+
+etc/android-ndk-*
+etc/FFmpeg
+
+# qemu core dumps
+web/cmd/server/*.core
+
+# gomobile / android
+*.aar
+*.jar
+
+# direnv (optional dev tool)
+.envrc
+
+# codegpt
+.codegpt/*

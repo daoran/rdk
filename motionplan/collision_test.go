@@ -6,7 +6,7 @@ import (
 	"github.com/golang/geo/r3"
 	"go.viam.com/test"
 
-	frame "go.viam.com/rdk/referenceframe"
+	"go.viam.com/rdk/referenceframe"
 	spatial "go.viam.com/rdk/spatialmath"
 	"go.viam.com/rdk/utils"
 )
@@ -63,57 +63,81 @@ func TestCheckCollisions(t *testing.T) {
 	obstacles[1].SetLabel("obstacleCube444")
 	obstacles = append(obstacles, bc1.Transform(spatial.NewPoseFromPoint(r3.Vector{6, 6, 6})))
 	obstacles[2].SetLabel("obstacleCube666")
-	cg, err := newCollisionGraph(robot, obstacles, nil, true)
+	cg, err := newCollisionGraph(robot, obstacles, nil, true, defaultCollisionBufferMM)
 	test.That(t, err, test.ShouldBeNil)
 	expectedCollisions := []Collision{
 		{"robotCube333", "obstacleCube444", -1},
 		{"robotCube000", "obstacleCube000", -2},
 	}
-	test.That(t, collisionListsAlmostEqual(cg.collisions(), expectedCollisions), test.ShouldBeTrue)
+	test.That(t, collisionListsAlmostEqual(cg.collisions(defaultCollisionBufferMM), expectedCollisions), test.ShouldBeTrue)
 
 	// case 2: zero position of xArm6 arm - should have number of collisions = to number of geometries - 1
 	// no external geometries considered, self collision only
-	m, err := frame.ParseModelJSONFile(utils.ResolveFile("components/arm/xarm/xarm6_kinematics.json"), "")
+	m, err := referenceframe.ParseModelJSONFile(utils.ResolveFile("components/arm/example_kinematics/xarm6_kinematics_test.json"), "")
 	test.That(t, err, test.ShouldBeNil)
-	gf, _ := m.Geometries(make([]frame.Input, len(m.DoF())))
+	gf, _ := m.Geometries(make([]referenceframe.Input, len(m.DoF())))
 	test.That(t, gf, test.ShouldNotBeNil)
-	cg, err = newCollisionGraph(gf.Geometries(), gf.Geometries(), nil, true)
+	cg, err = newCollisionGraph(gf.Geometries(), gf.Geometries(), nil, true, defaultCollisionBufferMM)
 	test.That(t, err, test.ShouldBeNil)
-	test.That(t, len(cg.collisions()), test.ShouldEqual, 4)
+	test.That(t, len(cg.collisions(defaultCollisionBufferMM)), test.ShouldEqual, 4)
 }
 
 func TestUniqueCollisions(t *testing.T) {
-	m, err := frame.ParseModelJSONFile(utils.ResolveFile("components/arm/xarm/xarm6_kinematics.json"), "")
+	m, err := referenceframe.ParseModelJSONFile(utils.ResolveFile("components/arm/example_kinematics/xarm6_kinematics_test.json"), "")
 	test.That(t, err, test.ShouldBeNil)
 
 	// zero position of xarm6 arm
-	input := make([]frame.Input, len(m.DoF()))
+	input := make([]referenceframe.Input, len(m.DoF()))
 	internalGeometries, _ := m.Geometries(input)
 	test.That(t, internalGeometries, test.ShouldNotBeNil)
-	zeroPositionCG, err := newCollisionGraph(internalGeometries.Geometries(), internalGeometries.Geometries(), nil, true)
+	zeroPositionCG, err := newCollisionGraph(
+		internalGeometries.Geometries(),
+		internalGeometries.Geometries(),
+		nil,
+		true,
+		defaultCollisionBufferMM,
+	)
 	test.That(t, err, test.ShouldBeNil)
 
 	// case 1: no self collision - check no new collisions are returned
-	input[0] = frame.Input{Value: 1}
+	input[0] = referenceframe.Input{Value: 1}
 	internalGeometries, _ = m.Geometries(input)
 	test.That(t, internalGeometries, test.ShouldNotBeNil)
-	cg, err := newCollisionGraph(internalGeometries.Geometries(), internalGeometries.Geometries(), zeroPositionCG, true)
+	cg, err := newCollisionGraph(
+		internalGeometries.Geometries(),
+		internalGeometries.Geometries(),
+		zeroPositionCG,
+		true,
+		defaultCollisionBufferMM,
+	)
 	test.That(t, err, test.ShouldBeNil)
-	test.That(t, len(cg.collisions()), test.ShouldEqual, 0)
+	test.That(t, len(cg.collisions(defaultCollisionBufferMM)), test.ShouldEqual, 0)
 
 	// case 2: self collision - check only new collisions are returned
-	input[4] = frame.Input{Value: 2}
+	input[4] = referenceframe.Input{Value: 2}
 	internalGeometries, _ = m.Geometries(input)
 	test.That(t, internalGeometries, test.ShouldNotBeNil)
-	cg, err = newCollisionGraph(internalGeometries.Geometries(), internalGeometries.Geometries(), zeroPositionCG, true)
+	cg, err = newCollisionGraph(
+		internalGeometries.Geometries(),
+		internalGeometries.Geometries(),
+		zeroPositionCG,
+		true,
+		defaultCollisionBufferMM,
+	)
 	test.That(t, err, test.ShouldBeNil)
 	expectedCollisions := []Collision{{"xArm6:base_top", "xArm6:wrist_link", -66.6}, {"xArm6:wrist_link", "xArm6:upper_arm", -48.1}}
-	test.That(t, collisionListsAlmostEqual(cg.collisions(), expectedCollisions), test.ShouldBeTrue)
+	test.That(t, collisionListsAlmostEqual(cg.collisions(defaultCollisionBufferMM), expectedCollisions), test.ShouldBeTrue)
 
 	// case 3: add a collision specification that the last element of expectedCollisions should be ignored
 	zeroPositionCG.addCollisionSpecification(&expectedCollisions[1])
 
-	cg, err = newCollisionGraph(internalGeometries.Geometries(), internalGeometries.Geometries(), zeroPositionCG, true)
+	cg, err = newCollisionGraph(
+		internalGeometries.Geometries(),
+		internalGeometries.Geometries(),
+		zeroPositionCG,
+		true,
+		defaultCollisionBufferMM,
+	)
 	test.That(t, err, test.ShouldBeNil)
-	test.That(t, collisionListsAlmostEqual(cg.collisions(), expectedCollisions[:1]), test.ShouldBeTrue)
+	test.That(t, collisionListsAlmostEqual(cg.collisions(defaultCollisionBufferMM), expectedCollisions[:1]), test.ShouldBeTrue)
 }

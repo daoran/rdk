@@ -6,6 +6,9 @@
 package spatialmath
 
 import (
+	"errors"
+	"math"
+
 	"github.com/golang/geo/r3"
 	commonpb "go.viam.com/api/common/v1"
 	"gonum.org/v1/gonum/num/dualquat"
@@ -84,16 +87,7 @@ func NewPoseFromDH(a, d, alpha float64) Pose {
 // It converts the poses to dual quaternions and multiplies them together, normalizes the transform and returns a new Pose.
 // Composition does not commute in general, i.e. you cannot guarantee ABx == BAx.
 func Compose(a, b Pose) Pose {
-	result := &dualQuaternion{dualQuaternionFromPose(a).Transformation(dualQuaternionFromPose(b).Number)}
-
-	// Normalization
-	if vecLen := 1 / quat.Abs(result.Real); vecLen != 1 {
-		result.Real.Real *= vecLen
-		result.Real.Imag *= vecLen
-		result.Real.Jmag *= vecLen
-		result.Real.Kmag *= vecLen
-	}
-	return result
+	return &dualQuaternion{dualQuaternionFromPose(a).Transformation(dualQuaternionFromPose(b).Number)}
 }
 
 // PoseBetween returns the difference between two dualQuaternions, that is, the dq which if multiplied by one will give the other.
@@ -101,13 +95,6 @@ func Compose(a, b Pose) Pose {
 func PoseBetween(a, b Pose) Pose {
 	invA := &dualQuaternion{dualquat.ConjQuat(dualQuaternionFromPose(a).Number)}
 	result := &dualQuaternion{invA.Transformation(dualQuaternionFromPose(b).Number)}
-	// Normalization
-	if vecLen := 1 / quat.Abs(result.Real); vecLen != 1 {
-		result.Real.Real *= vecLen
-		result.Real.Imag *= vecLen
-		result.Real.Jmag *= vecLen
-		result.Real.Kmag *= vecLen
-	}
 	return result
 }
 
@@ -116,13 +103,6 @@ func PoseBetween(a, b Pose) Pose {
 // PoseBetweenInverse(a, b) is equivalent to Compose(b, PoseInverse(a)).
 func PoseBetweenInverse(a, b Pose) Pose {
 	result := &dualQuaternion{dualQuaternionFromPose(b).Transformation(dualquat.ConjQuat(dualQuaternionFromPose(a).Number))}
-	// Normalization
-	if vecLen := 1 / quat.Abs(result.Real); vecLen != 1 {
-		result.Real.Real *= vecLen
-		result.Real.Imag *= vecLen
-		result.Real.Jmag *= vecLen
-		result.Real.Kmag *= vecLen
-	}
 	return result
 }
 
@@ -162,8 +142,12 @@ func PoseInverse(p Pose) Pose {
 // p1 and p2 are the two poses to interpolate between, by is a float representing the amount to interpolate between them.
 // by == 0 will return p1, by == 1 will return p2, and by == 0.5 will return the pose halfway between them.
 func Interpolate(p1, p2 Pose, by float64) Pose {
+	p2Orient := p2.Orientation().Quaternion()
+	if OrientationBetween(p1.Orientation(), p2.Orientation()).Quaternion().Real < 0 {
+		p2Orient = quat.Scale(-1, p2Orient)
+	}
 	intQ := newDualQuaternion()
-	intQ.Real = slerp(p1.Orientation().Quaternion(), p2.Orientation().Quaternion(), by)
+	intQ.Real = slerp(p1.Orientation().Quaternion(), p2Orient, by)
 
 	intQ.SetTranslation(r3.Vector{
 		(p1.Point().X + (p2.Point().X-p1.Point().X)*by),
@@ -180,7 +164,7 @@ func PoseAlmostEqual(a, b Pose) bool {
 
 // PoseAlmostEqualEps will return a bool describing whether 2 poses are approximately the same.
 func PoseAlmostEqualEps(a, b Pose, epsilon float64) bool {
-	return PoseAlmostCoincidentEps(a, b, epsilon) && OrientationAlmostEqual(a.Orientation(), b.Orientation())
+	return PoseAlmostCoincidentEps(a, b, epsilon) && OrientationAlmostEqualEps(a.Orientation(), b.Orientation(), epsilon)
 }
 
 // PoseAlmostCoincident will return a bool describing whether 2 poses approximately are at the same 3D coordinate location.
@@ -218,4 +202,27 @@ func ResetPoseDQTranslation(p Pose, v r3.Vector) {
 		panic("ResetPoseDQTranslation has to be passed a dual quaternion")
 	}
 	q.SetTranslation(v)
+}
+
+// ProjectOrientationTo2dRotation takes a pose whose orientation is not pointing at a pole and collapses its orientation into a single
+// rotation around the Z axis. This is useful for determining things like heading on a map if the component reporting heading is askew.
+func ProjectOrientationTo2dRotation(pose Pose) (Pose, error) {
+	orient := pose.Orientation().OrientationVectorRadians() // OV is easy to check if we are in plane
+	if orient.OX == 0 && orient.OY == 0 {
+		return pose, nil
+	}
+
+	// This is the vector in which a base would move if it had no changed orientation
+	adjPt := NewPoseFromPoint(r3.Vector{0, 1, 0})
+	// This is the vector a base would follow based on the reported orientation, were it unencumbered by things like gravity or the ground
+	newAdjPt := Compose(NewPoseFromOrientation(orient), adjPt).Point()
+	if 1-math.Abs(newAdjPt.Z) < orientationVectorPoleRadius {
+		if newAdjPt.Z > 0 {
+			return nil, errors.New("orientation appears to be pointing straight up, cannot project to 2d")
+		}
+		return nil, errors.New("orientation appears to be pointing straight down, cannot project to 2d")
+	}
+	// This is the vector across the ground of the above hypothetical vector, projected onto the X-Y plane.
+	theta := -math.Atan2(newAdjPt.Y, -newAdjPt.X)
+	return NewPose(pose.Point(), &OrientationVector{OZ: 1, Theta: theta}), nil
 }

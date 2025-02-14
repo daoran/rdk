@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/go-gl/mathgl/mgl64"
 	"github.com/golang/geo/r3"
 	"go.viam.com/test"
@@ -21,6 +20,7 @@ import (
 	"gonum.org/v1/gonum/mat"
 	"gonum.org/v1/gonum/num/quat"
 
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/motionplan"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/resource"
@@ -33,7 +33,7 @@ func testUR5eForwardKinematics(t *testing.T, jointRadians []float64, correct r3.
 	m, err := referenceframe.UnmarshalModelJSON(ur5modeljson, "")
 	test.That(t, err, test.ShouldBeNil)
 
-	pos, err := motionplan.ComputePosition(m, referenceframe.JointPositionsFromRadians(jointRadians))
+	pos, err := m.Transform(referenceframe.FloatsToInputs(jointRadians))
 	test.That(t, err, test.ShouldBeNil)
 	test.That(t, spatialmath.PoseAlmostCoincidentEps(pos, spatialmath.NewPoseFromPoint(correct), 0.01), test.ShouldBeTrue)
 
@@ -44,7 +44,7 @@ func testUR5eForwardKinematics(t *testing.T, jointRadians []float64, correct r3.
 func testUR5eInverseKinematics(t *testing.T, pos spatialmath.Pose) {
 	t.Helper()
 	ctx := context.Background()
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 
 	m, err := referenceframe.UnmarshalModelJSON(ur5modeljson, "")
 	test.That(t, err, test.ShouldBeNil)
@@ -179,7 +179,6 @@ func computeUR5ePosition(t *testing.T, jointRadians []float64) spatialmath.Pose 
 		OX: o.At(0, 3) - res.At(0, 3),
 		OY: o.At(1, 3) - res.At(1, 3),
 		OZ: o.At(2, 3) - res.At(2, 3),
-		// Theta: utils.RadToDeg(math.Acos(o.At(0,0))), // TODO(erh): fix this
 	}
 	ov.Normalize()
 
@@ -303,7 +302,6 @@ func setupListeners(ctx context.Context, statusBlob []byte,
 }
 
 func TestArmReconnection(t *testing.T) {
-	t.Skip()
 	var remote atomic.Bool
 
 	remote.Store(false)
@@ -311,7 +309,7 @@ func TestArmReconnection(t *testing.T) {
 	statusBlob, err := os.ReadFile(artifact.MustPath("components/arm/universalrobots/armBlob"))
 	test.That(t, err, test.ShouldBeNil)
 
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	parentCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ctx, childCancel := context.WithCancel(parentCtx)
@@ -322,16 +320,16 @@ func TestArmReconnection(t *testing.T) {
 	cfg := resource.Config{
 		Name: "testarm",
 		ConvertedAttributes: &Config{
-			Speed:               0.3,
+			SpeedDegsPerSec:     0.3,
 			Host:                "localhost",
 			ArmHostedKinematics: false,
 		},
 	}
 
-	arm, err := URArmConnect(parentCtx, cfg, logger)
+	arm, err := urArmConnect(parentCtx, cfg, logger)
 
 	test.That(t, err, test.ShouldBeNil)
-	ua, ok := arm.(*URArm)
+	ua, ok := arm.(*urArm)
 	test.That(t, ok, test.ShouldBeTrue)
 
 	testutils.WaitForAssertion(t, func(tb testing.TB) {
@@ -397,7 +395,7 @@ func TestReconfigure(t *testing.T) {
 	cfg := resource.Config{
 		Name: "testarm",
 		ConvertedAttributes: &Config{
-			Speed:               0.3,
+			SpeedDegsPerSec:     0.3,
 			Host:                "localhost",
 			ArmHostedKinematics: false,
 		},
@@ -406,7 +404,7 @@ func TestReconfigure(t *testing.T) {
 	conf1 := resource.Config{
 		Name: "testarm",
 		ConvertedAttributes: &Config{
-			Speed:               0.5,
+			SpeedDegsPerSec:     0.5,
 			Host:                "localhost",
 			ArmHostedKinematics: false,
 		},
@@ -415,7 +413,7 @@ func TestReconfigure(t *testing.T) {
 	conf2 := resource.Config{
 		Name: "testarm",
 		ConvertedAttributes: &Config{
-			Speed:               0.5,
+			SpeedDegsPerSec:     0.5,
 			Host:                "new",
 			ArmHostedKinematics: false,
 		},
@@ -424,18 +422,18 @@ func TestReconfigure(t *testing.T) {
 	conf, err := resource.NativeConfig[*Config](cfg)
 	test.That(t, err, test.ShouldBeNil)
 
-	ur5e := &URArm{
-		speed:              conf.Speed,
+	ur5e := &urArm{
+		speedRadPerSec:     conf.SpeedDegsPerSec,
 		urHostedKinematics: conf.ArmHostedKinematics,
 		host:               conf.Host,
 	}
 
 	// scenario where we do not reconfigure
 	test.That(t, ur5e.Reconfigure(context.Background(), nil, conf1), test.ShouldBeNil)
-	test.That(t, ur5e.speed, test.ShouldEqual, 0.5)
+	test.That(t, ur5e.speedRadPerSec, test.ShouldEqual, utils.DegToRad(0.5))
 
 	// scenario where we have to configure
 	test.That(t, ur5e.Reconfigure(context.Background(), nil, conf2), test.ShouldBeNil)
-	test.That(t, ur5e.speed, test.ShouldEqual, 0.5)
+	test.That(t, ur5e.speedRadPerSec, test.ShouldEqual, utils.DegToRad(0.5))
 	test.That(t, ur5e.host, test.ShouldEqual, "new")
 }

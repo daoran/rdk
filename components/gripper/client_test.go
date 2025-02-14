@@ -5,19 +5,21 @@ import (
 	"net"
 	"testing"
 
-	"github.com/edaniels/golog"
+	"github.com/golang/geo/r3"
 	"go.viam.com/test"
 	"go.viam.com/utils/rpc"
 
 	"go.viam.com/rdk/components/gripper"
 	viamgrpc "go.viam.com/rdk/grpc"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
+	"go.viam.com/rdk/spatialmath"
 	"go.viam.com/rdk/testutils"
 	"go.viam.com/rdk/testutils/inject"
 )
 
 func TestClient(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	listener1, err := net.Listen("tcp", "localhost:0")
 	test.That(t, err, test.ShouldBeNil)
 	rpcServer, err := rpc.NewServer(logger, rpc.WithUnauthenticated())
@@ -25,6 +27,7 @@ func TestClient(t *testing.T) {
 
 	var gripperOpen string
 	var extraOptions map[string]interface{}
+	expectedGeometries := []spatialmath.Geometry{spatialmath.NewPoint(r3.Vector{1, 2, 3}, "")}
 
 	grabbed1 := true
 	injectGripper := &inject.Gripper{}
@@ -41,6 +44,9 @@ func TestClient(t *testing.T) {
 		extraOptions = extra
 		return nil
 	}
+	injectGripper.GeometriesFunc = func(ctx context.Context) ([]spatialmath.Geometry, error) {
+		return expectedGeometries, nil
+	}
 
 	injectGripper2 := &inject.Gripper{}
 	injectGripper2.OpenFunc = func(ctx context.Context, extra map[string]interface{}) error {
@@ -52,6 +58,9 @@ func TestClient(t *testing.T) {
 	}
 	injectGripper2.StopFunc = func(ctx context.Context, extra map[string]interface{}) error {
 		return errStopUnimplemented
+	}
+	injectGripper2.GeometriesFunc = func(ctx context.Context) ([]spatialmath.Geometry, error) {
+		return nil, nil
 	}
 
 	gripperSvc, err := resource.NewAPIResourceCollection(
@@ -106,6 +115,13 @@ func TestClient(t *testing.T) {
 		test.That(t, gripper1Client.Stop(context.Background(), extra), test.ShouldBeNil)
 		test.That(t, extraOptions, test.ShouldResemble, extra)
 
+		extra = map[string]interface{}{"foo": "Geometries"}
+		geometries, err := gripper1Client.Geometries(context.Background(), extra)
+		test.That(t, err, test.ShouldBeNil)
+		for i, geometry := range geometries {
+			test.That(t, spatialmath.GeometriesAlmostEqual(expectedGeometries[i], geometry), test.ShouldBeTrue)
+		}
+
 		test.That(t, gripper1Client.Close(context.Background()), test.ShouldBeNil)
 
 		test.That(t, conn.Close(), test.ShouldBeNil)
@@ -131,6 +147,9 @@ func TestClient(t *testing.T) {
 		err = client2.Stop(context.Background(), extra)
 		test.That(t, err, test.ShouldNotBeNil)
 		test.That(t, err.Error(), test.ShouldContainSubstring, errStopUnimplemented.Error())
+
+		_, err = client2.Geometries(context.Background(), extra)
+		test.That(t, err.Error(), test.ShouldContainSubstring, gripper.ErrGeometriesNil(failGripperName).Error())
 
 		test.That(t, client2.Close(context.Background()), test.ShouldBeNil)
 		test.That(t, conn.Close(), test.ShouldBeNil)

@@ -2,18 +2,21 @@ package config
 
 import (
 	"reflect"
+	"strings"
 	"syscall"
 
-	"github.com/edaniels/golog"
 	"github.com/golang/geo/r3"
 	"github.com/pkg/errors"
 	packagespb "go.viam.com/api/app/packages/v1"
 	pb "go.viam.com/api/app/v1"
+	"go.viam.com/utils"
 	"go.viam.com/utils/pexec"
 	"go.viam.com/utils/protoutils"
 	"go.viam.com/utils/rpc"
 	"google.golang.org/protobuf/types/known/durationpb"
 
+	"go.viam.com/rdk/logging"
+	protoRdkUtils "go.viam.com/rdk/protoutils"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/resource"
 	spatial "go.viam.com/rdk/spatialmath"
@@ -21,7 +24,7 @@ import (
 )
 
 // FromProto converts the RobotConfig to the internal rdk equivalent.
-func FromProto(proto *pb.RobotConfig, logger golog.Logger) (*Config, error) {
+func FromProto(proto *pb.RobotConfig, logger logging.Logger) (*Config, error) {
 	cfg := Config{}
 
 	var err error
@@ -49,6 +52,7 @@ func FromProto(proto *pb.RobotConfig, logger golog.Logger) (*Config, error) {
 	if proto.DisablePartialStart != nil {
 		disablePartialStart = *proto.DisablePartialStart
 	}
+
 	cfg.Modules, err = toRDKSlice(proto.Modules, ModuleConfigFromProto, disablePartialStart, logger)
 	if err != nil {
 		return nil, errors.Wrap(err, "error converting modules config from proto")
@@ -83,6 +87,27 @@ func FromProto(proto *pb.RobotConfig, logger golog.Logger) (*Config, error) {
 		cfg.Debug = *proto.Debug
 	}
 
+	cfg.EnableWebProfile = proto.EnableWebProfile
+
+	cfg.LogConfig, err = toRDKSlice(proto.Log, LogConfigFromProto, disablePartialStart, logger)
+	if err != nil {
+		return nil, errors.Wrap(err, "error converting log config from proto")
+	}
+
+	cfg.Revision = proto.Revision
+
+	logAnyFragmentOverwriteErrors(logger, proto.OverwriteFragmentStatus)
+
+	if proto.Maintenance != nil {
+		maintenanceConfig, err := MaintenanceConfigFromProto(proto.Maintenance)
+		if err != nil {
+			return nil, errors.Wrap(err, "error converting maintenance config from proto")
+		}
+		cfg.MaintenanceConfig = maintenanceConfig
+	}
+
+	cfg.DisableLogDeduplication = proto.DisableLogDeduplication
+
 	return &cfg, nil
 }
 
@@ -101,15 +126,21 @@ func ComponentConfigToProto(conf *resource.Config) (*pb.ComponentConfig, error) 
 		return nil, errors.Wrap(err, "failed to convert service configs")
 	}
 
+	var logConfig *pb.LogConfiguration
+	if conf.LogConfiguration != nil {
+		logConfig = &pb.LogConfiguration{Level: strings.ToLower(conf.LogConfiguration.Level.String())}
+	}
+
 	protoConf := pb.ComponentConfig{
-		Name:           conf.Name,
-		Namespace:      string(conf.API.Type.Namespace),
-		Type:           conf.API.SubtypeName,
-		Api:            conf.API.String(),
-		Model:          conf.Model.String(),
-		DependsOn:      conf.DependsOn,
-		ServiceConfigs: serviceConfigs,
-		Attributes:     attributes,
+		Name:             conf.Name,
+		Namespace:        string(conf.API.Type.Namespace),
+		Type:             conf.API.SubtypeName,
+		Api:              conf.API.String(),
+		Model:            conf.Model.String(),
+		DependsOn:        conf.DependsOn,
+		ServiceConfigs:   serviceConfigs,
+		Attributes:       attributes,
+		LogConfiguration: logConfig,
 	}
 
 	if conf.Frame != nil {
@@ -150,6 +181,18 @@ func ComponentConfigFromProto(protoConf *pb.ComponentConfig) (*resource.Config, 
 		return nil, err
 	}
 
+	var logConfig *resource.LogConfig
+	if protoConf.GetLogConfiguration() != nil {
+		level, err := logging.LevelFromString(protoConf.GetLogConfiguration().Level)
+		if err != nil {
+			// Don't fail configuration due to a malformed log level.
+			level = logging.INFO
+			logging.Global().Warnw(
+				"Invalid log level.", "name", protoConf.GetName(), "log_level", protoConf.GetLogConfiguration().Level, "error", err)
+		}
+		logConfig = &resource.LogConfig{Level: level}
+	}
+
 	componentConf := resource.Config{
 		Name:                      protoConf.GetName(),
 		API:                       api,
@@ -157,6 +200,7 @@ func ComponentConfigFromProto(protoConf *pb.ComponentConfig) (*resource.Config, 
 		Attributes:                attrs,
 		DependsOn:                 protoConf.GetDependsOn(),
 		AssociatedResourceConfigs: serviceConfigs,
+		LogConfiguration:          logConfig,
 	}
 
 	if protoConf.GetFrame() != nil {
@@ -185,15 +229,21 @@ func ServiceConfigToProto(conf *resource.Config) (*pb.ServiceConfig, error) {
 		return nil, errors.Wrap(err, "failed to convert service configs")
 	}
 
+	var logConfig *pb.LogConfiguration
+	if conf.LogConfiguration != nil {
+		logConfig = &pb.LogConfiguration{Level: strings.ToLower(conf.LogConfiguration.Level.String())}
+	}
+
 	protoConf := pb.ServiceConfig{
-		Name:           conf.Name,
-		Namespace:      string(conf.API.Type.Namespace),
-		Type:           conf.API.SubtypeName,
-		Api:            conf.API.String(),
-		Model:          conf.Model.String(),
-		Attributes:     attributes,
-		DependsOn:      conf.DependsOn,
-		ServiceConfigs: serviceConfigs,
+		Name:             conf.Name,
+		Namespace:        string(conf.API.Type.Namespace),
+		Type:             conf.API.SubtypeName,
+		Api:              conf.API.String(),
+		Model:            conf.Model.String(),
+		Attributes:       attributes,
+		DependsOn:        conf.DependsOn,
+		ServiceConfigs:   serviceConfigs,
+		LogConfiguration: logConfig,
 	}
 
 	return &protoConf, nil
@@ -222,6 +272,18 @@ func ServiceConfigFromProto(protoConf *pb.ServiceConfig) (*resource.Config, erro
 		return nil, err
 	}
 
+	var logConfig *resource.LogConfig
+	if protoConf.GetLogConfiguration() != nil {
+		level, err := logging.LevelFromString(protoConf.GetLogConfiguration().Level)
+		if err != nil {
+			// Don't fail configuration due to a malformed log level.
+			level = logging.INFO
+			logging.Global().Warnw(
+				"Invalid log level.", "name", protoConf.GetName(), "log_level", protoConf.GetLogConfiguration().Level, "error", err)
+		}
+		logConfig = &resource.LogConfig{Level: level}
+	}
+
 	conf := resource.Config{
 		Name:                      protoConf.GetName(),
 		API:                       api,
@@ -229,6 +291,7 @@ func ServiceConfigFromProto(protoConf *pb.ServiceConfig) (*resource.Config, erro
 		Attributes:                attrs,
 		DependsOn:                 protoConf.GetDependsOn(),
 		AssociatedResourceConfigs: serviceConfigs,
+		LogConfiguration:          logConfig,
 	}
 
 	return &conf, nil
@@ -236,10 +299,20 @@ func ServiceConfigFromProto(protoConf *pb.ServiceConfig) (*resource.Config, erro
 
 // ModuleConfigToProto converts Module to the proto equivalent.
 func ModuleConfigToProto(module *Module) (*pb.ModuleConfig, error) {
+	var status *pb.AppValidationStatus
+	if module.Status != nil {
+		status = &pb.AppValidationStatus{Error: module.Status.Error}
+	}
+
 	proto := pb.ModuleConfig{
-		Name:     module.Name,
-		Path:     module.ExePath,
-		LogLevel: module.LogLevel,
+		Name:            module.Name,
+		Path:            module.ExePath,
+		LogLevel:        module.LogLevel,
+		Type:            string(module.Type),
+		ModuleId:        module.ModuleID,
+		Env:             module.Environment,
+		Status:          status,
+		FirstRunTimeout: durationpb.New(module.FirstRunTimeout.Unwrap()),
 	}
 
 	return &proto, nil
@@ -247,10 +320,20 @@ func ModuleConfigToProto(module *Module) (*pb.ModuleConfig, error) {
 
 // ModuleConfigFromProto creates Module from the proto equivalent.
 func ModuleConfigFromProto(proto *pb.ModuleConfig) (*Module, error) {
+	var status *AppValidationStatus
+	if proto.GetStatus() != nil {
+		status = &AppValidationStatus{Error: proto.GetStatus().GetError()}
+	}
+
 	module := Module{
-		Name:     proto.GetName(),
-		ExePath:  proto.GetPath(),
-		LogLevel: proto.GetLogLevel(),
+		Name:            proto.GetName(),
+		ExePath:         proto.GetPath(),
+		LogLevel:        proto.GetLogLevel(),
+		Type:            ModuleType(proto.GetType()),
+		ModuleID:        proto.GetModuleId(),
+		Environment:     proto.GetEnv(),
+		Status:          status,
+		FirstRunTimeout: utils.Duration(proto.GetFirstRunTimeout().AsDuration()),
 	}
 	return &module, nil
 }
@@ -263,6 +346,8 @@ func ProcessConfigToProto(process *pexec.ProcessConfig) (*pb.ProcessConfig, erro
 		Args:        process.Args,
 		Cwd:         process.CWD,
 		OneShot:     process.OneShot,
+		Username:    process.Username,
+		Env:         process.Environment,
 		Log:         process.Log,
 		StopSignal:  int32(process.StopSignal),
 		StopTimeout: durationpb.New(process.StopTimeout),
@@ -277,6 +362,8 @@ func ProcessConfigFromProto(proto *pb.ProcessConfig) (*pexec.ProcessConfig, erro
 		Args:        proto.Args,
 		CWD:         proto.Cwd,
 		OneShot:     proto.OneShot,
+		Username:    proto.Username,
+		Environment: proto.Env,
 		Log:         proto.Log,
 		StopSignal:  syscall.Signal(proto.StopSignal),
 		StopTimeout: proto.StopTimeout.AsDuration(),
@@ -562,6 +649,22 @@ func NetworkConfigToProto(network *NetworkConfig) (*pb.NetworkConfig, error) {
 	return &proto, nil
 }
 
+// MaintenanceConfigToProto converts MaintenanceConfig from the proto equivalent.
+func MaintenanceConfigToProto(maintenanceConfig *MaintenanceConfig) (*pb.MaintenanceConfig, error) {
+	// convert from string to resource name
+	name, err := resource.NewFromString(maintenanceConfig.SensorName)
+	if err != nil {
+		return nil, err
+	}
+
+	proto := pb.MaintenanceConfig{
+		SensorName:            protoRdkUtils.ResourceNameToProto(name),
+		MaintenanceAllowedKey: maintenanceConfig.MaintenanceAllowedKey,
+	}
+
+	return &proto, nil
+}
+
 // NetworkConfigFromProto creates NetworkConfig from the proto equivalent.
 func NetworkConfigFromProto(proto *pb.NetworkConfig) (*NetworkConfig, error) {
 	network := NetworkConfig{
@@ -575,6 +678,15 @@ func NetworkConfigFromProto(proto *pb.NetworkConfig) (*NetworkConfig, error) {
 	}
 
 	return &network, nil
+}
+
+// MaintenanceConfigFromProto creates a MaintenanceConfig from the proto equivalent.
+func MaintenanceConfigFromProto(proto *pb.MaintenanceConfig) (*MaintenanceConfig, error) {
+	MaintenanceConfig := MaintenanceConfig{
+		SensorName:            protoRdkUtils.ResourceNameFromProto(proto.SensorName).String(),
+		MaintenanceAllowedKey: proto.GetMaintenanceAllowedKey(),
+	}
+	return &MaintenanceConfig, nil
 }
 
 // AuthConfigToProto converts AuthConfig to the proto equivalent.
@@ -641,6 +753,9 @@ func CloudConfigToProto(cloud *Cloud) (*pb.CloudConfig, error) {
 		LocalFqdn:         cloud.LocalFQDN,
 		SignalingAddress:  cloud.SignalingAddress,
 		SignalingInsecure: cloud.SignalingInsecure,
+		PrimaryOrgId:      cloud.PrimaryOrgID,
+		LocationId:        cloud.LocationID,
+		MachineId:         cloud.MachineID,
 	}, nil
 }
 
@@ -657,6 +772,9 @@ func CloudConfigFromProto(proto *pb.CloudConfig) (*Cloud, error) {
 		//nolint:staticcheck
 		LocationSecret:    proto.GetLocationSecret(),
 		LocationSecrets:   locationSecrets,
+		LocationID:        proto.GetLocationId(),
+		PrimaryOrgID:      proto.GetPrimaryOrgId(),
+		MachineID:         proto.GetMachineId(),
 		ManagedBy:         proto.GetManagedBy(),
 		FQDN:              proto.GetFqdn(),
 		LocalFQDN:         proto.GetLocalFqdn(),
@@ -805,13 +923,13 @@ func toRDKSlice[PT, RT any](
 	protoList []*PT,
 	toRDK func(*PT) (*RT, error),
 	disablePartialStart bool,
-	logger golog.Logger,
+	logger logging.Logger,
 ) ([]RT, error) {
 	out := make([]RT, 0, len(protoList))
 	for _, proto := range protoList {
 		rdk, err := toRDK(proto)
 		if err != nil {
-			logger.Debugw("error converting from proto to config", "type", reflect.TypeOf(proto).String(), "error", err)
+			logger.Errorw("error converting from proto to config", "type", reflect.TypeOf(proto).String(), "error", err)
 			if disablePartialStart {
 				return nil, err
 			}
@@ -824,21 +942,33 @@ func toRDKSlice[PT, RT any](
 
 // PackageConfigToProto converts a rdk package config to the proto version.
 func PackageConfigToProto(cfg *PackageConfig) (*pb.PackageConfig, error) {
+	var status *pb.AppValidationStatus
+	if cfg.Status != nil {
+		status = &pb.AppValidationStatus{Error: cfg.Status.Error}
+	}
+
 	return &pb.PackageConfig{
 		Name:    cfg.Name,
 		Package: cfg.Package,
 		Version: cfg.Version,
 		Type:    string(cfg.Type),
+		Status:  status,
 	}, nil
 }
 
 // PackageConfigFromProto converts a proto package config to the rdk version.
 func PackageConfigFromProto(proto *pb.PackageConfig) (*PackageConfig, error) {
+	var status *AppValidationStatus
+	if proto.GetStatus() != nil {
+		status = &AppValidationStatus{Error: proto.GetStatus().GetError()}
+	}
+
 	return &PackageConfig{
 		Name:    proto.Name,
 		Package: proto.Package,
 		Version: proto.Version,
 		Type:    PackageType(proto.Type),
+		Status:  status,
 	}, nil
 }
 
@@ -846,18 +976,35 @@ func PackageConfigFromProto(proto *pb.PackageConfig) (*PackageConfig, error) {
 // This is required be because app/packages uses a PackageType enum but app/PackageConfig uses a string Type.
 func PackageTypeToProto(t PackageType) (*packagespb.PackageType, error) {
 	switch t {
-	case "":
-		// for backwards compatibility
-		fallthrough
 	case PackageTypeMlModel:
 		return packagespb.PackageType_PACKAGE_TYPE_ML_MODEL.Enum(), nil
 	case PackageTypeModule:
 		return packagespb.PackageType_PACKAGE_TYPE_MODULE.Enum(), nil
 	case PackageTypeSlamMap:
 		return packagespb.PackageType_PACKAGE_TYPE_SLAM_MAP.Enum(), nil
-	case PackageTypeBoardDefs:
-		return packagespb.PackageType_PACKAGE_TYPE_BOARD_DEFS.Enum(), nil
 	default:
 		return packagespb.PackageType_PACKAGE_TYPE_UNSPECIFIED.Enum(), errors.Errorf("unknown package type %q", t)
 	}
+}
+
+func logAnyFragmentOverwriteErrors(logger logging.Logger, overwriteFragmentStatus []*pb.AppValidationStatus) {
+	for _, status := range overwriteFragmentStatus {
+		logger.Errorw("error in overwriting fragment", "error", status.GetError())
+	}
+}
+
+// LogConfigToProto converts a LoggerPatternConfig type to its proto equivalent.
+func LogConfigToProto(logConfig *logging.LoggerPatternConfig) (*pb.LogPatternConfig, error) {
+	return &pb.LogPatternConfig{
+		Pattern: logConfig.Pattern,
+		Level:   logConfig.Level,
+	}, nil
+}
+
+// LogConfigFromProto converts a proto LoggerPatternConfig to the rdk version.
+func LogConfigFromProto(proto *pb.LogPatternConfig) (*logging.LoggerPatternConfig, error) {
+	return &logging.LoggerPatternConfig{
+		Pattern: proto.Pattern,
+		Level:   proto.Level,
+	}, nil
 }

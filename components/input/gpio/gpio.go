@@ -3,17 +3,17 @@ package gpio
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/bep/debounce"
-	"github.com/edaniels/golog"
+	"github.com/pkg/errors"
 	"go.viam.com/utils"
 
 	"go.viam.com/rdk/components/board"
 	"go.viam.com/rdk/components/input"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 )
 
@@ -49,10 +49,10 @@ type ButtonConfig struct {
 func (conf *Config) Validate(path string) ([]string, error) {
 	var deps []string
 	if conf.Board == "" {
-		return nil, utils.NewConfigValidationFieldRequiredError(path, "board")
+		return nil, resource.NewConfigValidationFieldRequiredError(path, "board")
 	}
 	if len(conf.Axes) == 0 && len(conf.Buttons) == 0 {
-		return nil, utils.NewConfigValidationError(path, errors.New("buttons and axes cannot be both empty"))
+		return nil, resource.NewConfigValidationError(path, errors.New("buttons and axes cannot be both empty"))
 	}
 	deps = append(deps, conf.Board)
 	return deps, nil
@@ -91,14 +91,14 @@ func NewGPIOController(
 	ctx context.Context,
 	deps resource.Dependencies,
 	conf resource.Config,
-	logger golog.Logger,
+	logger logging.Logger,
 ) (input.Controller, error) {
 	newConf, err := resource.NativeConfig[*Config](conf)
 	if err != nil {
 		return nil, err
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
+	cancelCtx, cancel := context.WithCancel(context.Background())
 	c := Controller{
 		Named:      conf.ResourceName().AsNamed(),
 		logger:     logger,
@@ -116,15 +116,19 @@ func NewGPIOController(
 		return nil, err
 	}
 
-	for interrupt, control := range newConf.Buttons {
-		err := c.newButton(ctx, brd, interrupt, *control)
+	for interruptName, control := range newConf.Buttons {
+		interrupt, err := brd.DigitalInterruptByName(interruptName)
+		if err != nil {
+			return nil, err
+		}
+		err = c.newButton(cancelCtx, brd, interrupt, *control)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	for reader, axis := range newConf.Axes {
-		err := c.newAxis(ctx, brd, reader, *axis)
+		err := c.newAxis(cancelCtx, brd, reader, *axis)
 		if err != nil {
 			return nil, err
 		}
@@ -142,7 +146,7 @@ type Controller struct {
 	mu                      sync.RWMutex
 	controls                []input.Control
 	lastEvents              map[input.Control]input.Event
-	logger                  golog.Logger
+	logger                  logging.Logger
 	activeBackgroundWorkers sync.WaitGroup
 	cancelFunc              func()
 	callbacks               map[input.Control]map[input.EventType]input.ControlFunction
@@ -254,17 +258,15 @@ func (c *Controller) sendConnectionStatus(ctx context.Context, connected bool) {
 	}
 }
 
-func (c *Controller) newButton(ctx context.Context, brd board.Board, intName string, cfg ButtonConfig) error {
-	interrupt, ok := brd.DigitalInterruptByName(intName)
-	if !ok {
-		return fmt.Errorf("can't find DigitalInterrupt (%s)", intName)
-	}
+func (c *Controller) newButton(ctx context.Context, brd board.Board, interrupt board.DigitalInterrupt, cfg ButtonConfig) error {
 	tickChan := make(chan board.Tick)
-	interrupt.AddCallback(tickChan)
+	err := brd.StreamTicks(ctx, []board.DigitalInterrupt{interrupt}, tickChan, nil)
+	if err != nil {
+		return errors.Wrap(err, "error getting digital interrupt ticks")
+	}
 
 	c.activeBackgroundWorkers.Add(1)
 	utils.ManagedGo(func() {
-		defer interrupt.RemoveCallback(tickChan)
 		debounced := debounce.New(time.Millisecond * time.Duration(cfg.DebounceMs))
 		for {
 			var val bool
@@ -304,9 +306,9 @@ func (c *Controller) newButton(ctx context.Context, brd board.Board, intName str
 }
 
 func (c *Controller) newAxis(ctx context.Context, brd board.Board, analogName string, cfg AxisConfig) error {
-	reader, ok := brd.AnalogReaderByName(analogName)
-	if !ok {
-		return fmt.Errorf("can't find AnalogReader (%s)", analogName)
+	reader, err := brd.AnalogByName(analogName)
+	if err != nil {
+		return err
 	}
 
 	c.activeBackgroundWorkers.Add(1)
@@ -322,32 +324,32 @@ func (c *Controller) newAxis(ctx context.Context, brd board.Board, analogName st
 			}
 			rawVal, err := reader.Read(ctx, nil)
 			if err != nil {
-				c.logger.Error(err)
+				c.logger.CError(ctx, err)
 			}
 
-			if rawVal > cfg.Max {
-				rawVal = cfg.Max
-			} else if rawVal < cfg.Min {
-				rawVal = cfg.Min
+			if rawVal.Value > cfg.Max {
+				rawVal.Value = cfg.Max
+			} else if rawVal.Value < cfg.Min {
+				rawVal.Value = cfg.Min
 			}
 
 			var outVal float64
 			if cfg.Bidirectional {
 				center := (cfg.Min + cfg.Max) / 2
-				if abs(rawVal-center) < cfg.Deadzone {
-					rawVal = center
+				if abs(rawVal.Value-center) < cfg.Deadzone {
+					rawVal.Value = center
 					outVal = 0.0
 				} else {
-					outVal = scaleAxis(rawVal, cfg.Min, cfg.Max, -1, 1)
+					outVal = scaleAxis(rawVal.Value, cfg.Min, cfg.Max, -1, 1)
 				}
 			} else {
-				if abs(rawVal-cfg.Min) < cfg.Deadzone {
-					rawVal = cfg.Min
+				if abs(rawVal.Value-cfg.Min) < cfg.Deadzone {
+					rawVal.Value = cfg.Min
 				}
-				outVal = scaleAxis(rawVal, cfg.Min, cfg.Max, 0, 1)
+				outVal = scaleAxis(rawVal.Value, cfg.Min, cfg.Max, 0, 1)
 			}
 
-			if abs(rawVal-prevVal) < cfg.MinChange {
+			if abs(rawVal.Value-prevVal) < cfg.MinChange {
 				continue
 			}
 
@@ -355,7 +357,7 @@ func (c *Controller) newAxis(ctx context.Context, brd board.Board, analogName st
 				outVal *= -1
 			}
 
-			prevVal = rawVal
+			prevVal = rawVal.Value
 			eventOut := input.Event{
 				Time:    time.Now(),
 				Event:   input.PositionChangeAbs,

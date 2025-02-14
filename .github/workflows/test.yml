@@ -6,27 +6,28 @@ on:
     secrets:
       MONGODB_TEST_OUTPUT_URI:
         required: true
+      DOCKER_PUBLIC_READONLY_PAT:
+        required: true
 
 env:
   MONGODB_TEST_OUTPUT_URI: ${{ secrets.MONGODB_TEST_OUTPUT_URI }}
 
 jobs:
-  build_and_test:
-    name: Build and Test
+  test_go:
+    # note: we have automations that match on platform_name. be careful changing this.
+    name: ${{ matrix.platform_name }} Go Unit Tests
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: [buildjet-8vcpu-ubuntu-2204]
-            image: ghcr.io/viamrobotics/canon:amd64-cache
+          - arch: ubuntu-large
+            image: ghcr.io/viamrobotics/rdk-devenv:amd64-cache
             platform: linux/amd64
             platform_name: linux-amd64
-            test_cmd: "make cover test-web"
-          - arch: [buildjet-8vcpu-ubuntu-2204-arm]
-            image: ghcr.io/viamrobotics/canon:arm64-cache
+          - arch: ubuntu-large-arm
+            image: ghcr.io/viamrobotics/rdk-devenv:arm64-cache
             platform: linux/arm64
             platform_name: linux-arm64
-            test_cmd: "make cover test-web"
     runs-on: ${{ matrix.arch }}
     container:
       image: ${{ matrix.image }}
@@ -34,148 +35,126 @@ jobs:
     timeout-minutes: 30
 
     steps:
-    - name: Check out code
-      if: github.event_name != 'pull_request_target'
-      uses: actions/checkout@v3
-
-    - name: Check out PR branch code
-      if: github.event_name == 'pull_request_target'
-      uses: actions/checkout@v3
-      with:
-        ref: ${{ github.event.pull_request.head.sha }}
-        fetch-depth: 0 # 0 so we can analyze history for coverage
-
-    - name: Set main env vars
-      if: github.event_name != 'pull_request_target'
-      run: |
-        echo "GITHUB_X_HEAD_SHA=${GITHUB_SHA}" >> $GITHUB_ENV
-        echo "GITHUB_X_HEAD_REF=${GITHUB_REF_NAME}" >> $GITHUB_ENV
-
-    - name: Set PR env vars
-      if: github.event_name == 'pull_request_target'
-      env:
-        GITHUB_HEAD_REF_SAN: ${{ github.event.pull_request.head.label }}
-      run: |
-        echo "GITHUB_X_HEAD_SHA=${{ github.event.pull_request.head.sha }}" >> $GITHUB_ENV
-        echo "GITHUB_X_HEAD_REF=${GITHUB_HEAD_REF_SAN}" >> $GITHUB_ENV
-        echo "GITHUB_X_PR_BASE_SHA=${{ github.event.pull_request.base.sha }}" >> $GITHUB_ENV
-        echo "GITHUB_X_PR_BASE_REF=${{ github.event.pull_request.base.ref }}" >> $GITHUB_ENV
-
-    - name: Verify no uncommitted changes from "make build lint"
-      run: |
-        git init
-        git add .
-        chown -R testbot:testbot .
-        sudo -Hu testbot bash -lc 'make build lint'
-        GEN_DIFF=$(git status -s)
-
-        if [ -n "$GEN_DIFF" ]; then
-            echo '"make build lint" resulted in changes not in git' 1>&2
-            git status
-            exit 1
-        fi
-
-    - name: Test
-      run: |
-        sudo --preserve-env=MONGODB_TEST_OUTPUT_URI,GITHUB_SHA,GITHUB_RUN_ID,GITHUB_RUN_NUMBER,GITHUB_RUN_ATTEMPT,GITHUB_X_PR_BASE_SHA,GITHUB_X_PR_BASE_REF,GITHUB_X_HEAD_REF,GITHUB_X_HEAD_SHA,GITHUB_REPOSITORY -Hu testbot bash -lc '${{ matrix.test_cmd }}'
-
-
-    - name: Upload test.json
-      if: always()
-      uses: actions/upload-artifact@v3
-      with:
-        name: test-${{ matrix.platform_name }}.json
-        path: json.log
-        retention-days: 30
-
-    # Now that RDK is public, can't directly comment without token having full read/write access
-    # code-coverage-comment.yml will trigger seperately and post the actual comments
-
-    - name: Prepare code comment
-      run: |
-        echo "PR_NUMBER=${{ github.event.pull_request.number }}" >> pr.env
-
-    - name: Mark appimage label
-      if: contains(github.event.pull_request.labels.*.name, 'appimage') || contains(github.event.pull_request.labels.*.name, 'appimage-ignore-tests')
-      run: |
-        echo "APPIMAGE=true" >> pr.env
-
-    - name: Mark static label
-      if: contains(github.event.pull_request.labels.*.name, 'static-build') || contains(github.event.pull_request.labels.*.name, 'static-ignore-tests')
-      run: |
-        echo "STATIC=true" >> pr.env
-
-    - name: Upload code coverage
-      uses: actions/upload-artifact@v3
-      with:
-        name: pr-code-coverage
-        path: |
-         pr.env
-         code-coverage-results.md
-        retention-days: 1
-
-  test_pi:
-    name: Test Raspberry Pi Code
-    runs-on: pi4
-    timeout-minutes: 5
-
-    steps:
-    - name: Clean Workspace
-      run: |
-        shopt -s dotglob
-        sudo chown -R `whoami` ./
-        rm -rf ./*
-
-    - name: Check out main branch code
-      if: github.event_name != 'pull_request_target'
-      uses: actions/checkout@v3
-
-    - name: Check out PR branch code
-      if: github.event_name == 'pull_request_target'
-      uses: actions/checkout@v3
-      with:
-        ref: ${{ github.event.pull_request.head.sha }}
-
-    - name: Test
-      run: make test-pi
-
-  test_e2e:
-    name: Test End-to-End
-    runs-on: [buildjet-8vcpu-ubuntu-2204]
-    container:
-      image: ghcr.io/viamrobotics/canon:amd64-cache
-      options: --platform linux/amd64
-    steps:
-      - name: Check out main branch code
-        if: github.event_name != 'pull_request_target'
-        uses: actions/checkout@v3
-
-      - name: Check out PR branch code
-        if: github.event_name == 'pull_request_target'
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.event.ref }}
 
-      - name: Install dependencies
+      - name: Set main env vars
+        if: github.event_name != 'pull_request_target'
         run: |
-          apt-get -y install libgtk2.0-0 libgtk-3-0 libgbm-dev libnotify-dev libgconf-2-4 libnss3 libxss1 libasound2 libxtst6 xauth xvfb netcat lsof
+          echo "GITHUB_X_HEAD_SHA=${GITHUB_SHA}" >> $GITHUB_ENV
+          echo "GITHUB_X_HEAD_REF=${GITHUB_REF_NAME}" >> $GITHUB_ENV
 
-      - name: Run e2e Tests
+      - name: Set PR env vars
+        if: github.event_name == 'pull_request_target'
+        env:
+          GITHUB_HEAD_REF_SAN: ${{ github.event.pull_request.head.label }}
         run: |
-          chown -R testbot:testbot .
-          sudo -Hu testbot bash -lc 'make build-web test-e2e E2E_ARGS="-k"'
+          echo "GITHUB_X_HEAD_SHA=${{ github.event.pull_request.head.sha }}" >> $GITHUB_ENV
+          echo "GITHUB_X_HEAD_REF=${GITHUB_HEAD_REF_SAN}" >> $GITHUB_ENV
+          echo "GITHUB_X_PR_BASE_SHA=${{ github.event.pull_request.base.sha }}" >> $GITHUB_ENV
+          echo "GITHUB_X_PR_BASE_REF=${{ github.event.pull_request.base.ref }}" >> $GITHUB_ENV
+
+      - name: Chown
+        run: chown -R testbot:testbot .
+
+      - name: Verify no uncommitted changes from "make build-go lint-go generate-go"
+        run: |
+          sudo -Hu testbot bash -lc 'git init && git add . && make build-go lint-go generate-go'
+          GEN_DIFF=$(git status -s)
+          if [ -n "$GEN_DIFF" ]; then
+              echo '"make build-go lint-go generate-go" resulted in the following untracked changes:' 1>&2
+              git diff
+              echo '"make build-go lint-go generate-go" resulted in changes not in git' 1>&2
+              git status
+              exit 1
+          fi
+
+      - name: Run go unit tests
+        run: |
+          chmod -R a+rwx . # temporary fix for arm runners
+          sudo apt-get update && sudo apt-get install -y python3-venv
+          sudo --preserve-env=MONGODB_TEST_OUTPUT_URI,GITHUB_SHA,GITHUB_RUN_ID,GITHUB_RUN_NUMBER,GITHUB_RUN_ATTEMPT,GITHUB_X_PR_BASE_SHA,GITHUB_X_PR_BASE_REF,GITHUB_X_HEAD_REF,GITHUB_X_HEAD_SHA,GITHUB_REPOSITORY -Hu testbot bash -lc 'make test-go'
+
+      - name: Upload test.json
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-${{ matrix.platform_name }}.json
+          path: json.log
+          retention-days: 30
+
+  test32:
+    name: Go 32-bit Unit Tests
+    runs-on: ubuntu-large-arm
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.ref }}
+
+      - uses: docker/login-action@v2
+        with:
+          username: viambuild
+          password: ${{ secrets.DOCKER_PUBLIC_READONLY_PAT }}
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Run go unit tests
+        run: |
+          chmod -R a+rwx . # temporary fix for arm runners
+          docker run \
+            --platform linux/arm/v7 \
+            -v `pwd`:/rdk \
+            ghcr.io/viamrobotics/rdk-devenv:armhf-cache \
+            sudo -Hu testbot bash -lc 'sudo apt-get update && sudo apt-get install -y python3-venv && cd /rdk && go test -v ./...'
+
+  motion_tests:
+    name: Test Longer-running Motion Plans if affected
+    uses: viamrobotics/rdk/.github/workflows/motion-tests.yml@main
+
+  jsonschema:
+    name: Test meta.json jsonschema
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+      - uses: actions/setup-python@v5
+        with:
+          cache-dependency-path: cli/test-requirements.txt
+      - run: |
+          go run ./cli/viam/ module create --local-only --name schematest --public-namespace ns
+          cat meta.json | jq '.models = [{"api": "x:y:z", "model": "x:y:z"}]' > meta2.json
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install -r cli/test-requirements.txt
+          check-jsonschema --schemafile ./cli/module.schema.json meta2.json
 
   test_passing:
     name: All Tests Passing
-    needs: [test_pi, build_and_test, test_e2e]
+    needs: [test_go, test32, motion_tests]
     runs-on: [ubuntu-latest]
     if: always()
     steps:
       - name: Check Results
         run: |
-          echo Pi Tests: ${{ needs.test_pi.result }}
-          echo Main Tests: ${{ needs.build_and_test.result }}
-          echo E2E Tests: ${{ needs.test_e2e.result }}
-          [ "${{ needs.test_pi.result }}" == "success" ] && \
-          [ "${{ needs.build_and_test.result }}" == "success" ] && \
-          [ "${{ needs.test_e2e.result }}" == "success" ]
+          echo Go Unit Tests: ${{ needs.test_go.result }}
+          echo Go 32-bit Tests: ${{ needs.test32.result }}
+          echo Motion Tests: ${{ needs.motion_tests.result }}
+          [ "${{ needs.test_go.result }}" == "success" ] && \
+          [ "${{ needs.test32.result }}" == "success" ] && \
+          [ "${{ needs.motion_tests.result }}" == "success" ]
+
+      # Now that RDK is public, can't directly comment without token having full read/write access
+      # code-coverage-comment.yml will trigger seperately and post the actual comments
+      - name: Prepare code comment
+        run: echo "PR_NUMBER=${{ github.event.pull_request.number }}" >> pr.env
+
+      - name: Mark appimage label
+        if: contains(github.event.pull_request.labels.*.name, 'appimage') || contains(github.event.pull_request.labels.*.name, 'appimage-ignore-tests')
+        run: echo "APPIMAGE=true" >> pr.env
+
+      - name: Mark static label
+        if: contains(github.event.pull_request.labels.*.name, 'static-build') || contains(github.event.pull_request.labels.*.name, 'static-ignore-tests')
+        run: echo "STATIC=true" >> pr.env

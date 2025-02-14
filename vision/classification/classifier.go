@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"image"
 	"sort"
-
-	"github.com/pkg/errors"
 )
 
 // Classification returns a confidence score of the classification and a label of the class.
@@ -21,11 +19,12 @@ type Classifications []Classification
 
 // TopN finds the N Classifications with the highest confidence scores.
 func (cc Classifications) TopN(n int) (Classifications, error) {
-	if len(cc) < n {
-		return nil, errors.Errorf("cannot produce top %v results from list of length %v", n, len(cc))
+	if n <= 0 {
+		return cc, nil
 	}
+	m := min(n, len(cc))
 	sort.Slice(cc, func(i, j int) bool { return cc[i].Score() > cc[j].Score() })
-	return cc[0:n], nil
+	return cc[0:m], nil
 }
 
 // A Classifier is defined as a function from an image to a list of Classifications.

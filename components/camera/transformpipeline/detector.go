@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"image"
+	"strings"
 
-	"github.com/viamrobotics/gostream"
 	"go.opencensus.io/trace"
 
 	"go.viam.com/rdk/components/camera"
@@ -19,24 +19,26 @@ import (
 
 // detectorConfig is the attribute struct for detectors (their name as found in the vision service).
 type detectorConfig struct {
-	DetectorName        string  `json:"detector_name"`
-	ConfidenceThreshold float64 `json:"confidence_threshold"`
+	DetectorName        string   `json:"detector_name"`
+	ConfidenceThreshold float64  `json:"confidence_threshold"`
+	ValidLabels         []string `json:"valid_labels"`
 }
 
 // detectorSource takes an image from the camera, and overlays the detections from the detector.
 type detectorSource struct {
-	stream       gostream.VideoStream
+	src          camera.VideoSource
 	detectorName string
+	labelFilter  objectdetection.Postprocessor // must build from ValidLabels
 	confFilter   objectdetection.Postprocessor
 	r            robot.Robot
 }
 
 func newDetectionsTransform(
 	ctx context.Context,
-	source gostream.VideoSource,
+	source camera.VideoSource,
 	r robot.Robot,
 	am utils.AttributeMap,
-) (gostream.VideoSource, camera.ImageType, error) {
+) (camera.VideoSource, camera.ImageType, error) {
 	conf, err := resource.TransformAttributeMap[*detectorConfig](am)
 	if err != nil {
 		return nil, camera.UnspecifiedStream, err
@@ -53,9 +55,15 @@ func newDetectionsTransform(
 		cameraModel.Distortion = props.DistortionParams
 	}
 	confFilter := objectdetection.NewScoreFilter(conf.ConfidenceThreshold)
+	validLabels := make(map[string]interface{})
+	for _, l := range conf.ValidLabels {
+		validLabels[strings.ToLower(l)] = struct{}{}
+	}
+	labelFilter := objectdetection.NewLabelFilter(validLabels)
 	detector := &detectorSource{
-		gostream.NewEmbeddedVideoStream(source),
+		source,
 		conf.DetectorName,
+		labelFilter,
 		confFilter,
 		r,
 	}
@@ -76,7 +84,7 @@ func (ds *detectorSource) Read(ctx context.Context) (image.Image, func(), error)
 		return nil, nil, fmt.Errorf("source_detector cant find vision service: %w", err)
 	}
 	// get image from source camera
-	img, release, err := ds.stream.Next(ctx)
+	img, release, err := camera.ReadImage(ctx, ds.src)
 	if err != nil {
 		return nil, nil, fmt.Errorf("could not get next source image: %w", err)
 	}
@@ -86,6 +94,8 @@ func (ds *detectorSource) Read(ctx context.Context) (image.Image, func(), error)
 	}
 	// overlay detections of the source image
 	dets = ds.confFilter(dets)
+	dets = ds.labelFilter(dets)
+
 	res, err := objectdetection.Overlay(img, dets)
 	if err != nil {
 		return nil, nil, fmt.Errorf("could not overlay bounding boxes: %w", err)
@@ -94,5 +104,5 @@ func (ds *detectorSource) Read(ctx context.Context) (image.Image, func(), error)
 }
 
 func (ds *detectorSource) Close(ctx context.Context) error {
-	return ds.stream.Close(ctx)
+	return nil
 }

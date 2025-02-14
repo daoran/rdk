@@ -8,13 +8,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/golang/geo/r3"
 	"github.com/pkg/errors"
 	vutils "go.viam.com/utils"
 
 	"go.viam.com/rdk/components/base"
 	"go.viam.com/rdk/components/input"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/services/baseremotecontrol"
 	"go.viam.com/rdk/session"
@@ -31,6 +31,8 @@ const (
 	arrowControl
 	droneControl
 )
+
+var modes = []string{"joystickControl", "triggerSpeedControl", "buttonControl", "arrowControl", "droneControl"}
 
 func init() {
 	resource.RegisterService(baseremotecontrol.API, resource.DefaultServiceModel, resource.Registration[baseremotecontrol.Service, *Config]{
@@ -54,14 +56,28 @@ type Config struct {
 func (conf *Config) Validate(path string) ([]string, error) {
 	var deps []string
 	if conf.InputControllerName == "" {
-		return nil, vutils.NewConfigValidationFieldRequiredError(path, "input_controller")
+		return nil, resource.NewConfigValidationFieldRequiredError(path, "input_controller")
 	}
 	deps = append(deps, conf.InputControllerName)
 
 	if conf.BaseName == "" {
-		return nil, vutils.NewConfigValidationFieldRequiredError(path, "base")
+		return nil, resource.NewConfigValidationFieldRequiredError(path, "base")
 	}
 	deps = append(deps, conf.BaseName)
+
+	if conf.ControlModeName != "" {
+		configModeExists := false
+		for _, mode := range modes {
+			if mode == conf.ControlModeName {
+				configModeExists = true
+				break
+			}
+		}
+
+		if !configModeExists {
+			return nil, resource.NewConfigValidationError(path, errors.Errorf("Control mode '%s' is not in %v", conf.ControlModeName, modes))
+		}
+	}
 
 	return deps, nil
 }
@@ -77,7 +93,7 @@ type builtIn struct {
 	config          *Config
 
 	state                   throttleState
-	logger                  golog.Logger
+	logger                  logging.Logger
 	cancel                  func()
 	cancelCtx               context.Context
 	activeBackgroundWorkers sync.WaitGroup
@@ -90,7 +106,7 @@ func NewBuiltIn(
 	ctx context.Context,
 	deps resource.Dependencies,
 	conf resource.Config,
-	logger golog.Logger,
+	logger logging.Logger,
 ) (baseremotecontrol.Service, error) {
 	cancelCtx, cancel := context.WithCancel(context.Background())
 	remoteSvc := &builtIn{
@@ -212,7 +228,7 @@ func (svc *builtIn) registerCallbacks(ctx context.Context, state *throttleState)
 		defer svc.mu.RUnlock()
 		err := svc.base.Stop(ctx, map[string]interface{}{})
 		if err != nil {
-			svc.logger.Error(err)
+			svc.logger.CError(ctx, err)
 		}
 
 		if !updateLastEvent(event) {

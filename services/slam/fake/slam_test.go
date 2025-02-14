@@ -9,24 +9,22 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/edaniels/golog"
 	"github.com/golang/geo/r3"
 	"github.com/pkg/errors"
 	"go.viam.com/test"
 	"go.viam.com/utils/artifact"
 
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/pointcloud"
 	"go.viam.com/rdk/services/slam"
 	"go.viam.com/rdk/spatialmath"
 )
 
 func TestFakeSLAMPosition(t *testing.T) {
-	expectedComponentReference := ""
-	slamSvc := NewSLAM(slam.Named("test"), golog.NewTestLogger(t))
+	slamSvc := NewSLAM(slam.Named("test"), logging.NewTestLogger(t))
 
-	p, componentReference, err := slamSvc.Position(context.Background())
+	p, err := slamSvc.Position(context.Background())
 	test.That(t, err, test.ShouldBeNil)
-	test.That(t, componentReference, test.ShouldEqual, expectedComponentReference)
 
 	// spatialmath.PoseAlmostEqual is used here as tiny differences were observed
 	// in floating point values between M1 mac & arm64 linux which
@@ -36,21 +34,25 @@ func TestFakeSLAMPosition(t *testing.T) {
 		&spatialmath.Quaternion{Real: 0.9999997195238413, Imag: 0, Jmag: 0, Kmag: 0.0007489674483818071})
 	test.That(t, spatialmath.PoseAlmostEqual(p, expectedPose), test.ShouldBeTrue)
 
-	p2, componentReference, err := slamSvc.Position(context.Background())
+	p2, err := slamSvc.Position(context.Background())
 	test.That(t, err, test.ShouldBeNil)
-	test.That(t, componentReference, test.ShouldEqual, expectedComponentReference)
 	test.That(t, p, test.ShouldResemble, p2)
 }
 
-func TestFakeSLAMLatestMapInfo(t *testing.T) {
-	slamSvc := NewSLAM(slam.Named("test"), golog.NewTestLogger(t))
+func TestFakeProperties(t *testing.T) {
+	slamSvc := NewSLAM(slam.Named("test"), logging.NewTestLogger(t))
 
-	timestamp1, err := slamSvc.LatestMapInfo(context.Background())
+	prop, err := slamSvc.Properties(context.Background())
 	test.That(t, err, test.ShouldBeNil)
-
-	timestamp2, err := slamSvc.LatestMapInfo(context.Background())
-	test.That(t, err, test.ShouldBeNil)
-	test.That(t, timestamp2.After(timestamp1), test.ShouldBeTrue)
+	test.That(t, prop.CloudSlam, test.ShouldBeFalse)
+	test.That(t, prop.MappingMode, test.ShouldEqual, slam.MappingModeLocalizationOnly)
+	test.That(t, prop.InternalStateFileType, test.ShouldEqual, ".pbstream")
+	test.That(t, prop.SensorInfo, test.ShouldResemble,
+		[]slam.SensorInfo{
+			{Name: "my-camera", Type: slam.SensorTypeCamera},
+			{Name: "my-movement-sensor", Type: slam.SensorTypeMovementSensor},
+		},
+	)
 }
 
 func TestFakeSLAMStateful(t *testing.T) {
@@ -61,7 +63,7 @@ func TestFakeSLAMStateful(t *testing.T) {
 		}()
 		// maxDataCount lowered under test to reduce test runtime
 		maxDataCount = 5
-		slamSvc := &SLAM{Named: slam.Named("test").AsNamed(), logger: golog.NewTestLogger(t)}
+		slamSvc := &SLAM{Named: slam.Named("test").AsNamed(), logger: logging.NewTestLogger(t)}
 		verifyPointCloudMapStateful(t, slamSvc)
 	})
 }
@@ -69,17 +71,23 @@ func TestFakeSLAMStateful(t *testing.T) {
 func TestFakeSLAMInternalState(t *testing.T) {
 	testName := "Returns a callback function which, returns the current fake internal state in chunks"
 	t.Run(testName, func(t *testing.T) {
-		slamSvc := NewSLAM(slam.Named("test"), golog.NewTestLogger(t))
+		slamSvc := NewSLAM(slam.Named("test"), logging.NewTestLogger(t))
 
 		path := filepath.Clean(artifact.MustPath(fmt.Sprintf(internalStateTemplate, datasetDirectory, slamSvc.getCount())))
 		expectedData, err := os.ReadFile(path)
 		test.That(t, err, test.ShouldBeNil)
+		internalStateFunc, err := slamSvc.InternalState(context.Background())
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, internalStateFunc, test.ShouldNotBeNil)
+		data := getDataFromStream(t, internalStateFunc)
 
-		data := getDataFromStream(t, slamSvc.InternalState)
 		test.That(t, len(data), test.ShouldBeGreaterThan, 0)
 		test.That(t, data, test.ShouldResemble, expectedData)
 
-		data2 := getDataFromStream(t, slamSvc.InternalState)
+		internalStateFunc2, err := slamSvc.InternalState(context.Background())
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, internalStateFunc2, test.ShouldNotBeNil)
+		data2 := getDataFromStream(t, internalStateFunc2)
 		test.That(t, len(data2), test.ShouldBeGreaterThan, 0)
 		test.That(t, data, test.ShouldResemble, data2)
 		test.That(t, data2, test.ShouldResemble, expectedData)
@@ -89,9 +97,12 @@ func TestFakeSLAMInternalState(t *testing.T) {
 func TestFakeSLAMPointMap(t *testing.T) {
 	testName := "Returns a callback function which, returns the current fake pointcloud map state in chunks and advances the dataset"
 	t.Run(testName, func(t *testing.T) {
-		slamSvc := NewSLAM(slam.Named("test"), golog.NewTestLogger(t))
+		slamSvc := NewSLAM(slam.Named("test"), logging.NewTestLogger(t))
 
-		data := getDataFromStream(t, slamSvc.PointCloudMap)
+		pointCloudFunc, err := slamSvc.PointCloudMap(context.Background(), false)
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, pointCloudFunc, test.ShouldNotBeNil)
+		data := getDataFromStream(t, pointCloudFunc)
 		test.That(t, len(data), test.ShouldBeGreaterThan, 0)
 
 		path := filepath.Clean(artifact.MustPath(fmt.Sprintf(pcdTemplate, datasetDirectory, slamSvc.getCount())))
@@ -100,7 +111,10 @@ func TestFakeSLAMPointMap(t *testing.T) {
 
 		test.That(t, data, test.ShouldResemble, expectedData)
 
-		data2 := getDataFromStream(t, slamSvc.PointCloudMap)
+		pointCloudFunc2, err := slamSvc.PointCloudMap(context.Background(), false)
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, pointCloudFunc, test.ShouldNotBeNil)
+		data2 := getDataFromStream(t, pointCloudFunc2)
 		test.That(t, len(data2), test.ShouldBeGreaterThan, 0)
 
 		path2 := filepath.Clean(artifact.MustPath(fmt.Sprintf(pcdTemplate, datasetDirectory, slamSvc.getCount())))
@@ -113,10 +127,7 @@ func TestFakeSLAMPointMap(t *testing.T) {
 	})
 }
 
-func getDataFromStream(t *testing.T, sFunc func(ctx context.Context) (func() ([]byte, error), error)) []byte {
-	f, err := sFunc(context.Background())
-	test.That(t, err, test.ShouldBeNil)
-	test.That(t, f, test.ShouldNotBeNil)
+func getDataFromStream(t *testing.T, f func() ([]byte, error)) []byte {
 	data, err := helperConcatenateChunksToFull(f)
 	test.That(t, err, test.ShouldBeNil)
 	return data
@@ -138,7 +149,7 @@ func verifyPointCloudMapStateful(t *testing.T, slamSvc *SLAM) {
 
 	// Call GetPointCloudMap twice for every testData artifact
 	for i := 0; i < testDataCount*2; i++ {
-		f, err := slamSvc.PointCloudMap(context.Background())
+		f, err := slamSvc.PointCloudMap(context.Background(), false)
 		test.That(t, err, test.ShouldBeNil)
 		test.That(t, f, test.ShouldNotBeNil)
 		pcd, err := helperConcatenateChunksToFull(f)
@@ -149,7 +160,7 @@ func verifyPointCloudMapStateful(t *testing.T, slamSvc *SLAM) {
 		getPointCloudMapResults = append(getPointCloudMapResults, pc.MetaData().MaxX)
 		test.That(t, err, test.ShouldBeNil)
 
-		p, _, err := slamSvc.Position(context.Background())
+		p, err := slamSvc.Position(context.Background())
 		test.That(t, err, test.ShouldBeNil)
 		getPositionResults = append(getPositionResults, p)
 

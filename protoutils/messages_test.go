@@ -5,9 +5,73 @@ import (
 	"strconv"
 	"testing"
 
+	robotpb "go.viam.com/api/robot/v1"
 	"go.viam.com/test"
 	"google.golang.org/protobuf/types/known/wrapperspb"
+
+	"go.viam.com/rdk/cloud"
 )
+
+func TestMetadataFromProto(t *testing.T) {
+	expected := cloud.Metadata{}
+	observed := MetadataFromProto(nil)
+	test.That(t, observed, test.ShouldResemble, expected)
+
+	partID := "123"
+	machineID := "abc"
+	orgID := "456"
+	locID := "def"
+
+	samePartID := &robotpb.GetCloudMetadataResponse{
+		RobotPartId:   partID,
+		MachinePartId: partID,
+		MachineId:     machineID,
+		PrimaryOrgId:  orgID,
+		LocationId:    locID,
+	}
+	expected = cloud.Metadata{
+		MachinePartID: partID,
+		MachineID:     machineID,
+		PrimaryOrgID:  orgID,
+		LocationID:    locID,
+	}
+	observed = MetadataFromProto(samePartID)
+	test.That(t, observed, test.ShouldResemble, expected)
+
+	robotPartID := "789"
+	diffPartID := &robotpb.GetCloudMetadataResponse{
+		RobotPartId:   robotPartID,
+		MachinePartId: partID,
+		MachineId:     machineID,
+		PrimaryOrgId:  orgID,
+		LocationId:    locID,
+	}
+	observed = MetadataFromProto(diffPartID)
+	test.That(t, observed, test.ShouldResemble, expected)
+}
+
+func TestMetadataToProto(t *testing.T) {
+	partID := "123"
+	machineID := "abc"
+	orgID := "456"
+	locID := "def"
+
+	metadata := cloud.Metadata{
+		MachinePartID: partID,
+		MachineID:     machineID,
+		PrimaryOrgID:  orgID,
+		LocationID:    locID,
+	}
+	expected := &robotpb.GetCloudMetadataResponse{
+		RobotPartId:   partID,
+		MachinePartId: partID,
+		MachineId:     machineID,
+		PrimaryOrgId:  orgID,
+		LocationId:    locID,
+	}
+	observed := MetadataToProto(metadata)
+	test.That(t, observed, test.ShouldResembleProto, expected)
+}
 
 func TestStringToAnyPB(t *testing.T) {
 	anyVal, err := ConvertStringToAnyPB("12")
@@ -15,7 +79,7 @@ func TestStringToAnyPB(t *testing.T) {
 	wrappedVal := wrapperspb.Int64(int64(12))
 	test.That(t, anyVal.MessageIs(wrappedVal), test.ShouldBeTrue)
 
-	anyVal, err = ConvertStringToAnyPB(strconv.Itoa(math.MaxInt64))
+	anyVal, err = ConvertStringToAnyPB(strconv.Itoa(math.MaxInt))
 	test.That(t, err, test.ShouldBeNil)
 	wrappedVal = wrapperspb.Int64(math.MaxInt64)
 	test.That(t, anyVal.MessageIs(wrappedVal), test.ShouldBeTrue)

@@ -2,28 +2,29 @@ package config_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
-	"github.com/edaniels/golog"
 	"go.viam.com/test"
 
 	"go.viam.com/rdk/components/arm"
 	"go.viam.com/rdk/config"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 )
 
 func TestFromReaderValidate(t *testing.T) {
-	logger := golog.NewTestLogger(t)
-	_, err := config.FromReader(context.Background(), "somepath", strings.NewReader(""), logger)
+	logger := logging.NewTestLogger(t)
+	_, err := config.FromReader(context.Background(), "somepath", strings.NewReader(""), logger, nil)
 	test.That(t, err, test.ShouldNotBeNil)
 	test.That(t, err.Error(), test.ShouldContainSubstring, "json: EOF")
 
-	_, err = config.FromReader(context.Background(), "somepath", strings.NewReader(`{"cloud": 1}`), logger)
+	_, err = config.FromReader(context.Background(), "somepath", strings.NewReader(`{"cloud": 1}`), logger, nil)
 	test.That(t, err, test.ShouldNotBeNil)
 	test.That(t, err.Error(), test.ShouldContainSubstring, "unmarshal")
 
-	conf, err := config.FromReader(context.Background(), "somepath", strings.NewReader(`{}`), logger)
+	conf, err := config.FromReader(context.Background(), "somepath", strings.NewReader(`{}`), logger, nil)
 	test.That(t, err, test.ShouldBeNil)
 	test.That(t, conf, test.ShouldResemble, &config.Config{
 		ConfigFilePath: "somepath",
@@ -38,20 +39,22 @@ func TestFromReaderValidate(t *testing.T) {
 		},
 	})
 
-	_, err = config.FromReader(context.Background(), "somepath", strings.NewReader(`{"cloud": {}}`), logger)
+	_, err = config.FromReader(context.Background(), "somepath", strings.NewReader(`{"cloud": {}}`), logger, nil)
 	test.That(t, err, test.ShouldNotBeNil)
-	test.That(t, err.Error(), test.ShouldContainSubstring, `"id" is required`)
+	test.That(t, resource.GetFieldFromFieldRequiredError(err), test.ShouldEqual, "id")
 
 	_, err = config.FromReader(context.Background(),
-		"somepath", strings.NewReader(`{"disable_partial_start":true,"components": [{}]}`), logger)
+		"somepath", strings.NewReader(`{"disable_partial_start":true,"components": [{}]}`), logger, nil)
 	test.That(t, err, test.ShouldNotBeNil)
-	test.That(t, err.Error(), test.ShouldContainSubstring, `components.0`)
-	test.That(t, err.Error(), test.ShouldContainSubstring, `"name" is required`)
+	var fre resource.FieldRequiredError
+	test.That(t, errors.As(err, &fre), test.ShouldBeTrue)
+	test.That(t, fre.Path, test.ShouldEqual, "components.0")
+	test.That(t, fre.Field, test.ShouldEqual, "name")
 
 	conf, err = config.FromReader(context.Background(),
 		"somepath",
 		strings.NewReader(`{"components": [{"name": "foo", "type": "arm", "model": "foo"}]}`),
-		logger)
+		logger, nil)
 	test.That(t, err, test.ShouldBeNil)
 	expected := &config.Config{
 		ConfigFilePath: "somepath",

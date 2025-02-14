@@ -1,11 +1,11 @@
+//go:build !no_cgo
+
 package transform
 
 import (
 	"fmt"
 	"math"
-	"math/rand"
 
-	"github.com/edaniels/golog"
 	"github.com/golang/geo/r2"
 	"github.com/golang/geo/r3"
 	"github.com/pkg/errors"
@@ -13,7 +13,9 @@ import (
 	"gonum.org/v1/gonum/mat"
 	"gonum.org/v1/gonum/optimize"
 
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/spatialmath"
+	"go.viam.com/rdk/utils"
 )
 
 // ExtrinsicCalibrationConfig stores all the necessary parameters to do an extrinsic calibration.
@@ -27,7 +29,7 @@ type ExtrinsicCalibrationConfig struct {
 // RunPinholeExtrinsicCalibration will solve the optimization problem to find the rigid pose
 // (translation and rotation) that changes the reference frame from the
 // point of view of the depth camera to the point of the view of the color camera.
-func RunPinholeExtrinsicCalibration(prob *optimize.Problem, logger golog.Logger) (spatialmath.Pose, error) {
+func RunPinholeExtrinsicCalibration(prob *optimize.Problem, logger logging.Logger) (spatialmath.Pose, error) {
 	// optimization method
 	method := &optimize.GradientDescent{
 		StepSizer:         &optimize.FirstOrderStepSize{},
@@ -44,8 +46,9 @@ func RunPinholeExtrinsicCalibration(prob *optimize.Problem, logger golog.Logger)
 	}
 	// initial value for rotation euler angles(3) and translation(3)
 	params := make([]float64, 6)
+	source := utils.SafeTestingRand()
 	for i := range params {
-		params[i] = (rand.Float64() - 0.5) / 10. //nolint:gosec // initial values for parameters
+		params[i] = (source.Float64() - 0.5) / 10.
 	}
 	// do the minimization
 	res, err := optimize.Minimize(*prob, params, settings, method)

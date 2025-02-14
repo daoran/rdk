@@ -4,28 +4,22 @@ import (
 	"context"
 	"testing"
 
-	"github.com/edaniels/golog"
 	"go.viam.com/test"
 
 	"go.viam.com/rdk/components/board"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 )
 
 func TestFakeBoard(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	boardConfig := Config{
-		I2Cs: []board.I2CConfig{
-			{Name: "main", Bus: "0"},
-		},
-		SPIs: []board.SPIConfig{
-			{Name: "aux", BusSelect: "1"},
-		},
-		Analogs: []board.AnalogConfig{
-			{Name: "blue", Pin: "0"},
+		AnalogReaders: []board.AnalogReaderConfig{
+			{Name: "blue", Pin: analogTestPin},
 		},
 		DigitalInterrupts: []board.DigitalInterruptConfig{
 			{Name: "i1", Pin: "35"},
-			{Name: "i2", Pin: "31", Type: "servo"},
+			{Name: "i2", Pin: "31"},
 			{Name: "a", Pin: "38"},
 			{Name: "b", Pin: "40"},
 		},
@@ -35,44 +29,29 @@ func TestFakeBoard(t *testing.T) {
 	b, err := NewBoard(context.Background(), cfg, logger)
 	test.That(t, err, test.ShouldBeNil)
 
-	_, ok := b.I2CByName("main")
-	test.That(t, ok, test.ShouldBeTrue)
-
-	_, ok = b.SPIByName("aux")
-	test.That(t, ok, test.ShouldBeTrue)
-
-	_, ok = b.AnalogReaderByName("blue")
-	test.That(t, ok, test.ShouldBeTrue)
-
-	_, ok = b.DigitalInterruptByName("i1")
-	test.That(t, ok, test.ShouldBeTrue)
-	_, ok = b.DigitalInterruptByName("i2")
-	test.That(t, ok, test.ShouldBeTrue)
-	_, ok = b.DigitalInterruptByName("a")
-	test.That(t, ok, test.ShouldBeTrue)
-	_, ok = b.DigitalInterruptByName("b")
-	test.That(t, ok, test.ShouldBeTrue)
-
-	status, err := b.Status(context.Background(), nil)
+	_, err = b.AnalogByName("blue")
 	test.That(t, err, test.ShouldBeNil)
 
-	test.That(t, int(status.Analogs["blue"].Value), test.ShouldEqual, 0)
-	test.That(t, int(status.DigitalInterrupts["i1"].Value), test.ShouldEqual, 0)
-	test.That(t, int(status.DigitalInterrupts["i2"].Value), test.ShouldEqual, 0)
-	test.That(t, int(status.DigitalInterrupts["a"].Value), test.ShouldEqual, 0)
-	test.That(t, int(status.DigitalInterrupts["b"].Value), test.ShouldEqual, 0)
+	_, err = b.DigitalInterruptByName("i1")
+	test.That(t, err, test.ShouldBeNil)
+	_, err = b.DigitalInterruptByName("i2")
+	test.That(t, err, test.ShouldBeNil)
+	_, err = b.DigitalInterruptByName("a")
+	test.That(t, err, test.ShouldBeNil)
+	_, err = b.DigitalInterruptByName("b")
+	test.That(t, err, test.ShouldBeNil)
 }
 
 func TestConfigValidate(t *testing.T) {
 	validConfig := Config{}
 
-	validConfig.Analogs = []board.AnalogConfig{{}}
+	validConfig.AnalogReaders = []board.AnalogReaderConfig{{}}
 	_, err := validConfig.Validate("path")
 	test.That(t, err, test.ShouldNotBeNil)
 	test.That(t, err.Error(), test.ShouldContainSubstring, `path.analogs.0`)
-	test.That(t, err.Error(), test.ShouldContainSubstring, `"name" is required`)
+	test.That(t, resource.GetFieldFromFieldRequiredError(err), test.ShouldEqual, "name")
 
-	validConfig.Analogs = []board.AnalogConfig{{Name: "bar"}}
+	validConfig.AnalogReaders = []board.AnalogReaderConfig{{Name: "bar"}}
 	_, err = validConfig.Validate("path")
 	test.That(t, err, test.ShouldBeNil)
 
@@ -80,13 +59,13 @@ func TestConfigValidate(t *testing.T) {
 	_, err = validConfig.Validate("path")
 	test.That(t, err, test.ShouldNotBeNil)
 	test.That(t, err.Error(), test.ShouldContainSubstring, `path.digital_interrupts.0`)
-	test.That(t, err.Error(), test.ShouldContainSubstring, `"name" is required`)
+	test.That(t, resource.GetFieldFromFieldRequiredError(err), test.ShouldEqual, "name")
 
 	validConfig.DigitalInterrupts = []board.DigitalInterruptConfig{{Name: "bar"}}
 	_, err = validConfig.Validate("path")
 	test.That(t, err, test.ShouldNotBeNil)
 	test.That(t, err.Error(), test.ShouldContainSubstring, `path.digital_interrupts.0`)
-	test.That(t, err.Error(), test.ShouldContainSubstring, `"pin" is required`)
+	test.That(t, resource.GetFieldFromFieldRequiredError(err), test.ShouldEqual, "pin")
 
 	validConfig.DigitalInterrupts = []board.DigitalInterruptConfig{{Name: "bar", Pin: "3"}}
 	_, err = validConfig.Validate("path")

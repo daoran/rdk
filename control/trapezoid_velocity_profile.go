@@ -6,8 +6,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/pkg/errors"
+
+	"go.viam.com/rdk/logging"
 )
 
 const (
@@ -22,20 +23,20 @@ type trapezoidVelocityGenerator struct {
 	maxVel       float64
 	lastVelCmd   float64
 	trapDistance float64
-	kPP          float64 //nolint: revive
-	kPP0         float64 //nolint: revive
+	kPP          float64
+	kPP0         float64
 	vDec         float64
 	targetPos    float64
 	y            []*Signal
 	currentPhase int
 	lastsetPoint float64
 	dir          int
-	logger       golog.Logger
+	logger       logging.Logger
 	posWindow    float64
 	kppGain      float64
 }
 
-func newTrapezoidVelocityProfile(config BlockConfig, logger golog.Logger) (Block, error) {
+func newTrapezoidVelocityProfile(config BlockConfig, logger logging.Logger) (Block, error) {
 	t := &trapezoidVelocityGenerator{cfg: config, logger: logger}
 	if err := t.reset(); err != nil {
 		return nil, err
@@ -44,14 +45,17 @@ func newTrapezoidVelocityProfile(config BlockConfig, logger golog.Logger) (Block
 }
 
 func (s *trapezoidVelocityGenerator) Next(ctx context.Context, x []*Signal, dt time.Duration) ([]*Signal, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var pos float64
 	var setPoint float64
 	if len(x) == 2 {
+		//nolint: exhaustive
 		for _, sig := range x {
-			switch sig.name {
-			case "set_point":
+			switch sig.blockType {
+			case blockConstant:
 				setPoint = sig.GetSignalValueAt(0)
-			case "endpoint":
+			case blockEndpoint:
 				pos = sig.GetSignalValueAt(0)
 			default:
 				return s.y, false
@@ -65,7 +69,6 @@ func (s *trapezoidVelocityGenerator) Next(ctx context.Context, x []*Signal, dt t
 				s.dir = 1
 			}
 			s.trapDistance = math.Abs(setPoint - pos)
-			s.lastVelCmd = 0
 			s.vDec = math.Min(math.Sqrt(s.trapDistance*s.maxAcc), s.maxVel)
 			s.kPP0 = 2.0 * s.maxAcc / s.vDec
 			s.kPP = s.kppGain * s.kPP0
@@ -92,6 +95,7 @@ func (s *trapezoidVelocityGenerator) Next(ctx context.Context, x []*Signal, dt t
 		s.lastVelCmd = vel
 		s.y[0].SetSignalValueAt(0, vel*float64(s.dir))
 	} else {
+		s.lastVelCmd = 0
 		s.y[0].SetSignalValueAt(0, 0.0)
 		s.currentPhase = rest
 	}
@@ -105,13 +109,37 @@ func (s *trapezoidVelocityGenerator) reset() error {
 	if !s.cfg.Attribute.Has("max_vel") {
 		return errors.Errorf("trapezoidale velocity profile block %s needs max_vel field", s.cfg.Name)
 	}
-	s.maxAcc = s.cfg.Attribute.Float64("max_acc", 0.0)
-	s.maxVel = s.cfg.Attribute.Float64("max_vel", 0.0)
-	s.posWindow = s.cfg.Attribute.Float64("pos_window", 10.0)
-	s.kppGain = s.cfg.Attribute.Float64("kpp_gain", 0.45)
+	s.maxAcc = s.cfg.Attribute["max_acc"].(float64)
+	s.maxVel = s.cfg.Attribute["max_vel"].(float64)
+	if s.maxAcc == 0 { // default 1.0, the math breaks if maxAcc = 0
+		s.maxAcc = 1
+	}
+	if s.maxVel == 0 { // default 1.0, the math breaks if maxVel = 0
+		s.maxVel = 1
+	}
+
+	s.posWindow = 0
+	if s.cfg.Attribute.Has("pos_window") {
+		s.posWindow = s.cfg.Attribute["pos_window"].(float64)
+	}
+
+	s.kppGain = 0
+	if s.cfg.Attribute.Has("kpp_gain") {
+		s.kppGain = s.cfg.Attribute["kpp_gain"].(float64)
+	}
+	if s.kppGain == 0 {
+		s.kppGain = 0.45
+	}
+	s.lastVelCmd = 0
+	if s.y != nil {
+		s.lastVelCmd = s.y[0].GetSignalValueAt(0)
+	}
+
+	s.lastsetPoint = math.NaN()
+
 	s.currentPhase = rest
 	s.y = make([]*Signal, 1)
-	s.y[0] = makeSignal(s.cfg.Name)
+	s.y[0] = makeSignal(s.cfg.Name, s.cfg.Type)
 	return nil
 }
 
@@ -133,5 +161,7 @@ func (s *trapezoidVelocityGenerator) Output(ctx context.Context) []*Signal {
 }
 
 func (s *trapezoidVelocityGenerator) Config(ctx context.Context) BlockConfig {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.cfg
 }

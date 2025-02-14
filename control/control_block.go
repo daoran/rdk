@@ -4,24 +4,24 @@ import (
 	"context"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/pkg/errors"
 
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/utils"
 )
 
 type controlBlockType string
 
 const (
-	blockEndpoint                   controlBlockType = "endpoint"
-	blockFilter                     controlBlockType = "filter"
+	blockConstant                   controlBlockType = "constant"
 	blockTrapezoidalVelocityProfile controlBlockType = "trapezoidalVelocityProfile"
 	blockPID                        controlBlockType = "PID"
 	blockGain                       controlBlockType = "gain"
 	blockDerivative                 controlBlockType = "derivative"
 	blockSum                        controlBlockType = "sum"
-	blockConstant                   controlBlockType = "constant"
 	blockEncoderToRPM               controlBlockType = "encoderToRpm"
+	blockEndpoint                   controlBlockType = "endpoint"
+	blockFilter                     controlBlockType = "filter"
 )
 
 // BlockConfig configuration of a given block.
@@ -50,7 +50,7 @@ type Block interface {
 	Config(ctx context.Context) BlockConfig
 }
 
-func createBlock(cfg BlockConfig, logger golog.Logger) (Block, error) {
+func (l *Loop) createBlock(cfg BlockConfig, logger logging.Logger) (Block, error) {
 	t := cfg.Type
 	switch t {
 	case blockEndpoint:
@@ -84,7 +84,7 @@ func createBlock(cfg BlockConfig, logger golog.Logger) (Block, error) {
 		}
 		return b, nil
 	case blockPID:
-		b, err := newPID(cfg, logger)
+		b, err := l.newPID(cfg, logger)
 		if err != nil {
 			return nil, err
 		}

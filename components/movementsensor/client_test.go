@@ -3,18 +3,18 @@ package movementsensor_test
 import (
 	"context"
 	"errors"
+	"math"
 	"net"
 	"testing"
 
-	"github.com/edaniels/golog"
 	"github.com/golang/geo/r3"
 	geo "github.com/kellydunn/golang-geo"
 	"go.viam.com/test"
 	"go.viam.com/utils/rpc"
 
 	"go.viam.com/rdk/components/movementsensor"
-	"go.viam.com/rdk/components/sensor"
 	viamgrpc "go.viam.com/rdk/grpc"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/spatialmath"
 	"go.viam.com/rdk/testutils"
@@ -36,7 +36,7 @@ var (
 )
 
 func TestClient(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	listener1, err := net.Listen("tcp", "localhost:0")
 	test.That(t, err, test.ShouldBeNil)
 	rpcServer, err := rpc.NewServer(logger, rpc.WithUnauthenticated())
@@ -51,7 +51,7 @@ func TestClient(t *testing.T) {
 	heading := 202.
 	props := &movementsensor.Properties{LinearVelocitySupported: true}
 	aclZ := 1.0
-	acy := map[string]float32{"x": 1.1}
+	acy := &movementsensor.Accuracy{AccuracyMap: map[string]float32{"x": 1.1}}
 	rs := map[string]interface{}{
 		"position":            loc,
 		"altitude":            alt,
@@ -82,7 +82,12 @@ func TestClient(t *testing.T) {
 	injectMovementSensor.PropertiesFunc = func(ctx context.Context, extra map[string]interface{}) (*movementsensor.Properties, error) {
 		return props, nil
 	}
-	injectMovementSensor.AccuracyFunc = func(ctx context.Context, extra map[string]interface{}) (map[string]float32, error) { return acy, nil }
+	injectMovementSensor.AccuracyFunc = func(ctx context.Context, extra map[string]interface{}) (*movementsensor.Accuracy, error) {
+		return acy, nil
+	}
+	injectMovementSensor.ReadingsFunc = func(ctx context.Context, extra map[string]interface{}) (map[string]interface{}, error) {
+		return rs, nil
+	}
 
 	injectMovementSensor2 := &inject.MovementSensor{}
 	injectMovementSensor2.PositionFunc = func(ctx context.Context, extra map[string]interface{}) (*geo.Point, float64, error) {
@@ -102,6 +107,15 @@ func TestClient(t *testing.T) {
 	}
 	injectMovementSensor2.CompassHeadingFunc = func(ctx context.Context, extra map[string]interface{}) (float64, error) {
 		return 0, errCompassHeading
+	}
+	injectMovementSensor2.ReadingsFunc = func(ctx context.Context, extra map[string]interface{}) (map[string]interface{}, error) {
+		return nil, errReadingsFailed
+	}
+	injectMovementSensor2.AccuracyFunc = func(ctx context.Context, extra map[string]interface{}) (*movementsensor.Accuracy, error) {
+		return nil, errAccuracy
+	}
+	injectMovementSensor2.PropertiesFunc = func(ctx context.Context, extra map[string]interface{}) (*movementsensor.Properties, error) {
+		return nil, errProperties
 	}
 
 	gpsSvc, err := resource.NewAPIResourceCollection(movementsensor.API, map[resource.Name]movementsensor.MovementSensor{
@@ -173,7 +187,8 @@ func TestClient(t *testing.T) {
 
 		acc1, err := gps1Client.Accuracy(context.Background(), map[string]interface{}{"foo": "bar"})
 		test.That(t, err, test.ShouldBeNil)
-		test.That(t, acc1, test.ShouldResemble, acy)
+		test.That(t, acc1.AccuracyMap, test.ShouldResemble, acy.AccuracyMap)
+		test.That(t, math.IsNaN(float64(acc1.Hdop)), test.ShouldBeTrue)
 		test.That(t, injectMovementSensor.AccuracyFuncExtraCap, test.ShouldResemble, map[string]interface{}{"foo": "bar"})
 
 		la1, err := gps1Client.LinearAcceleration(context.Background(), map[string]interface{}{"foo": "bar"})
@@ -181,7 +196,7 @@ func TestClient(t *testing.T) {
 		test.That(t, la1.Z, test.ShouldResemble, aclZ)
 		test.That(t, injectMovementSensor.LinearAccelerationExtraCap, test.ShouldResemble, map[string]interface{}{"foo": "bar"})
 
-		rs1, err := gps1Client.Readings(context.Background(), make(map[string]interface{}))
+		rs1, err := gps1Client.Readings(context.Background(), map[string]interface{}{"foo": "bar"})
 		test.That(t, err, test.ShouldBeNil)
 		test.That(t, rs1["position"], test.ShouldResemble, rs["position"])
 		test.That(t, rs1["altitude"], test.ShouldResemble, rs["altitude"])
@@ -218,9 +233,17 @@ func TestClient(t *testing.T) {
 		test.That(t, err, test.ShouldNotBeNil)
 		test.That(t, err.Error(), test.ShouldContainSubstring, errAngularVelocity.Error())
 
-		_, err = client2.(sensor.Sensor).Readings(context.Background(), make(map[string]interface{}))
+		_, err = client2.Readings(context.Background(), make(map[string]interface{}))
 		test.That(t, err, test.ShouldNotBeNil)
-		test.That(t, err.Error(), test.ShouldContainSubstring, errLocation.Error())
+		test.That(t, err.Error(), test.ShouldContainSubstring, errReadingsFailed.Error())
+
+		_, err = client2.Accuracy(context.Background(), make(map[string]interface{}))
+		test.That(t, err, test.ShouldNotBeNil)
+		test.That(t, err.Error(), test.ShouldContainSubstring, errAccuracy.Error())
+
+		_, err = client2.Properties(context.Background(), make(map[string]interface{}))
+		test.That(t, err, test.ShouldNotBeNil)
+		test.That(t, err.Error(), test.ShouldContainSubstring, errProperties.Error())
 
 		test.That(t, client2.Close(context.Background()), test.ShouldBeNil)
 		test.That(t, conn.Close(), test.ShouldBeNil)

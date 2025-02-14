@@ -5,46 +5,31 @@ import (
 	"os"
 	"testing"
 
-	"github.com/edaniels/golog"
 	"go.viam.com/test"
 	"go.viam.com/utils/artifact"
 
 	"go.viam.com/rdk/components/camera"
 	"go.viam.com/rdk/config"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/rimage"
 	"go.viam.com/rdk/robot"
 	robotimpl "go.viam.com/rdk/robot/impl"
-	"go.viam.com/rdk/services/mlmodel"
 	_ "go.viam.com/rdk/services/mlmodel/register"
 	"go.viam.com/rdk/services/vision"
 	_ "go.viam.com/rdk/services/vision/register"
 	rutils "go.viam.com/rdk/utils"
 )
 
-func buildRobotWithClassifier(logger golog.Logger) (robot.Robot, error) {
+func buildRobotWithClassifier(logger logging.Logger) (robot.Robot, error) {
 	cfg := &config.Config{}
 
 	// create fake source camera
-	tfliteSrv1 := resource.Config{
-		Name:  "object_classifier",
-		API:   mlmodel.API,
-		Model: resource.DefaultModelFamily.WithModel("tflite_cpu"),
-		Attributes: rutils.AttributeMap{
-			"model_path":  artifact.MustPath("vision/classification/object_classifier.tflite"),
-			"label_path":  artifact.MustPath("vision/classification/object_labels.txt"),
-			"num_threads": 1,
-		},
-	}
-	cfg.Services = append(cfg.Services, tfliteSrv1)
 	visionSrv1 := resource.Config{
-		Name:  "vision_classifier",
-		API:   vision.API,
-		Model: resource.DefaultModelFamily.WithModel("mlmodel"),
-		Attributes: rutils.AttributeMap{
-			"mlmodel_name": "object_classifier",
-		},
-		DependsOn: []string{"object_classifier"},
+		Name:       "vision_classifier",
+		API:        vision.API,
+		Model:      resource.DefaultModelFamily.WithModel("fake"),
+		Attributes: rutils.AttributeMap{},
 	}
 	cfg.Services = append(cfg.Services, visionSrv1)
 	cameraComp := resource.Config{
@@ -97,9 +82,8 @@ func buildRobotWithClassifier(logger golog.Logger) (robot.Robot, error) {
 	return r, nil
 }
 
-//nolint:dupl
 func TestClassifierSource(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -114,13 +98,15 @@ func TestClassifierSource(t *testing.T) {
 	test.That(t, err, test.ShouldBeNil)
 	defer classifier.Close(ctx)
 
-	resImg, _, err := camera.ReadImage(ctx, classifier)
+	streamClassifier, ok := classifier.(camera.VideoSource)
+	test.That(t, ok, test.ShouldBeTrue)
+	resImg, _, err := camera.ReadImage(ctx, streamClassifier)
 	test.That(t, err, test.ShouldBeNil)
 	ovImg := rimage.ConvertImage(resImg)
 
 	// Max classifications was 5, but this image gets classified with just 2 labels, so we
 	// test that each label is present.
-	test.That(t, ovImg.GetXY(149, 48), test.ShouldResemble, rimage.Red)
-	test.That(t, ovImg.GetXY(100, 75), test.ShouldResemble, rimage.Red)
+	test.That(t, ovImg.GetXY(42, 50), test.ShouldResemble, rimage.Red)
+	test.That(t, ovImg.GetXY(268, 48), test.ShouldResemble, rimage.Red)
 	test.That(t, classifier.Close(context.Background()), test.ShouldBeNil)
 }

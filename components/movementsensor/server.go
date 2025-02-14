@@ -2,6 +2,7 @@ package movementsensor
 
 import (
 	"context"
+	"math"
 
 	"github.com/golang/geo/r3"
 	commonpb "go.viam.com/api/common/v1"
@@ -21,6 +22,26 @@ func NewRPCServiceServer(coll resource.APIResourceCollection[MovementSensor]) in
 	return &serviceServer{coll: coll}
 }
 
+// GetReadings returns the most recent readings from the given Sensor.
+func (s *serviceServer) GetReadings(
+	ctx context.Context,
+	req *commonpb.GetReadingsRequest,
+) (*commonpb.GetReadingsResponse, error) {
+	sensorDevice, err := s.coll.Resource(req.Name)
+	if err != nil {
+		return nil, err
+	}
+	readings, err := sensorDevice.Readings(ctx, req.Extra.AsMap())
+	if err != nil {
+		return nil, err
+	}
+	m, err := protoutils.ReadingGoToProto(readings)
+	if err != nil {
+		return nil, err
+	}
+	return &commonpb.GetReadingsResponse{Readings: m}, nil
+}
+
 func (s *serviceServer) GetPosition(
 	ctx context.Context,
 	req *pb.GetPositionRequest,
@@ -33,8 +54,16 @@ func (s *serviceServer) GetPosition(
 	if err != nil {
 		return nil, err
 	}
+
+	// defensively initialize a invalid, non-nil default
+	coordinate := &commonpb.GeoPoint{Latitude: math.NaN(), Longitude: math.NaN()}
+	// populate the coordinate response with the location if it is non nil
+	if loc != nil {
+		coordinate = &commonpb.GeoPoint{Latitude: loc.Lat(), Longitude: loc.Lng()}
+	}
+
 	return &pb.GetPositionResponse{
-		Coordinate: &commonpb.GeoPoint{Latitude: loc.Lat(), Longitude: loc.Lng()},
+		Coordinate: coordinate,
 		AltitudeM:  float32(altitide),
 	}, nil
 }
@@ -70,6 +99,23 @@ func (s *serviceServer) GetAngularVelocity(
 	}
 	return &pb.GetAngularVelocityResponse{
 		AngularVelocity: protoutils.ConvertVectorR3ToProto(r3.Vector(av)),
+	}, nil
+}
+
+func (s *serviceServer) GetLinearAcceleration(
+	ctx context.Context,
+	req *pb.GetLinearAccelerationRequest,
+) (*pb.GetLinearAccelerationResponse, error) {
+	msDevice, err := s.coll.Resource(req.Name)
+	if err != nil {
+		return nil, err
+	}
+	la, err := msDevice.LinearAcceleration(ctx, req.Extra.AsMap())
+	if err != nil {
+		return nil, err
+	}
+	return &pb.GetLinearAccelerationResponse{
+		LinearAcceleration: protoutils.ConvertVectorR3ToProto(la),
 	}, nil
 }
 
@@ -130,25 +176,16 @@ func (s *serviceServer) GetAccuracy(
 	if err != nil {
 		return nil, err
 	}
-	acc, err := msDevice.Accuracy(ctx, req.Extra.AsMap())
-	return &pb.GetAccuracyResponse{Accuracy: acc}, err
-}
+	accuracy, err := msDevice.Accuracy(ctx, req.Extra.AsMap())
+	if err != nil {
+		return nil, err
+	}
 
-func (s *serviceServer) GetLinearAcceleration(
-	ctx context.Context,
-	req *pb.GetLinearAccelerationRequest,
-) (*pb.GetLinearAccelerationResponse, error) {
-	msDevice, err := s.coll.Resource(req.Name)
-	if err != nil {
-		return nil, err
+	uacc := UnimplementedOptionalAccuracies()
+	if accuracy != nil {
+		return accuracyToProtoResponse(accuracy)
 	}
-	la, err := msDevice.LinearAcceleration(ctx, req.Extra.AsMap())
-	if err != nil {
-		return nil, err
-	}
-	return &pb.GetLinearAccelerationResponse{
-		LinearAcceleration: protoutils.ConvertVectorR3ToProto(la),
-	}, nil
+	return accuracyToProtoResponse(uacc)
 }
 
 // DoCommand receives arbitrary commands.

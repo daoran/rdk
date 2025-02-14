@@ -1,6 +1,8 @@
 package referenceframe
 
 import (
+	"fmt"
+
 	"github.com/pkg/errors"
 	commonpb "go.viam.com/api/common/v1"
 
@@ -21,34 +23,20 @@ type PoseInFrame struct {
 	name   string
 }
 
-// LinkInFrame is a PoseInFrame plus a Geometry.
-type LinkInFrame struct {
-	*PoseInFrame
-	geometry spatialmath.Geometry
+// NewPoseInFrame generates a new PoseInFrame.
+func NewPoseInFrame(frame string, pose spatialmath.Pose) *PoseInFrame {
+	return &PoseInFrame{
+		parent: frame,
+		pose:   pose,
+	}
 }
 
-// Geometry returns the Geometry of the LinkInFrame.
-func (lF *LinkInFrame) Geometry() spatialmath.Geometry {
-	return lF.geometry
-}
-
-// ToStaticFrame converts a LinkInFrame into a staticFrame with a new name.
-func (lF *LinkInFrame) ToStaticFrame(name string) (Frame, error) {
-	if name == "" {
-		name = lF.name
+// NewZeroPoseInFrame is a convenience method that creates a PoseInFrame with the specified Frame and a zero pose.
+func NewZeroPoseInFrame(frame string) *PoseInFrame {
+	return &PoseInFrame{
+		parent: frame,
+		pose:   spatialmath.NewZeroPose(),
 	}
-	pose := lF.pose
-	if pose == nil {
-		pose = spatialmath.NewZeroPose()
-	}
-	if lF.geometry != nil {
-		// deep copy geometry
-		newGeom := lF.geometry.Transform(spatialmath.NewZeroPose())
-		newGeom.SetLabel(name)
-		return NewStaticFrameWithGeometry(name, pose, newGeom)
-	}
-
-	return NewStaticFrame(name, pose)
 }
 
 // Parent returns the name of the frame in which the pose was observed. Needed for Transformable interface.
@@ -82,12 +70,15 @@ func (pF *PoseInFrame) Transform(tf *PoseInFrame) Transformable {
 	return NewPoseInFrame(tf.parent, spatialmath.Compose(tf.pose, pF.pose))
 }
 
-// NewPoseInFrame generates a new PoseInFrame.
-func NewPoseInFrame(frame string, pose spatialmath.Pose) *PoseInFrame {
-	return &PoseInFrame{
-		parent: frame,
-		pose:   pose,
-	}
+// String returns the string representation of the PoseInFrame.
+func (pF *PoseInFrame) String() string {
+	return fmt.Sprintf("parent: %s, pose: %s", pF.parent, spatialmath.PoseToProtobuf(pF.pose))
+}
+
+// LinkInFrame is a PoseInFrame plus a Geometry.
+type LinkInFrame struct {
+	*PoseInFrame
+	geometry spatialmath.Geometry
 }
 
 // NewLinkInFrame generates a new LinkInFrame.
@@ -102,8 +93,36 @@ func NewLinkInFrame(frame string, pose spatialmath.Pose, name string, geometry s
 	}
 }
 
+// Geometry returns the Geometry of the LinkInFrame.
+func (lF *LinkInFrame) Geometry() spatialmath.Geometry {
+	return lF.geometry
+}
+
+// ToStaticFrame converts a LinkInFrame into a staticFrame with a new name.
+func (lF *LinkInFrame) ToStaticFrame(name string) (Frame, error) {
+	if name == "" {
+		name = lF.name
+	}
+	pose := lF.pose
+	if pose == nil {
+		pose = spatialmath.NewZeroPose()
+	}
+	if lF.geometry != nil {
+		// deep copy geometry
+		newGeom := lF.geometry.Transform(spatialmath.NewZeroPose())
+		newGeom.SetLabel(name)
+		return NewStaticFrameWithGeometry(name, pose, newGeom)
+	}
+
+	return NewStaticFrame(name, pose)
+}
+
 // PoseInFrameToProtobuf converts a PoseInFrame struct to a PoseInFrame protobuf message.
 func PoseInFrameToProtobuf(framedPose *PoseInFrame) *commonpb.PoseInFrame {
+	if framedPose == nil {
+		return &commonpb.PoseInFrame{}
+	}
+
 	poseProto := &commonpb.Pose{}
 	if framedPose.pose != nil {
 		poseProto = spatialmath.PoseToProtobuf(framedPose.pose)
@@ -202,6 +221,19 @@ type GeometriesInFrame struct {
 	nameIndexMap map[string]int
 }
 
+// NewGeometriesInFrame generates a new GeometriesInFrame.
+func NewGeometriesInFrame(frame string, geometries []spatialmath.Geometry) *GeometriesInFrame {
+	nameIndexMap := make(map[string]int)
+	for i, geometry := range geometries {
+		nameIndexMap[geometry.Label()] = i
+	}
+	return &GeometriesInFrame{
+		frame:        frame,
+		geometries:   geometries,
+		nameIndexMap: nameIndexMap,
+	}
+}
+
 // Parent returns the name of the frame in which the geometries were observed.
 func (gF *GeometriesInFrame) Parent() string {
 	return gF.frame
@@ -235,19 +267,6 @@ func (gF *GeometriesInFrame) Transform(tf *PoseInFrame) Transformable {
 		geometries = append(geometries, geometry.Transform(tf.pose))
 	}
 	return NewGeometriesInFrame(tf.parent, geometries)
-}
-
-// NewGeometriesInFrame generates a new GeometriesInFrame.
-func NewGeometriesInFrame(frame string, geometries []spatialmath.Geometry) *GeometriesInFrame {
-	nameIndexMap := make(map[string]int)
-	for i, geometry := range geometries {
-		nameIndexMap[geometry.Label()] = i
-	}
-	return &GeometriesInFrame{
-		frame:        frame,
-		geometries:   geometries,
-		nameIndexMap: nameIndexMap,
-	}
 }
 
 // GeometriesInFrameToProtobuf converts a GeometriesInFrame struct to a GeometriesInFrame message as specified in common.proto.

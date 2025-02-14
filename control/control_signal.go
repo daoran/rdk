@@ -1,6 +1,8 @@
 package control
 
-import "sync"
+import (
+	"sync"
+)
 
 // Signal holds any data passed between blocks.
 type Signal struct {
@@ -8,16 +10,30 @@ type Signal struct {
 	time      []int
 	dimension int
 	name      string
+	blockType controlBlockType
 	mu        sync.Mutex
 }
 
-func makeSignal(name string) *Signal {
+func makeSignal(name string, blockType controlBlockType) *Signal {
 	var s Signal
 	dimension := 1
 	s.dimension = dimension
 	s.signal = make([]float64, dimension)
 	s.time = make([]int, dimension)
 	s.name = name
+	s.blockType = blockType
+	return &s
+}
+
+// makeSignals returns a Signal object where the length of its signal[] array is dependent
+// on the number of PIDSets from the config.
+func makeSignals(name string, blockType controlBlockType, dimension int) *Signal {
+	var s Signal
+	s.dimension = dimension
+	s.signal = make([]float64, dimension)
+	s.time = make([]int, dimension)
+	s.name = name
+	s.blockType = blockType
 	return &s
 }
 
@@ -25,7 +41,7 @@ func makeSignal(name string) *Signal {
 func (s *Signal) GetSignalValueAt(i int) float64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if i > len(s.signal)-1 {
+	if !(i < len(s.signal)) {
 		return 0.0
 	}
 	return s.signal[i]
@@ -35,7 +51,7 @@ func (s *Signal) GetSignalValueAt(i int) float64 {
 func (s *Signal) SetSignalValueAt(i int, val float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if i > len(s.signal)-1 {
+	if !(i < len(s.signal)) {
 		return
 	}
 	s.signal[i] = val

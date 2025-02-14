@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/golang/geo/r3"
 	"github.com/pkg/errors"
 	echopb "go.viam.com/api/component/testecho/v1"
@@ -18,6 +18,7 @@ import (
 	"go.viam.com/test"
 	"go.viam.com/utils"
 	"go.viam.com/utils/rpc"
+	"go.viam.com/utils/testutils"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
@@ -26,6 +27,7 @@ import (
 	_ "go.viam.com/rdk/components/register"
 	"go.viam.com/rdk/config"
 	"go.viam.com/rdk/grpc"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/robot/client"
 	robotimpl "go.viam.com/rdk/robot/impl"
@@ -51,20 +53,26 @@ func init() {
 			conn rpc.ClientConn,
 			remoteName string,
 			name resource.Name,
-			logger golog.Logger,
+			logger logging.Logger,
 		) (resource.Resource, error) {
 			return NewClientFromConn(ctx, conn, remoteName, name, logger), nil
 		},
 	})
 }
 
+// TODO(RSDK-5435): This test suite checks if stopping a client also stops any
+// components that were started by that client. We also should implement a benchmark
+// suite that measures how long it takes for components to stop.
+//
+// We should NOT add a strict deadline to this test - we had that before and it resulted
+// in flaky tests (see RSDK-2493).
 func TestSessions(t *testing.T) {
 	for _, windowSize := range []time.Duration{
 		config.DefaultSessionHeartbeatWindow,
 		time.Second * 5,
 	} {
 		t.Run(fmt.Sprintf("window size=%s", windowSize), func(t *testing.T) {
-			logger := golog.NewTestLogger(t)
+			logger := logging.NewTestLogger(t)
 
 			stopChs := map[string]*StopChan{
 				"motor1": {make(chan struct{}), "motor1"},
@@ -100,7 +108,7 @@ func TestSessions(t *testing.T) {
 					ctx context.Context,
 					deps resource.Dependencies,
 					conf resource.Config,
-					logger golog.Logger,
+					logger logging.Logger,
 				) (motor.Motor, error) {
 					if conf.Name == "motor1" {
 						return &dummyMotor1, nil
@@ -115,7 +123,7 @@ func TestSessions(t *testing.T) {
 						ctx context.Context,
 						_ resource.Dependencies,
 						conf resource.Config,
-						logger golog.Logger,
+						logger logging.Logger,
 					) (resource.Resource, error) {
 						return &dummyEcho1, nil
 					},
@@ -129,7 +137,7 @@ func TestSessions(t *testing.T) {
 						ctx context.Context,
 						_ resource.Dependencies,
 						conf resource.Config,
-						logger golog.Logger,
+						logger logging.Logger,
 					) (base.Base, error) {
 						return &dummyBase1, nil
 					},
@@ -167,18 +175,18 @@ func TestSessions(t *testing.T) {
 			}
 			`, windowSize, model, streamModel)
 
-			cfg, err := config.FromReader(context.Background(), "", strings.NewReader(roboConfig), logger)
+			cfg, err := config.FromReader(context.Background(), "", strings.NewReader(roboConfig), logger, nil)
 			test.That(t, err, test.ShouldBeNil)
 
 			ctx := context.Background()
-			r, err := robotimpl.New(ctx, cfg, logger)
+			r, err := robotimpl.New(ctx, cfg, logger.Sublogger("main"))
 			test.That(t, err, test.ShouldBeNil)
 
 			options, _, addr := robottestutils.CreateBaseOptionsAndListener(t)
 			err = r.StartWeb(ctx, options)
 			test.That(t, err, test.ShouldBeNil)
 
-			roboClient, err := client.New(ctx, addr, logger)
+			roboClient, err := client.New(ctx, addr, logger.Sublogger("client"))
 			test.That(t, err, test.ShouldBeNil)
 
 			motor1, err := motor.FromRobot(roboClient, "motor1")
@@ -194,7 +202,7 @@ func TestSessions(t *testing.T) {
 			// kind of racy but it's okay
 			ensureStop(t, "", stopChNames)
 
-			roboClient, err = client.New(ctx, addr, logger)
+			roboClient, err = client.New(ctx, addr, logger.Sublogger("client"))
 			test.That(t, err, test.ShouldBeNil)
 
 			motor1, err = motor.FromRobot(roboClient, "motor1")
@@ -203,24 +211,16 @@ func TestSessions(t *testing.T) {
 			t.Log("set power of motor1 which will be safety monitored")
 			test.That(t, motor1.SetPower(ctx, 50, nil), test.ShouldBeNil)
 
-			startAt := time.Now()
 			test.That(t, roboClient.Close(ctx), test.ShouldBeNil)
 
 			ensureStop(t, "motor1", stopChNames)
-
-			test.That(t,
-				time.Since(startAt),
-				test.ShouldBeBetweenOrEqual,
-				float64(windowSize)*.75,
-				float64(windowSize)*1.5,
-			)
 
 			dummyMotor1.mu.Lock()
 			stopChs["motor1"].Chan = make(chan struct{})
 			dummyMotor1.stopCh = stopChs["motor1"].Chan
 			dummyMotor1.mu.Unlock()
 
-			roboClient, err = client.New(ctx, addr, logger)
+			roboClient, err = client.New(ctx, addr, logger.Sublogger("client"))
 			test.That(t, err, test.ShouldBeNil)
 
 			motor2, err := motor.FromRobot(roboClient, "motor2")
@@ -239,20 +239,12 @@ func TestSessions(t *testing.T) {
 			_, err = echoMultiClient.Recv() // EOF; okay
 			test.That(t, err, test.ShouldBeError, io.EOF)
 
-			startAt = time.Now()
 			test.That(t, roboClient.Close(ctx), test.ShouldBeNil)
 
 			checkAgainst := []string{"motor1"}
 			ensureStop(t, "motor2", checkAgainst)
 			ensureStop(t, "echo1", checkAgainst)
 			ensureStop(t, "base1", checkAgainst)
-
-			test.That(t,
-				time.Since(startAt),
-				test.ShouldBeBetweenOrEqual,
-				float64(windowSize)*.75,
-				float64(windowSize)*1.5,
-			)
 
 			test.That(t, roboClient.Close(ctx), test.ShouldBeNil)
 
@@ -262,7 +254,7 @@ func TestSessions(t *testing.T) {
 }
 
 func TestSessionsWithRemote(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 
 	stopChs := map[string]*StopChan{
 		"remMotor1": {make(chan struct{}), "remMotor1"},
@@ -299,7 +291,7 @@ func TestSessionsWithRemote(t *testing.T) {
 				ctx context.Context,
 				deps resource.Dependencies,
 				conf resource.Config,
-				logger golog.Logger,
+				logger logging.Logger,
 			) (motor.Motor, error) {
 				if conf.Attributes.Bool("rem", false) {
 					if conf.Name == "motor1" {
@@ -318,7 +310,7 @@ func TestSessionsWithRemote(t *testing.T) {
 				ctx context.Context,
 				_ resource.Dependencies,
 				conf resource.Config,
-				logger golog.Logger,
+				logger logging.Logger,
 			) (resource.Resource, error) {
 				return &dummyRemEcho1, nil
 			},
@@ -332,7 +324,7 @@ func TestSessionsWithRemote(t *testing.T) {
 				ctx context.Context,
 				_ resource.Dependencies,
 				conf resource.Config,
-				logger golog.Logger,
+				logger logging.Logger,
 			) (base.Base, error) {
 				if conf.Attributes.Bool("rem", false) {
 					return &dummyRemBase1, nil
@@ -380,7 +372,7 @@ func TestSessionsWithRemote(t *testing.T) {
 	}
 	`, model, streamModel)
 
-	cfg, err := config.FromReader(context.Background(), "", strings.NewReader(remoteConfig), logger)
+	cfg, err := config.FromReader(context.Background(), "", strings.NewReader(remoteConfig), logger, nil)
 	test.That(t, err, test.ShouldBeNil)
 
 	ctx := context.Background()
@@ -413,20 +405,30 @@ func TestSessionsWithRemote(t *testing.T) {
 	}
 	`, remoteAddr, model)
 
-	cfg, err = config.FromReader(context.Background(), "", strings.NewReader(roboConfig), logger)
+	cfg, err = config.FromReader(context.Background(), "", strings.NewReader(roboConfig), logger, nil)
 	test.That(t, err, test.ShouldBeNil)
 
-	r, err := robotimpl.New(ctx, cfg, logger)
+	r, err := robotimpl.New(ctx, cfg, logger.Sublogger("main"))
 	test.That(t, err, test.ShouldBeNil)
 
 	options, _, addr := robottestutils.CreateBaseOptionsAndListener(t)
 	err = r.StartWeb(ctx, options)
 	test.That(t, err, test.ShouldBeNil)
 
-	roboClient, err := client.New(ctx, addr, logger)
+	roboClient, err := client.New(ctx, addr, logger.Sublogger("client"))
 	test.That(t, err, test.ShouldBeNil)
 
 	motor1, err := motor.FromRobot(roboClient, "rem1:motor1")
+	if err != nil {
+		bufSize := 1 << 20
+		traces := make([]byte, bufSize)
+		traceSize := runtime.Stack(traces, true)
+		message := fmt.Sprintf("error accessing remote from roboClient: %s. logging stack trace for debugging purposes", err.Error())
+		if traceSize == bufSize {
+			message = fmt.Sprintf("%s (warning: backtrace truncated to %v bytes)", message, bufSize)
+		}
+		logger.Errorf("%s,\n %s", message, traces)
+	}
 	test.That(t, err, test.ShouldBeNil)
 
 	t.Log("get position of rem1:motor1 which will not be safety monitored")
@@ -439,7 +441,7 @@ func TestSessionsWithRemote(t *testing.T) {
 	// kind of racy but it's okay
 	ensureStop(t, "", stopChNames)
 
-	roboClient, err = client.New(ctx, addr, logger)
+	roboClient, err = client.New(ctx, addr, logger.Sublogger("client"))
 	test.That(t, err, test.ShouldBeNil)
 
 	motor1, err = motor.FromRobot(roboClient, "rem1:motor1")
@@ -449,16 +451,9 @@ func TestSessionsWithRemote(t *testing.T) {
 	t.Log("set power of rem1:motor1 which will be safety monitored")
 	test.That(t, motor1.SetPower(ctx, 50, nil), test.ShouldBeNil)
 
-	startAt := time.Now()
 	test.That(t, roboClient.Close(ctx), test.ShouldBeNil)
 
 	ensureStop(t, "remMotor1", stopChNames)
-	test.That(t,
-		time.Since(startAt),
-		test.ShouldBeBetweenOrEqual,
-		float64(config.DefaultSessionHeartbeatWindow)*.5,
-		float64(config.DefaultSessionHeartbeatWindow)*2.5,
-	)
 
 	dummyRemMotor1.mu.Lock()
 	stopChs["remMotor1"].Chan = make(chan struct{})
@@ -467,7 +462,7 @@ func TestSessionsWithRemote(t *testing.T) {
 
 	logger.Info("close robot instead of client")
 
-	roboClient, err = client.New(ctx, addr, logger)
+	roboClient, err = client.New(ctx, addr, logger.Sublogger("client"))
 	test.That(t, err, test.ShouldBeNil)
 
 	motor1, err = motor.FromRobot(roboClient, "rem1:motor1")
@@ -476,17 +471,9 @@ func TestSessionsWithRemote(t *testing.T) {
 	t.Log("set power of rem1:motor1 which will be safety monitored")
 	test.That(t, motor1.SetPower(ctx, 50, nil), test.ShouldBeNil)
 
-	startAt = time.Now()
 	test.That(t, r.Close(ctx), test.ShouldBeNil)
 
 	ensureStop(t, "remMotor1", stopChNames)
-
-	test.That(t,
-		time.Since(startAt),
-		test.ShouldBeBetweenOrEqual,
-		float64(config.DefaultSessionHeartbeatWindow)*.5,
-		float64(config.DefaultSessionHeartbeatWindow)*2.5,
-	)
 
 	test.That(t, roboClient.Close(ctx), test.ShouldBeNil)
 
@@ -502,10 +489,20 @@ func TestSessionsWithRemote(t *testing.T) {
 	err = r.StartWeb(ctx, options)
 	test.That(t, err, test.ShouldBeNil)
 
-	roboClient, err = client.New(ctx, addr, logger)
+	roboClient, err = client.New(ctx, addr, logger.Sublogger("client"))
 	test.That(t, err, test.ShouldBeNil)
 
 	motor2, err := motor.FromRobot(roboClient, "rem1:motor2")
+	if err != nil {
+		bufSize := 1 << 20
+		traces := make([]byte, bufSize)
+		traceSize := runtime.Stack(traces, true)
+		message := fmt.Sprintf("error accessing remote from roboClient: %s. logging stack trace for debugging purposes", err.Error())
+		if traceSize == bufSize {
+			message = fmt.Sprintf("%s (warning: backtrace truncated to %v bytes)", message, bufSize)
+		}
+		logger.Errorf("%s,\n %s", message, traces)
+	}
 	test.That(t, err, test.ShouldBeNil)
 
 	t.Log("set power of rem1:motor2 which will be safety monitored")
@@ -522,20 +519,12 @@ func TestSessionsWithRemote(t *testing.T) {
 	_, err = echoMultiClient.Recv() // EOF; okay
 	test.That(t, err, test.ShouldBeError, io.EOF)
 
-	startAt = time.Now()
 	test.That(t, roboClient.Close(ctx), test.ShouldBeNil)
 
 	checkAgainst := []string{"remMotor1", "motor1", "base1"}
 	ensureStop(t, "remMotor2", checkAgainst)
 	ensureStop(t, "remBase1", checkAgainst)
 	ensureStop(t, "remEcho1", checkAgainst)
-
-	test.That(t,
-		time.Since(startAt),
-		test.ShouldBeBetweenOrEqual,
-		float64(config.DefaultSessionHeartbeatWindow)*.5,
-		float64(config.DefaultSessionHeartbeatWindow)*2.5,
-	)
 
 	test.That(t, roboClient.Close(ctx), test.ShouldBeNil)
 
@@ -544,7 +533,7 @@ func TestSessionsWithRemote(t *testing.T) {
 }
 
 func TestSessionsMixedClients(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	stopChMotor1 := make(chan struct{})
 
 	model := resource.DefaultModelFamily.WithModel(utils.RandomAlphaString(8))
@@ -558,7 +547,7 @@ func TestSessionsMixedClients(t *testing.T) {
 				ctx context.Context,
 				deps resource.Dependencies,
 				conf resource.Config,
-				logger golog.Logger,
+				logger logging.Logger,
 			) (motor.Motor, error) {
 				return &dummyMotor1, nil
 			},
@@ -575,20 +564,32 @@ func TestSessionsMixedClients(t *testing.T) {
 	}
 	`, model)
 
-	cfg, err := config.FromReader(context.Background(), "", strings.NewReader(roboConfig), logger)
+	cfg, err := config.FromReader(context.Background(), "", strings.NewReader(roboConfig), logger, nil)
 	test.That(t, err, test.ShouldBeNil)
 
 	ctx := context.Background()
-	r, err := robotimpl.New(ctx, cfg, logger)
+	r, err := robotimpl.New(ctx, cfg, logger.Sublogger("main"))
 	test.That(t, err, test.ShouldBeNil)
 
 	options, _, addr := robottestutils.CreateBaseOptionsAndListener(t)
 	err = r.StartWeb(ctx, options)
 	test.That(t, err, test.ShouldBeNil)
 
-	roboClient1, err := client.New(ctx, addr, logger)
+	// This test sets up two clients to the same motor. Both clients connect to the robot through a WebRTC
+	// gRPC connection, which adds an auth entity to the connection implicitly.
+	// The test sets up this scenario:
+	// 1) Client 1 will first `SetPower` with a session heartbeat. This operation returns with the
+	//    motor engaged.
+	// 2) Client 2 will override that operation with a very slow `GoFor`, becoming the last caller to the motor in
+	//    the process.
+	// 3) Client 1 will disconnect. This results in the client ceasing heartbeats. However, as Client 2 is the last caller
+	//    and sending heartbeats, the robot's heartbeat thread will not call `motor1.Stop`.
+	// 4) Client 2 will disconnect. This results in the client ceasing heartbeats and the robot's heartbeat thread
+	//    will call `motor1.Stop`.
+
+	roboClient1, err := client.New(ctx, addr, logger.Sublogger("client1"))
 	test.That(t, err, test.ShouldBeNil)
-	roboClient2, err := client.New(ctx, addr, logger)
+	roboClient2, err := client.New(ctx, addr, logger.Sublogger("client2"))
 	test.That(t, err, test.ShouldBeNil)
 
 	motor1Client1, err := motor.FromRobot(roboClient1, "motor1")
@@ -611,29 +612,21 @@ func TestSessionsMixedClients(t *testing.T) {
 		timer.Stop()
 	}
 
-	startAt := time.Now()
 	test.That(t, roboClient2.Close(ctx), test.ShouldBeNil)
-
-	select {
-	case <-stopChMotor1:
-		panic("unexpected; too fast")
-	default:
-	}
-
-	<-stopChMotor1
-
-	test.That(t,
-		time.Since(startAt),
-		test.ShouldBeBetweenOrEqual,
-		float64(config.DefaultSessionHeartbeatWindow)*.75,
-		float64(config.DefaultSessionHeartbeatWindow)*1.5,
-	)
+	testutils.WaitForAssertion(t, func(tb testing.TB) {
+		select {
+		case <-stopChMotor1:
+			return
+		default:
+			tb.Fail()
+		}
+	})
 
 	test.That(t, r.Close(ctx), test.ShouldBeNil)
 }
 
 func TestSessionsMixedOwnersNoAuth(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	stopChMotor1 := make(chan struct{})
 
 	model := resource.DefaultModelFamily.WithModel(utils.RandomAlphaString(8))
@@ -647,7 +640,7 @@ func TestSessionsMixedOwnersNoAuth(t *testing.T) {
 				ctx context.Context,
 				deps resource.Dependencies,
 				conf resource.Config,
-				logger golog.Logger,
+				logger logging.Logger,
 			) (motor.Motor, error) {
 				return &dummyMotor1, nil
 			},
@@ -664,11 +657,11 @@ func TestSessionsMixedOwnersNoAuth(t *testing.T) {
 	}
 	`, model)
 
-	cfg, err := config.FromReader(context.Background(), "", strings.NewReader(roboConfig), logger)
+	cfg, err := config.FromReader(context.Background(), "", strings.NewReader(roboConfig), logger, nil)
 	test.That(t, err, test.ShouldBeNil)
 
 	ctx := context.Background()
-	r, err := robotimpl.New(ctx, cfg, logger)
+	r, err := robotimpl.New(ctx, cfg, logger.Sublogger("main"))
 	test.That(t, err, test.ShouldBeNil)
 
 	options, _, addr := robottestutils.CreateBaseOptionsAndListener(t)
@@ -686,9 +679,23 @@ func TestSessionsMixedOwnersNoAuth(t *testing.T) {
 	}))
 	test.That(t, err, test.ShouldBeNil)
 
+	// This test sets up two clients to the same motor. Both clients connect to the robot through a direct
+	// gRPC connection, which does not add an auth entity to the connection implicitly.
+	// The test sets up this (contrived) scenario:
+	// 1) Client 1 will first `SetPower` with a session heartbeat. This operation returns with the
+	//    motor engaged.
+	// 2) Client 2 will attempt to "override" that operation with a very slow `GoFor` using the same session id
+	//    as Client 1. The operation will succeed as the session is not tied to any auth entities.
+	// 3) Client 2 will attempt to resume a session with the main robot using the same session id as Client 1.
+	//    The robot will accept the session id from Client 2.
+	// 4) Client 1 will disconnect. This results in the client ceasing heartbeats for the
+	//    `SetPower` operation. The robot's heartbeat thread will call `motor1.Stop`. While Client 2 sent a command
+	//    to the motor, it used Client 1's session and never sent heartbeats.
 	motor1Client1, err := motor.FromRobot(roboClient1, "motor1")
 	test.That(t, err, test.ShouldBeNil)
-	motor1Client2, err := motor.NewClientFromConn(ctx, roboClientConn2, "", motor.Named("motor1"), logger)
+
+	// clients made directly with a connection will not send heartbeats.
+	motor1Client2, err := motor.NewClientFromConn(ctx, roboClientConn2, "", motor.Named("motor1"), logger.Sublogger("motor1client2"))
 	test.That(t, err, test.ShouldBeNil)
 
 	test.That(t, motor1Client1.SetPower(ctx, 50, nil), test.ShouldBeNil)
@@ -702,7 +709,7 @@ func TestSessionsMixedOwnersNoAuth(t *testing.T) {
 	client2Ctx := metadata.AppendToOutgoingContext(ctx, session.IDMetadataKey, sessID)
 	test.That(t, motor1Client2.GoFor(client2Ctx, 1, 2, nil), test.ShouldBeNil)
 
-	// this would just heartbeat it
+	// this would just heartbeat client 1's session
 	resp, err := robotpb.NewRobotServiceClient(roboClientConn2).StartSession(ctx, &robotpb.StartSessionRequest{
 		Resume: sessID,
 	})
@@ -710,31 +717,23 @@ func TestSessionsMixedOwnersNoAuth(t *testing.T) {
 	test.That(t, resp.Id, test.ShouldEqual, sessID)
 
 	// this is the only one heartbeating so we expect a stop
-	startAt := time.Now()
 	test.That(t, roboClient1.Close(ctx), test.ShouldBeNil)
-
-	select {
-	case <-stopChMotor1:
-		panic("unexpected; too fast")
-	default:
-	}
-
-	<-stopChMotor1
-
-	test.That(t,
-		time.Since(startAt),
-		test.ShouldBeBetweenOrEqual,
-		float64(config.DefaultSessionHeartbeatWindow)*.75,
-		float64(config.DefaultSessionHeartbeatWindow)*1.5,
-	)
+	testutils.WaitForAssertion(t, func(tb testing.TB) {
+		select {
+		case <-stopChMotor1:
+			return
+		default:
+			tb.Fail()
+		}
+	})
 
 	test.That(t, roboClientConn2.Close(), test.ShouldBeNil)
 	test.That(t, r.Close(ctx), test.ShouldBeNil)
 }
 
-// TODO(RSDK-890): add explicit auth test once subjects are actually unique.
+// TODO(RSDK-890): add explicit auth test once entities are actually unique.
 func TestSessionsMixedOwnersImplicitAuth(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	stopChMotor1 := make(chan struct{})
 
 	model := resource.DefaultModelFamily.WithModel(utils.RandomAlphaString(8))
@@ -748,7 +747,7 @@ func TestSessionsMixedOwnersImplicitAuth(t *testing.T) {
 				ctx context.Context,
 				deps resource.Dependencies,
 				conf resource.Config,
-				logger golog.Logger,
+				logger logging.Logger,
 			) (motor.Motor, error) {
 				return &dummyMotor1, nil
 			},
@@ -765,31 +764,48 @@ func TestSessionsMixedOwnersImplicitAuth(t *testing.T) {
 	}
 	`, model)
 
-	cfg, err := config.FromReader(context.Background(), "", strings.NewReader(roboConfig), logger)
+	cfg, err := config.FromReader(context.Background(), "", strings.NewReader(roboConfig), logger, nil)
 	test.That(t, err, test.ShouldBeNil)
 
 	ctx := context.Background()
-	r, err := robotimpl.New(ctx, cfg, logger)
+	r, err := robotimpl.New(ctx, cfg, logger.Sublogger("main"))
 	test.That(t, err, test.ShouldBeNil)
 
 	options, _, addr := robottestutils.CreateBaseOptionsAndListener(t)
 	err = r.StartWeb(ctx, options)
 	test.That(t, err, test.ShouldBeNil)
 
-	// TODO(RSDK-890): using WebRTC (the default) gives us an implicit auth subject, for now
-	roboClient1, err := client.New(ctx, addr, logger)
+	// TODO(RSDK-890): using WebRTC (the default) gives us an implicit auth entity, for now
+	roboClient1, err := client.New(ctx, addr, logger.Sublogger("client"))
 	test.That(t, err, test.ShouldBeNil)
 
-	roboClientConn2, err := grpc.Dial(ctx, addr, logger, rpc.WithWebRTCOptions(rpc.DialWebRTCOptions{
+	// there is no auth entity with a direct connection
+	roboClientConn2, err := grpc.Dial(ctx, addr, logger.Sublogger("motor1client2"), rpc.WithWebRTCOptions(rpc.DialWebRTCOptions{
 		Disable: true,
 	}))
 	test.That(t, err, test.ShouldBeNil)
 
+	// This test sets up two clients to the same motor. Client 1 connects to the robot through WebRTC, which
+	// implicitly adds an auth entity to the connection. Client 2 connects through a direct gRPC connection,
+	// which does not.
+	// The test sets up this (contrived) scenario:
+	// 1) Client 1 will first `SetPower` with a session heartbeat. This operation returns with the
+	//    motor engaged.
+	// 2) Client 2 will attempt to "override" that operation with a very slow `GoFor` using the same session id
+	//    as Client 1. The operation will fail as sessions cannot be shared between different auth entities.
+	// 3) Client 2 will attempt to resume a session with the main robot using the same session id as Client 1.
+	//    The robot will reject the session id and create a new session for Client 2.
+	// 4) Client 1 will disconnect. This results in the client ceasing heartbeats for the
+	//    `SetPower` operation. As Client 2 never sent a successful command to the motor (even if it did, Client 2
+	//    won't sent heartbeats), the robot's heartbeat thread will call `motor1.Stop`.
 	motor1Client1, err := motor.FromRobot(roboClient1, "motor1")
 	test.That(t, err, test.ShouldBeNil)
-	motor1Client2, err := motor.NewClientFromConn(ctx, roboClientConn2, "", motor.Named("motor1"), logger)
+
+	// clients made directly with a connection will not send heartbeats.
+	motor1Client2, err := motor.NewClientFromConn(ctx, roboClientConn2, "", motor.Named("motor1"), logger.Sublogger("motor1client2"))
 	test.That(t, err, test.ShouldBeNil)
 
+	// Set the power on client1.
 	test.That(t, motor1Client1.SetPower(ctx, 50, nil), test.ShouldBeNil)
 	time.Sleep(time.Second)
 
@@ -797,7 +813,7 @@ func TestSessionsMixedOwnersImplicitAuth(t *testing.T) {
 	test.That(t, sessions, test.ShouldHaveLength, 1)
 	sessID := sessions[0].ID().String()
 
-	// cannot share here
+	// cannot share sessions across different auth entities.
 	client2Ctx := metadata.AppendToOutgoingContext(ctx, session.IDMetadataKey, sessID)
 	err = motor1Client2.GoFor(client2Ctx, 1, 2, nil)
 	test.That(t, err, test.ShouldNotBeNil)
@@ -806,7 +822,7 @@ func TestSessionsMixedOwnersImplicitAuth(t *testing.T) {
 	test.That(t, statusErr.Code(), test.ShouldEqual, session.StatusNoSession.Code())
 	test.That(t, statusErr.Message(), test.ShouldEqual, session.StatusNoSession.Message())
 
-	// this should give us a new session instead since we cannot see it
+	// this should give us a new session since sessions cannot be shared across different auth entities.
 	resp, err := robotpb.NewRobotServiceClient(roboClientConn2).StartSession(ctx, &robotpb.StartSessionRequest{
 		Resume: sessID,
 	})
@@ -814,24 +830,17 @@ func TestSessionsMixedOwnersImplicitAuth(t *testing.T) {
 	test.That(t, resp.Id, test.ShouldNotEqual, sessID)
 	test.That(t, resp.Id, test.ShouldNotEqual, "")
 
-	// this is the only one heartbeating so we expect a stop
-	startAt := time.Now()
+	// Assert that closing `roboClient1` results in heartbeats stopping that propagates to `Stop`ing
+	// the motor operation. We observe this with a message over the `stopChMotor1` channel.
 	test.That(t, roboClient1.Close(ctx), test.ShouldBeNil)
-
-	select {
-	case <-stopChMotor1:
-		panic("unexpected; too fast")
-	default:
-	}
-
-	<-stopChMotor1
-
-	test.That(t,
-		time.Since(startAt),
-		test.ShouldBeBetweenOrEqual,
-		float64(config.DefaultSessionHeartbeatWindow)*.75,
-		float64(config.DefaultSessionHeartbeatWindow)*1.5,
-	)
+	testutils.WaitForAssertion(t, func(tb testing.TB) {
+		select {
+		case <-stopChMotor1:
+			return
+		default:
+			tb.Fail()
+		}
+	})
 
 	test.That(t, roboClientConn2.Close(), test.ShouldBeNil)
 	test.That(t, r.Close(ctx), test.ShouldBeNil)
@@ -854,6 +863,10 @@ func (dm *dummyMotor) GoFor(ctx context.Context, rpm, revolutions float64, extra
 }
 
 func (dm *dummyMotor) GoTo(ctx context.Context, rpm, positionRevolutions float64, extra map[string]interface{}) error {
+	return nil
+}
+
+func (dm *dummyMotor) SetRPM(ctx context.Context, rpm float64, extra map[string]interface{}) error {
 	return nil
 }
 
@@ -933,7 +946,7 @@ func NewClientFromConn(
 	conn rpc.ClientConn,
 	remoteName string,
 	name resource.Name,
-	logger golog.Logger,
+	logger logging.Logger,
 ) resource.Resource {
 	c := echopb.NewTestEchoServiceClient(conn)
 	return &dummyClient{

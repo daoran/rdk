@@ -10,7 +10,7 @@ if [ "`sudo whoami`x" != "rootx" ]; then
 	exit 1
 fi
 
-do_bullseye(){
+do_piOS(){
 	sudo bash <<-EOS
 	# Basic tools
 	apt-get update && apt-get install -y curl gpg git
@@ -27,13 +27,13 @@ do_bullseye(){
 	echo "deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_18.x $(grep VERSION_CODENAME /etc/os-release | cut -d= -f2) main" > /etc/apt/sources.list.d/nodesource.list
 
 	# Install most things
-	apt-get update && apt-get install -y build-essential nodejs libnlopt-dev libx264-dev libtensorflowlite-dev ffmpeg libjpeg62-turbo-dev
+	apt-get update && apt-get install -y build-essential nodejs libnlopt-dev libx264-dev ffmpeg libjpeg62-turbo-dev
+
+	# Install Gostream dependencies
+	sudo apt-get install -y --no-install-recommends libopus-dev libx11-dev libxext-dev libopusfile-dev
 
 	# Install backports
 	apt-get install -y -t $(grep VERSION_CODENAME /etc/os-release | cut -d= -f2)-backports golang-go
-
-	# Raspberry Pi support
-	test "$(uname -m)" = "aarch64" && apt-get install -y libpigpio-dev
 
 	# upx
 	UPX_URL=https://github.com/upx/upx/releases/download/v4.0.2/upx-4.0.2-amd64_linux.tar.xz
@@ -58,9 +58,19 @@ do_bullseye(){
 }
 
 do_linux(){
+	COLOR_RED='\033[0;31m'
+	COLOR_NULL='\033[0m'
 	if apt-get --version > /dev/null 2>&1; then
 		# Debian/Ubuntu
 		INSTALL_CMD="apt-get install --assume-yes build-essential procps curl file git debianutils"
+		if [ $(source /etc/os-release && echo $VERSION_CODENAME) = focal ]; then
+			echo -e ${COLOR_RED}WARNING:${COLOR_NULL} Ubuntu focal has known issues. Your build may fail.
+			read -p "Continue? (y/n) " yesno
+			if [ $yesno != y ]; then
+				echo Okay, quitting
+				exit 0
+			fi
+		fi
 	elif pacman --version > /dev/null 2>&1; then
 		# Arch
 		INSTALL_CMD="pacman -Sy --needed --noconfirm base-devel procps-ng curl git which"
@@ -147,7 +157,7 @@ do_brew(){
 	tap  "viamrobotics/brews"
 
 	# pinned
-	brew "go@1.20", link: true, conflicts_with: ["go"]
+	brew "go@1.23", link: true, conflicts_with: ["go"]
 	brew "node@18", link: true, conflicts_with: ["node"]
 
 	# unpinned
@@ -158,13 +168,17 @@ do_brew(){
 	brew "jpeg-turbo"
 	brew "ffmpeg"
 	brew "licensefinder"
-	brew "tensorflowlite" # Needs to be last
+	brew "opus"
+	brew "opusfile"
 	EOS
 
 	if [ $? -ne 0 ]; then
 		echo "Package installation failed when running brew command, please retry."
 		exit 1
 	fi
+
+	# replace default go with pinned
+	brew link --overwrite go@1.23
 
 	# due to a missing bottle in homebrew, this has to be installed on its own
 	brew install upx
@@ -176,13 +190,13 @@ do_brew(){
 # Main install routine
 
 if [ "$(uname)" == "Linux" ]; then
-	if [ "$(grep VERSION_CODENAME /etc/os-release | cut -d= -f2)" == "bullseye" ]; then
+	if [ "$(grep VERSION_CODENAME /etc/os-release | cut -d= -f2)" == "bullseye" ] || [ "$(grep VERSION_CODENAME /etc/os-release | cut -d= -f2)" == "bookworm" ]; then
 		NO_PROFILE=1
-		do_bullseye || exit 1
+		do_piOS || exit 1
 	elif [ "$(uname -m)" == "x86_64" ]; then
 		do_linux || exit 1
 	else
-		echo -e "\033[41m""Native dev environment is only supported on Debian/Bullseye (x86_64 and aarch64), but brew-based support is available for generic Linux/x86_64 and Darwin (MacOS).""\033[0m"
+		echo -e "\033[41m""Native dev environment is only supported on Debian/Bullseye or Bookworm (x86_64 and aarch64), but brew-based support is available for generic Linux/x86_64 and Darwin (MacOS).""\033[0m"
 		exit 1
 	fi
 elif [ "$(uname)" == "Darwin" ]; then

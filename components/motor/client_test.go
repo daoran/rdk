@@ -5,19 +5,19 @@ import (
 	"net"
 	"testing"
 
-	"github.com/edaniels/golog"
 	"go.viam.com/test"
 	"go.viam.com/utils/rpc"
 
 	"go.viam.com/rdk/components/motor"
 	viamgrpc "go.viam.com/rdk/grpc"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/testutils"
 	"go.viam.com/rdk/testutils/inject"
 )
 
 func TestClient(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	listener1, err := net.Listen("tcp", "localhost:0")
 	test.That(t, err, test.ShouldBeNil)
 	rpcServer, err := rpc.NewServer(logger, rpc.WithUnauthenticated())
@@ -39,6 +39,10 @@ func TestClient(t *testing.T) {
 		return nil
 	}
 	workingMotor.GoToFunc = func(ctx context.Context, rpm, position float64, extra map[string]interface{}) error {
+		actualExtra = extra
+		return nil
+	}
+	workingMotor.SetRPMFunc = func(ctx context.Context, rpm float64, extra map[string]interface{}) error {
 		actualExtra = extra
 		return nil
 	}
@@ -73,6 +77,9 @@ func TestClient(t *testing.T) {
 	}
 	failingMotor.GoToFunc = func(ctx context.Context, rpm, position float64, extra map[string]interface{}) error {
 		return errGoToFailed
+	}
+	failingMotor.SetRPMFunc = func(ctx context.Context, rpm float64, extra map[string]interface{}) error {
+		return errSetRPMFailed
 	}
 	failingMotor.ResetZeroPositionFunc = func(ctx context.Context, offset float64, extra map[string]interface{}) error {
 		return errResetZeroFailed
@@ -135,6 +142,9 @@ func TestClient(t *testing.T) {
 		err = workingMotorClient.GoTo(context.Background(), 42.0, 42.0, nil)
 		test.That(t, err, test.ShouldBeNil)
 
+		err = workingMotorClient.SetRPM(context.Background(), 42.0, nil)
+		test.That(t, err, test.ShouldBeNil)
+
 		err = workingMotorClient.ResetZeroPosition(context.Background(), 0.5, nil)
 		test.That(t, err, test.ShouldBeNil)
 
@@ -171,6 +181,9 @@ func TestClient(t *testing.T) {
 		err := failingMotorClient.GoTo(context.Background(), 42.0, 42.0, nil)
 		test.That(t, err, test.ShouldNotBeNil)
 		test.That(t, err.Error(), test.ShouldContainSubstring, errGoToFailed.Error())
+
+		err = failingMotor.SetRPMFunc(context.Background(), 42.0, nil)
+		test.That(t, err.Error(), test.ShouldContainSubstring, errSetRPMFailed.Error())
 
 		err = failingMotorClient.ResetZeroPosition(context.Background(), 0.5, nil)
 		test.That(t, err, test.ShouldNotBeNil)
@@ -224,6 +237,9 @@ func TestClient(t *testing.T) {
 		err = workingMotorDialedClient.GoTo(context.Background(), 42.0, 42.0, nil)
 		test.That(t, err, test.ShouldBeNil)
 
+		err = workingMotorDialedClient.SetRPM(context.Background(), 42.0, nil)
+		test.That(t, err, test.ShouldBeNil)
+
 		err = workingMotorDialedClient.ResetZeroPosition(context.Background(), 0.5, nil)
 		test.That(t, err, test.ShouldBeNil)
 
@@ -248,6 +264,9 @@ func TestClient(t *testing.T) {
 		err = failingMotorDialedClient.SetPower(context.Background(), 39.2, nil)
 		test.That(t, err, test.ShouldNotBeNil)
 		test.That(t, err.Error(), test.ShouldContainSubstring, errSetPowerFailed.Error())
+
+		err = failingMotorDialedClient.SetRPM(context.Background(), 42.0, nil)
+		test.That(t, err.Error(), test.ShouldContainSubstring, errSetRPMFailed.Error())
 
 		properties, err := failingMotorDialedClient.Properties(context.Background(), nil)
 		test.That(t, properties.PositionReporting, test.ShouldBeFalse)

@@ -34,13 +34,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/pkg/errors"
 	"go.uber.org/multierr"
 	"go.viam.com/utils"
 
 	"go.viam.com/rdk/components/board"
 	"go.viam.com/rdk/components/motor"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/operation"
 	"go.viam.com/rdk/resource"
 	rdkutils "go.viam.com/rdk/utils"
@@ -68,16 +68,16 @@ type Config struct {
 func (cfg *Config) Validate(path string) ([]string, error) {
 	var deps []string
 	if cfg.BoardName == "" {
-		return nil, utils.NewConfigValidationFieldRequiredError(path, "board")
+		return nil, resource.NewConfigValidationFieldRequiredError(path, "board")
 	}
 	if cfg.TicksPerRotation == 0 {
-		return nil, utils.NewConfigValidationFieldRequiredError(path, "ticks_per_rotation")
+		return nil, resource.NewConfigValidationFieldRequiredError(path, "ticks_per_rotation")
 	}
 	if cfg.Pins.Direction == "" {
-		return nil, utils.NewConfigValidationFieldRequiredError(path, "dir")
+		return nil, resource.NewConfigValidationFieldRequiredError(path, "dir")
 	}
 	if cfg.Pins.Step == "" {
-		return nil, utils.NewConfigValidationFieldRequiredError(path, "step")
+		return nil, resource.NewConfigValidationFieldRequiredError(path, "step")
 	}
 	deps = append(deps, cfg.BoardName)
 	return deps, nil
@@ -85,46 +85,42 @@ func (cfg *Config) Validate(path string) ([]string, error) {
 
 func init() {
 	resource.RegisterComponent(motor.API, model, resource.Registration[motor.Motor, *Config]{
-		Constructor: func(
-			ctx context.Context,
-			deps resource.Dependencies,
-			conf resource.Config,
-			logger golog.Logger,
-		) (motor.Motor, error) {
-			actualBoard, motorConfig, err := getBoardFromRobotConfig(deps, conf)
-			if err != nil {
-				return nil, err
-			}
-
-			return newGPIOStepper(ctx, actualBoard, *motorConfig, conf.ResourceName(), logger)
-		},
-	})
+		Constructor: newGPIOStepper,
+	},
+	)
 }
 
-func getBoardFromRobotConfig(deps resource.Dependencies, conf resource.Config) (board.Board, *Config, error) {
-	motorConfig, err := resource.NativeConfig[*Config](conf)
-	if err != nil {
-		return nil, nil, err
+// TODO (rh) refactor this driver so that the enable and direction logic is at the beginning of each API call
+// and the step -> position logic is the only thing being handled by the background thread.
+// right now too many things can be called out of lock, this function is only called from the constructor, CLose
+// the doCycle step routine, and should not be called elsewhere since there's no lock in to ptoect the enable pins.
+func (m *gpioStepper) enable(ctx context.Context, high bool) error {
+	var err error
+	if m.enablePinHigh != nil {
+		err = multierr.Combine(err, m.enablePinHigh.Set(ctx, high, nil))
 	}
-	if motorConfig.BoardName == "" {
-		return nil, nil, errors.New("expected board name in config for motor")
+
+	if m.enablePinLow != nil {
+		err = multierr.Combine(err, m.enablePinLow.Set(ctx, !high, nil))
 	}
-	b, err := board.FromDependencies(deps, motorConfig.BoardName)
-	if err != nil {
-		return nil, nil, err
-	}
-	return b, motorConfig, nil
+
+	return err
 }
 
 func newGPIOStepper(
 	ctx context.Context,
-	b board.Board,
-	mc Config,
-	name resource.Name,
-	logger golog.Logger,
+	deps resource.Dependencies,
+	conf resource.Config,
+	logger logging.Logger,
 ) (motor.Motor, error) {
-	if b == nil {
-		return nil, errors.New("board is required")
+	mc, err := resource.NativeConfig[*Config](conf)
+	if err != nil {
+		return nil, err
+	}
+
+	b, err := board.FromDependencies(deps, mc.BoardName)
+	if err != nil {
+		return nil, err
 	}
 
 	if mc.TicksPerRotation == 0 {
@@ -132,14 +128,12 @@ func newGPIOStepper(
 	}
 
 	m := &gpioStepper{
-		Named:            name.AsNamed(),
+		Named:            conf.ResourceName().AsNamed(),
 		theBoard:         b,
 		stepsPerRotation: mc.TicksPerRotation,
 		logger:           logger,
 		opMgr:            operation.NewSingleOperationManager(),
 	}
-
-	var err error
 
 	// only set enable pins if they exist
 	if mc.Pins.EnablePinHigh != "" {
@@ -182,7 +176,6 @@ func newGPIOStepper(
 type gpioStepper struct {
 	resource.Named
 	resource.AlwaysRebuild
-	resource.TriviallyCloseable
 
 	// config
 	theBoard                    board.Board
@@ -191,7 +184,7 @@ type gpioStepper struct {
 	minDelay                    time.Duration
 	enablePinHigh, enablePinLow board.GPIOPin
 	stepPin, dirPin             board.GPIOPin
-	logger                      golog.Logger
+	logger                      logging.Logger
 
 	// state
 	lock  sync.Mutex
@@ -208,11 +201,28 @@ type gpioStepper struct {
 // SetPower sets the percentage of power the motor should employ between 0-1.
 func (m *gpioStepper) SetPower(ctx context.Context, powerPct float64, extra map[string]interface{}) error {
 	if math.Abs(powerPct) <= .0001 {
-		m.stop()
-		return nil
+		return m.Stop(ctx, nil)
 	}
 
-	return errors.Errorf("gpioStepper doesn't support raw power mode in motor (%s)", m.Name().Name)
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	if m.minDelay == 0 {
+		return errors.Errorf(
+			"if you want to set the power, set 'stepper_delay_usec' in the motor config at "+
+				"the minimum time delay between pulses for your stepper motor (%s)",
+			m.Name().Name)
+	}
+
+	// lock added here to prevent race with doStep
+	m.stepperDelay = time.Duration(float64(m.minDelay) / math.Abs(powerPct))
+
+	if powerPct < 0 {
+		m.targetStepPosition = math.MinInt64
+	} else {
+		m.targetStepPosition = math.MaxInt64
+	}
+
+	return nil
 }
 
 func (m *gpioStepper) startThread() {
@@ -266,26 +276,28 @@ func (m *gpioStepper) doCycle(ctx context.Context) (time.Duration, error) {
 
 	// wait the stepper delay to return from the doRun for loop or select
 	// context if the duration has not elapsed.
-	return m.stepperDelay, nil
+	return 0, nil
 }
 
 // have to be locked to call.
 func (m *gpioStepper) doStep(ctx context.Context, forward bool) error {
 	err := multierr.Combine(
 		m.dirPin.Set(ctx, forward, nil),
-		m.stepPin.Set(ctx, true, nil))
+		m.stepPin.Set(ctx, true, nil),
+		m.enable(ctx, true),
+	)
 	if err != nil {
 		return err
 	}
 	// stay high for half the delay
-	time.Sleep(m.stepperDelay / 2)
+	time.Sleep(m.stepperDelay / 2.0)
 
 	if err := m.stepPin.Set(ctx, false, nil); err != nil {
 		return err
 	}
 
 	// stay low for the other half
-	time.Sleep(m.stepperDelay / 2)
+	time.Sleep(m.stepperDelay / 2.0)
 
 	if forward {
 		m.stepPosition++
@@ -304,21 +316,10 @@ func (m *gpioStepper) GoFor(ctx context.Context, rpm, revolutions float64, extra
 	ctx, done := m.opMgr.New(ctx)
 	defer done()
 
-	err := m.enable(ctx, true)
-	if err != nil {
-		return errors.Wrapf(err, "error enabling motor in GoFor from motor (%s)", m.Name().Name)
-	}
-
-	err = m.goForInternal(ctx, rpm, revolutions)
-	if err != nil {
+	if err := m.goForInternal(ctx, rpm, revolutions); err != nil {
 		return multierr.Combine(
 			m.enable(ctx, false),
 			errors.Wrapf(err, "error in GoFor from motor (%s)", m.Name().Name))
-	}
-
-	// this is a long-running operation, do not wait for Stop, do not disable enable pins
-	if revolutions == 0 {
-		return nil
 	}
 
 	return multierr.Combine(
@@ -326,16 +327,28 @@ func (m *gpioStepper) GoFor(ctx context.Context, rpm, revolutions float64, extra
 		m.enable(ctx, false))
 }
 
-func (m *gpioStepper) goForInternal(ctx context.Context, rpm, revolutions float64) error {
-	if revolutions == 0 {
-		// go a large number of revolutions if 0 is passed in, at the desired speed
-		revolutions = 1000000
+// calcStepperDelay calculates the delay between steps for the thread that we started in component creation.
+// The delay is found by calculating seconds per step, and then casting that value to a time.Duration.
+func (m *gpioStepper) calcStepperDelay(rpm float64) time.Duration {
+	stepperDelay := time.Duration(int64(float64(time.Minute) / (math.Abs(rpm) * float64(m.stepsPerRotation))))
+	if stepperDelay < m.minDelay || rpm == 0 {
+		stepperDelay = m.minDelay
+		m.logger.Debugf(
+			"calculated delay less than the minimum delay for stepper motor setting to %+v", stepperDelay,
+		)
 	}
 
+	return stepperDelay
+}
+
+func (m *gpioStepper) goForInternal(ctx context.Context, rpm, revolutions float64) error {
 	speed := math.Abs(rpm)
 	if speed < 0.1 {
-		m.logger.Warn("motor speed is nearly 0 rev_per_min")
-		return m.Stop(ctx, nil)
+		return multierr.Combine(m.Stop(ctx, nil), motor.NewZeroRPMError())
+	}
+
+	if err := motor.CheckRevolutions(revolutions); err != nil {
+		return err
 	}
 
 	var d int64 = 1
@@ -346,14 +359,7 @@ func (m *gpioStepper) goForInternal(ctx context.Context, rpm, revolutions float6
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
-	// calculate delay between steps for the thread in the gorootuine that we started in component creation
-	m.stepperDelay = time.Duration(int64(float64(time.Minute) / (math.Abs(rpm) * float64(m.stepsPerRotation))))
-	if m.stepperDelay < m.minDelay {
-		m.stepperDelay = m.minDelay
-		m.logger.Debugf(
-			"calculated delay less than the minimum delay for stepper motor setting to %+v", m.stepperDelay,
-		)
-	}
+	m.stepperDelay = m.calcStepperDelay(rpm)
 
 	if !m.threadStarted {
 		return errors.New("thread not started")
@@ -377,19 +383,46 @@ func (m *gpioStepper) GoTo(ctx context.Context, rpm, positionRevolutions float64
 	// if you call GoFor with 0 revolutions, the motor will spin forever. If we are at the target,
 	// we must avoid this by not calling GoFor.
 	if rdkutils.Float64AlmostEqual(moveDistance, 0, 0.1) {
-		m.logger.Debugf("GoTo distance nearly zero for motor (%s), not moving", m.Name().Name)
+		m.logger.CDebugf(ctx, "GoTo distance nearly zero for motor (%s), not moving", m.Name().Name)
 		return nil
 	}
 
-	m.logger.Debugf("motor (%s) going to %.2f at rpm %.2f", m.Name().Name, moveDistance, math.Abs(rpm))
+	m.logger.CDebugf(ctx, "motor (%s) going to %.2f at rpm %.2f", m.Name().Name, moveDistance, math.Abs(rpm))
 	return m.GoFor(ctx, math.Abs(rpm), moveDistance, extra)
+}
+
+// SetRPM instructs the motor to move at the specified RPM indefinitely.
+func (m *gpioStepper) SetRPM(ctx context.Context, rpm float64, extra map[string]interface{}) error {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	if math.Abs(rpm) <= .0001 {
+		return m.Stop(ctx, nil)
+	}
+
+	// calculate delay between steps for the thread in the goroutine that we started in component creation.
+	// the delay is found by calculating seconds per step, and then casting that value to a time.Duration.
+	m.stepperDelay = m.calcStepperDelay(rpm)
+
+	if !m.threadStarted {
+		return errors.New("thread not started")
+	}
+
+	if rpm < 0 {
+		m.targetStepPosition = math.MinInt64
+	} else {
+		m.targetStepPosition = math.MaxInt64
+	}
+
+	return nil
 }
 
 // Set the current position (+/- offset) to be the new zero (home) position.
 func (m *gpioStepper) ResetZeroPosition(ctx context.Context, offset float64, extra map[string]interface{}) error {
 	m.lock.Lock()
 	defer m.lock.Unlock()
-	m.stepPosition = int64(offset * float64(m.stepsPerRotation))
+	m.stepPosition = int64(-1 * offset * float64(m.stepsPerRotation))
+	m.targetStepPosition = m.stepPosition
 	return nil
 }
 
@@ -418,16 +451,11 @@ func (m *gpioStepper) IsMoving(ctx context.Context) (bool, error) {
 
 // Stop turns the power to the motor off immediately, without any gradual step down.
 func (m *gpioStepper) Stop(ctx context.Context, extra map[string]interface{}) error {
-	m.stop()
-	m.lock.Lock()
-	defer m.lock.Unlock()
-	return m.enable(ctx, false)
-}
-
-func (m *gpioStepper) stop() {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 	m.targetStepPosition = m.stepPosition
+
+	return m.enable(ctx, false)
 }
 
 // IsPowered returns whether or not the motor is currently on. It also returns the percent power
@@ -445,25 +473,12 @@ func (m *gpioStepper) IsPowered(ctx context.Context, extra map[string]interface{
 	return on, percent, err
 }
 
-func (m *gpioStepper) enable(ctx context.Context, on bool) error {
-	var err error
-	if m.enablePinHigh != nil {
-		err = multierr.Combine(err, m.enablePinHigh.Set(ctx, on, nil))
-	}
-
-	if m.enablePinLow != nil {
-		err = multierr.Combine(err, m.enablePinLow.Set(ctx, !on, nil))
-	}
-
-	return err
-}
-
 func (m *gpioStepper) Close(ctx context.Context) error {
 	err := m.Stop(ctx, nil)
 
 	m.lock.Lock()
 	if m.cancel != nil {
-		m.logger.Debugf("stopping control thread for motor (%s)", m.Name().Name)
+		m.logger.CDebugf(ctx, "stopping control thread for motor (%s)", m.Name().Name)
 		m.cancel()
 		m.cancel = nil
 		m.threadStarted = false

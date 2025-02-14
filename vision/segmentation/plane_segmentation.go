@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/rand"
 	"sort"
+	"sync"
 
 	"github.com/golang/geo/r3"
 	"github.com/pkg/errors"
@@ -17,19 +18,23 @@ import (
 	"go.viam.com/rdk/utils"
 )
 
+// Setting a global here is dangerous and doesn't work in parallel.
+// This is only ever set for testing, and tests need to be careful to revert it to false afterwards.
 var sortPositions bool
 
 // GetPointCloudPositions extracts the positions of the points from the pointcloud into a Vec3 slice.
-func GetPointCloudPositions(cloud pc.PointCloud) []r3.Vector {
+func GetPointCloudPositions(cloud pc.PointCloud) ([]r3.Vector, []pc.Data) {
 	positions := make(pc.Vectors, 0, cloud.Size())
+	data := make([]pc.Data, 0, cloud.Size())
 	cloud.Iterate(0, 0, func(pt r3.Vector, d pc.Data) bool {
 		positions = append(positions, pt)
+		data = append(data, d)
 		return true
 	})
 	if sortPositions {
 		sort.Sort(positions)
 	}
-	return positions
+	return positions, data
 }
 
 func distance(equation [4]float64, pt r3.Vector) float64 {
@@ -83,7 +88,7 @@ func SegmentPlaneWRTGround(ctx context.Context, cloud pc.PointCloud, nIterations
 	}
 	//nolint:gosec
 	r := rand.New(rand.NewSource(1))
-	pts := GetPointCloudPositions(cloud)
+	pts, data := GetPointCloudPositions(cloud)
 	nPoints := cloud.Size()
 
 	// First get all equations
@@ -116,7 +121,7 @@ func SegmentPlaneWRTGround(ctx context.Context, cloud pc.PointCloud, nIterations
 			equations = append(equations, currentEquation)
 		}
 	}
-	return findBestEq(ctx, cloud, len(equations), equations, pts, dstThreshold)
+	return findBestEq(ctx, cloud, len(equations), equations, pts, data, dstThreshold)
 }
 
 // SegmentPlane segments the biggest plane in the 3D Pointcloud.
@@ -131,7 +136,7 @@ func SegmentPlane(ctx context.Context, cloud pc.PointCloud, nIterations int, thr
 	}
 	//nolint:gosec
 	r := rand.New(rand.NewSource(1))
-	pts := GetPointCloudPositions(cloud)
+	pts, data := GetPointCloudPositions(cloud)
 	nPoints := cloud.Size()
 
 	// First get all equations
@@ -159,11 +164,11 @@ func SegmentPlane(ctx context.Context, cloud pc.PointCloud, nIterations int, thr
 		equations = append(equations, currentEquation)
 	}
 
-	return findBestEq(ctx, cloud, nIterations, equations, pts, threshold)
+	return findBestEq(ctx, cloud, nIterations, equations, pts, data, threshold)
 }
 
 func findBestEq(ctx context.Context, cloud pc.PointCloud, nIterations int, equations [][4]float64,
-	pts []r3.Vector, threshold float64,
+	pts []r3.Vector, data []pc.Data, threshold float64,
 ) (pc.Plane, pc.PointCloud, error) {
 	// Then find the best equation in parallel. It ends up being faster to loop
 	// by equations (iterations) and then points due to what I (erd) think is
@@ -174,6 +179,7 @@ func findBestEq(ctx context.Context, cloud pc.PointCloud, nIterations int, equat
 		inliers  int
 	}
 	var bestResults []bestResult
+	var bestResultsMu sync.Mutex
 	if err := utils.GroupWorkParallel(
 		ctx,
 		nIterations,
@@ -181,8 +187,10 @@ func findBestEq(ctx context.Context, cloud pc.PointCloud, nIterations int, equat
 			bestResults = make([]bestResult, numGroups)
 		},
 		func(groupNum, groupSize, from, to int) (utils.MemberWorkFunc, utils.GroupWorkDoneFunc) {
+			var groupMu sync.Mutex
 			bestEquation := [4]float64{}
 			bestInliers := 0
+
 			return func(memberNum, workNum int) {
 					currentInliers := 0
 					currentEquation := equations[workNum]
@@ -194,11 +202,15 @@ func findBestEq(ctx context.Context, cloud pc.PointCloud, nIterations int, equat
 						}
 					}
 					// if the current plane contains more pixels than the previously stored one, save this one as the biggest plane
+					groupMu.Lock()
+					defer groupMu.Unlock()
 					if currentInliers > bestInliers {
 						bestEquation = currentEquation
 						bestInliers = currentInliers
 					}
 				}, func() {
+					bestResultsMu.Lock()
+					defer bestResultsMu.Unlock()
 					bestResults[groupNum] = bestResult{bestEquation, bestInliers}
 				}
 		},
@@ -220,18 +232,14 @@ func findBestEq(ctx context.Context, cloud pc.PointCloud, nIterations int, equat
 	planeCloud := pc.NewWithPrealloc(bestInliers)
 	nonPlaneCloud := pc.NewWithPrealloc(nPoints - bestInliers)
 	planeCloudCenter := r3.Vector{}
-	for _, pt := range pts {
+	for i, pt := range pts {
 		dist := distance(bestEquation, pt)
 		var err error
-		data, got := cloud.At(pt.X, pt.Y, pt.Z)
-		if !got {
-			return nil, nil, errors.Errorf("expected cloud to contain point (%v, %v, %v)", pt.X, pt.Y, pt.Z)
-		}
 		if math.Abs(dist) < threshold {
 			planeCloudCenter = planeCloudCenter.Add(pt)
-			err = planeCloud.Set(pt, data)
+			err = planeCloud.Set(pt, data[i])
 		} else {
-			err = nonPlaneCloud.Set(pt, data)
+			err = nonPlaneCloud.Set(pt, data[i])
 		}
 		if err != nil {
 			return nil, nil, errors.Wrapf(err, "error setting point (%v, %v, %v) in point cloud", pt.X, pt.Y, pt.Z)
@@ -317,9 +325,8 @@ func (pcps *pointCloudPlaneSegmentation) FindPlanes(ctx context.Context) ([]pc.P
 			// this cloud is not valid so revert to last
 			nonPlaneCloud = lastNonPlaneCloud
 			break
-		} else {
-			nonPlaneCloud = smallerNonPlaneCloud
 		}
+		nonPlaneCloud = smallerNonPlaneCloud
 		planes = append(planes, smallerPlane)
 	}
 	return planes, nonPlaneCloud, nil

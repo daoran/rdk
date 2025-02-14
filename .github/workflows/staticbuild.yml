@@ -5,7 +5,11 @@ on:
     inputs:
       release_type:
         required: true
+        default: latest
         type: string
+      no-upload:
+        type: boolean
+        description: "no-upload: if checked, don't upload"
   workflow_call:
     inputs:
       release_type:
@@ -16,27 +20,58 @@ on:
         required: true
 
 jobs:
+  build_timestamp:
+    name: Set Build Timestamp 
+    runs-on: ubuntu-latest
+    outputs:
+      date: ${{ steps.build_time.outputs.date }}
+    steps:
+    - name: Build Time
+      id: build_time
+      if: inputs.release_type == 'latest'
+      run: echo "date=`date +%Y%m%d%H%M%S`" >> $GITHUB_OUTPUT
+
   static:
     name: Antique Build
+    needs: build_timestamp
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: [ubuntu-latest]
-            image: ghcr.io/viamrobotics/antique:amd64-cache
+          - arch: ubuntu-latest
+            image: ghcr.io/viamrobotics/antique2:amd64-cache
             platform: linux/amd64
-          - arch: [buildjet-2vcpu-ubuntu-2204-arm]
-            image: ghcr.io/viamrobotics/antique:arm64-cache
+            target: static-release
+          - arch: ubuntu-small-arm
+            image: ghcr.io/viamrobotics/antique2:arm64-cache
             platform: linux/arm64
+            target: static-release
+          - arch: ubuntu-latest
+            image: ghcr.io/viamrobotics/antique2:amd64-cache
+            platform: linux/amd64
+            target: static-release-win
     runs-on: ${{ matrix.arch }}
     container:
       image: ${{ matrix.image }}
       options: --platform ${{ matrix.platform }}
+      volumes:
+      # otherwise we get a 'read-only filesystem' error when symlinking over this
+      - /tmp/node20:/__e/node20
     timeout-minutes: 15
     outputs:
       date: ${{ steps.build_date.outputs.date }}
+    env:
+      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: 'true'
 
     steps:
+    - name: override nodejs
+      # note: the antique image intentionally has an old ubuntu with old GLIBC; github's node requires a newer one.
+      # actions require this /__e/node20/bin/node file, so we override it.
+      run: |
+        mkdir -p /__e/node20/bin/
+        ln --force --symbolic $(which node) /__e/node20/bin/node
+        /__e/node20/bin/node --version
+
     - name: Check out code
       if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
       uses: actions/checkout@v3
@@ -53,14 +88,14 @@ jobs:
         sudo -Hu testbot bash -lc 'make clean-all'
 
     - name: Authorize GCP Upload
-      uses: google-github-actions/auth@v1
+      uses: google-github-actions/auth@v1.1.1
       with:
         credentials_json: '${{ secrets.GCP_CREDENTIALS }}'
 
     - name: Build (PR)
       if: contains(github.event.pull_request.labels.*.name, 'static-build') || contains(github.event.pull_request.labels.*.name, 'static-ignore-tests')
       run: |
-        sudo -Hu testbot bash -lc 'make BUILD_CHANNEL="pr-${{ github.event.pull_request.number }}" static-release'
+        sudo -Hu testbot bash -lc 'make BUILD_CHANNEL="pr-${{ github.event.pull_request.number }}" ${{ matrix.target }}'
 
     - name: Upload Files (PR)
       if: contains(github.event.pull_request.labels.*.name, 'static-build') || contains(github.event.pull_request.labels.*.name, 'static-ignore-tests')
@@ -76,24 +111,35 @@ jobs:
     - name: Build (Latest)
       if: inputs.release_type == 'latest'
       run: |
-        sudo -Hu testbot bash -lc 'make BUILD_CHANNEL="latest" static-release'
+        sudo -Hu testbot bash -lc 'make RELEASE_TYPE="latest" BUILD_CHANNEL="${{needs.build_timestamp.outputs.date}}" ${{ matrix.target }}'
 
     - name: Build (Tagged)
       if: inputs.release_type == 'stable' || inputs.release_type == 'rc'
       run: |
-        sudo -Hu testbot bash -lc 'make RELEASE_TYPE="${{ inputs.release_type }}" BUILD_CHANNEL="${{ github.ref_name }}" static-release'
+        sudo -Hu testbot bash -lc 'make RELEASE_TYPE="${{ inputs.release_type }}" BUILD_CHANNEL="${{ github.ref_name }}" ${{ matrix.target }}'
 
     - name: Set Date
       id: build_date
       run: echo "date=`date +%F`" >> $GITHUB_OUTPUT
 
     - name: Upload Files (Testing)
-      if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+      if: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'push') && !inputs.no-upload }}
       uses: google-github-actions/upload-cloud-storage@v0.10.4
       with:
         headers: "cache-control: no-cache"
         path: 'etc/packaging/static/deploy/'
         destination: 'packages.viam.com/apps/viam-server/testing/static/${{ steps.build_date.outputs.date }}/${{ github.sha }}/'
+        glob: 'viam-server-*'
+        parent: false
+        gzip: false
+
+    - name: Upload Manifest (Testing)
+      if: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'push') && !inputs.no-upload }}
+      uses: google-github-actions/upload-cloud-storage@v0.10.4
+      with:
+        headers: "cache-control: no-cache"
+        path: 'etc/packaging/static/manifest/'
+        destination: 'packages.viam.com/apps/viam-subsystems/testing/viam-server/${{ steps.build_date.outputs.date }}/${{ github.sha }}/'
         glob: 'viam-server-*'
         parent: false
         gzip: false
@@ -114,11 +160,11 @@ jobs:
 
   static_test:
     name: Static Test
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+    if: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'push') && !inputs.no-upload }}
     strategy:
       fail-fast: false
       matrix:
-        arch: [[ubuntu-latest], [buildjet-2vcpu-ubuntu-2204-arm], [arm64, pi4]]
+        arch: [[ubuntu-latest], [ubuntu-small-arm], [pi4], [pi5]]
     needs: static
     runs-on: ${{ matrix.arch }}
     timeout-minutes: 15
@@ -161,11 +207,12 @@ jobs:
   static_deploy:
     name: Static Deploy
     needs: static_test
+    if: ${{ !inputs.no-upload }}
     runs-on: ubuntu-latest
 
     steps:
     - name: Authorize GCP
-      uses: google-github-actions/auth@v1
+      uses: google-github-actions/auth@v1.1.1
       with:
         credentials_json: '${{ secrets.GCP_CREDENTIALS }}'
 
@@ -175,6 +222,10 @@ jobs:
     - name: Publish Static Binary
       run: |
         gsutil mv "gs://packages.viam.com/apps/viam-server/testing/static/${{ needs.static_test.outputs.date }}/${{ github.sha }}/*" "gs://packages.viam.com/apps/viam-server/"
+
+    - name: Publish Subsystem Metadata
+      run: |
+        gsutil mv "gs://packages.viam.com/apps/viam-subsystems/testing/viam-server/${{ needs.static_test.outputs.date }}/${{ github.sha }}/*" "gs://packages.viam.com/apps/viam-subsystems/"
 
     - name: Output Summary
       run: |

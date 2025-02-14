@@ -146,6 +146,26 @@ func TestServer(t *testing.T) {
 		test.That(t, err, test.ShouldBeNil)
 		test.That(t, resp, test.ShouldNotBeNil)
 		test.That(t, currentMode, test.ShouldEqual, navigation.ModeWaypoint)
+
+		// set explore mode
+		req = &pb.SetModeRequest{
+			Name: testSvcName1.ShortName(),
+			Mode: pb.Mode_MODE_EXPLORE,
+		}
+		resp, err = navServer.SetMode(context.Background(), req)
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, resp, test.ShouldNotBeNil)
+		test.That(t, currentMode, test.ShouldEqual, navigation.ModeExplore)
+
+		// set unknown mode
+		req = &pb.SetModeRequest{
+			Name: testSvcName1.ShortName(),
+			Mode: 99,
+		}
+		resp, err = navServer.SetMode(context.Background(), req)
+		test.That(t, err, test.ShouldNotBeNil)
+		test.That(t, err.Error(), test.ShouldContainSubstring, "unknown mode")
+		test.That(t, resp, test.ShouldBeNil)
 	})
 
 	t.Run("failing set mode function", func(t *testing.T) {
@@ -328,6 +348,54 @@ func TestServer(t *testing.T) {
 		}
 		resp, err = navServer.RemoveWaypoint(context.Background(), req)
 		test.That(t, err, test.ShouldNotBeNil)
+		test.That(t, resp, test.ShouldBeNil)
+	})
+
+	t.Run("working Paths", func(t *testing.T) {
+		path, err := navigation.NewPath(primitive.NewObjectID(), []*geo.Point{geo.NewPoint(0, 0)})
+		test.That(t, err, test.ShouldBeNil)
+		expectedOutput := []*navigation.Path{path}
+		injectSvc.PathsFunc = func(ctx context.Context, extra map[string]interface{}) ([]*navigation.Path, error) {
+			return expectedOutput, nil
+		}
+		req := &pb.GetPathsRequest{Name: testSvcName1.ShortName()}
+		resp, err := navServer.GetPaths(context.Background(), req)
+		test.That(t, err, test.ShouldBeNil)
+		convertedPbPath, err := navigation.ProtoSliceToPaths(resp.Paths)
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, convertedPbPath, test.ShouldResemble, expectedOutput)
+	})
+	t.Run("failing Paths", func(t *testing.T) {
+		expectedErr := errors.New("unimplemented")
+		injectSvc.PathsFunc = func(ctx context.Context, extra map[string]interface{}) ([]*navigation.Path, error) {
+			return nil, expectedErr
+		}
+		req := &pb.GetPathsRequest{Name: testSvcName1.ShortName()}
+		resp, err := navServer.GetPaths(context.Background(), req)
+		test.That(t, err, test.ShouldResemble, expectedErr)
+		test.That(t, resp, test.ShouldBeNil)
+	})
+
+	t.Run("working Properties", func(t *testing.T) {
+		prop := navigation.Properties{
+			MapType: navigation.NoMap,
+		}
+		injectSvc.PropertiesFunc = func(ctx context.Context) (navigation.Properties, error) {
+			return prop, nil
+		}
+		req := &pb.GetPropertiesRequest{Name: testSvcName1.ShortName()}
+		resp, err := navServer.GetProperties(context.Background(), req)
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, resp.MapType, test.ShouldEqual, pb.MapType_MAP_TYPE_NONE)
+	})
+	t.Run("failing Properties", func(t *testing.T) {
+		expectedErr := errors.New("unimplemented")
+		injectSvc.PropertiesFunc = func(ctx context.Context) (navigation.Properties, error) {
+			return navigation.Properties{}, expectedErr
+		}
+		req := &pb.GetPropertiesRequest{Name: testSvcName1.ShortName()}
+		resp, err := navServer.GetProperties(context.Background(), req)
+		test.That(t, err, test.ShouldBeError, expectedErr)
 		test.That(t, resp, test.ShouldBeNil)
 	})
 

@@ -17,26 +17,31 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/pkg/errors"
 	"go.uber.org/multierr"
-	pb "go.viam.com/api/component/arm/v1"
 	goutils "go.viam.com/utils"
 
 	"go.viam.com/rdk/components/arm"
-	"go.viam.com/rdk/motionplan"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/operation"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/resource"
+	"go.viam.com/rdk/services/motion"
 	"go.viam.com/rdk/spatialmath"
+	rdkutils "go.viam.com/rdk/utils"
 )
 
 // Model is the name of the UR5e model of an arm component.
 var Model = resource.DefaultModelFamily.WithModel("ur5e")
 
+var (
+	errorPollDuration = 10 * time.Millisecond
+	defaultTimeout    = 10 * time.Second
+)
+
 // Config is used for converting config attributes.
 type Config struct {
-	Speed               float64 `json:"speed_degs_per_sec"`
+	SpeedDegsPerSec     float64 `json:"speed_degs_per_sec"`
 	Host                string  `json:"host"`
 	ArmHostedKinematics bool    `json:"arm_hosted_kinematics,omitempty"`
 }
@@ -44,10 +49,10 @@ type Config struct {
 // Validate ensures all parts of the config are valid.
 func (cfg *Config) Validate(path string) ([]string, error) {
 	if cfg.Host == "" {
-		return nil, goutils.NewConfigValidationFieldRequiredError(path, "host")
+		return nil, resource.NewConfigValidationFieldRequiredError(path, "host")
 	}
-	if cfg.Speed > 1 || cfg.Speed < .1 {
-		return nil, errors.New("speed for universalrobots has to be between .1 and 1")
+	if cfg.SpeedDegsPerSec > 180 || cfg.SpeedDegsPerSec < 3 {
+		return nil, errors.New("speed for universalrobots has to be between 3 and 180 degrees per second")
 	}
 	return []string{}, nil
 }
@@ -57,8 +62,10 @@ var ur5modeljson []byte
 
 func init() {
 	resource.RegisterComponent(arm.API, Model, resource.Registration[arm.Arm, *Config]{
-		Constructor: func(ctx context.Context, _ resource.Dependencies, conf resource.Config, logger golog.Logger) (arm.Arm, error) {
-			return URArmConnect(ctx, conf, logger)
+		Constructor: func(
+			ctx context.Context, _ resource.Dependencies, conf resource.Config, logger logging.Logger,
+		) (arm.Arm, error) {
+			return urArmConnect(ctx, conf, logger)
 		},
 	})
 }
@@ -68,25 +75,24 @@ func MakeModelFrame(name string) (referenceframe.Model, error) {
 	return referenceframe.UnmarshalModelJSON(ur5modeljson, name)
 }
 
-// URArm TODO.
-type URArm struct {
+type urArm struct {
 	resource.Named
 	io.Closer
 	muMove                  sync.Mutex
 	connControl             net.Conn
 	debug                   bool
 	haveData                bool
-	logger                  golog.Logger
+	logger                  logging.Logger
 	cancel                  func()
 	activeBackgroundWorkers sync.WaitGroup
 	model                   referenceframe.Model
 	opMgr                   *operation.SingleOperationManager
 
 	mu                       sync.Mutex
-	state                    RobotState
+	state                    robotState
 	runtimeError             error
 	inRemoteMode             bool
-	speed                    float64
+	speedRadPerSec           float64
 	urHostedKinematics       bool
 	dashboardConnection      net.Conn
 	readRobotStateConnection net.Conn
@@ -97,7 +103,7 @@ type URArm struct {
 const waitBackgroundWorkersDur = 5 * time.Second
 
 // Reconfigure atomically reconfigures this arm in place based on the new config.
-func (ua *URArm) Reconfigure(ctx context.Context, deps resource.Dependencies, conf resource.Config) error {
+func (ua *urArm) Reconfigure(ctx context.Context, deps resource.Dependencies, conf resource.Config) error {
 	newConf, err := resource.NativeConfig[*Config](conf)
 	if err != nil {
 		return err
@@ -115,25 +121,25 @@ func (ua *URArm) Reconfigure(ctx context.Context, deps resource.Dependencies, co
 		}
 		return nil
 	}
-	ua.speed = newConf.Speed
+	ua.speedRadPerSec = rdkutils.DegToRad(newConf.SpeedDegsPerSec)
 	ua.urHostedKinematics = newConf.ArmHostedKinematics
 	return nil
 }
 
-// Close TODO.
-func (ua *URArm) Close(ctx context.Context) error {
+// Close cleans up the UR arm.
+func (ua *urArm) Close(ctx context.Context) error {
 	ua.cancel()
 
 	closeConn := func() {
 		if err := ua.dashboardConnection.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			ua.logger.Errorw("error closing arm's Dashboard connection", "error", err)
+			ua.logger.CErrorw(ctx, "error closing arm's Dashboard connection", "error", err)
 		}
 		if err := ua.readRobotStateConnection.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			ua.logger.Errorw("error closing arm's State connection", "error", err)
+			ua.logger.CErrorw(ctx, "error closing arm's State connection", "error", err)
 		}
 		if ua.connControl != nil {
 			if err := ua.connControl.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-				ua.logger.Errorw("error closing arm's control connection", "error", err)
+				ua.logger.CErrorw(ctx, "error closing arm's control connection", "error", err)
 			}
 		}
 	}
@@ -155,18 +161,13 @@ func (ua *URArm) Close(ctx context.Context) error {
 	return waitCtx.Err()
 }
 
-// URArmConnect TODO.
-func URArmConnect(ctx context.Context, conf resource.Config, logger golog.Logger) (arm.Arm, error) {
+func urArmConnect(ctx context.Context, conf resource.Config, logger logging.Logger) (arm.Arm, error) {
 	// this is to speed up component build failure if the UR arm is not reachable
 	ctx, cancel := context.WithDeadline(ctx, time.Now().Add(5*time.Second))
 	defer cancel()
 	newConf, err := resource.NativeConfig[*Config](conf)
 	if err != nil {
 		return nil, err
-	}
-
-	if newConf.Speed > 1 || newConf.Speed < .1 {
-		return nil, errors.New("speed for universalrobots has to be between .1 and 1")
 	}
 
 	model, err := MakeModelFrame(conf.Name)
@@ -185,10 +186,10 @@ func URArmConnect(ctx context.Context, conf resource.Config, logger golog.Logger
 		return nil, fmt.Errorf("can't connect to ur arm's dashboard (%s): %w", newConf.Host, err)
 	}
 	cancelCtx, cancel := context.WithCancel(context.Background())
-	newArm := &URArm{
+	newArm := &urArm{
 		Named:                    conf.ResourceName().AsNamed(),
 		connControl:              nil,
-		speed:                    newConf.Speed,
+		speedRadPerSec:           rdkutils.DegToRad(newConf.SpeedDegsPerSec),
 		debug:                    false,
 		haveData:                 false,
 		logger:                   logger,
@@ -208,7 +209,8 @@ func URArmConnect(ctx context.Context, conf resource.Config, logger golog.Logger
 		for {
 			readerWriter := bufio.NewReadWriter(bufio.NewReader(newArm.dashboardConnection), bufio.NewWriter(newArm.dashboardConnection))
 			err := dashboardReader(cancelCtx, *readerWriter, newArm)
-			if err != nil && (errors.Is(err, syscall.ECONNRESET) || errors.Is(err, io.ErrClosedPipe) || os.IsTimeout(err)) {
+			if err != nil &&
+				(errors.Is(err, syscall.ECONNRESET) || errors.Is(err, io.ErrClosedPipe) || os.IsTimeout(err) || errors.Is(err, io.EOF)) {
 				newArm.mu.Lock()
 				newArm.inRemoteMode = false
 				newArm.mu.Unlock()
@@ -216,7 +218,7 @@ func URArmConnect(ctx context.Context, conf resource.Config, logger golog.Logger
 					if err := cancelCtx.Err(); err != nil {
 						return
 					}
-					logger.Debug("attempting to reconnect to ur arm dashboard")
+					logger.CDebug(ctx, "attempting to reconnect to ur arm dashboard")
 					time.Sleep(1 * time.Second)
 					connDashboard, err = d.DialContext(cancelCtx, "tcp", newArm.host+":29999")
 					if err == nil {
@@ -225,17 +227,18 @@ func URArmConnect(ctx context.Context, conf resource.Config, logger golog.Logger
 						newArm.isConnected = true
 						newArm.mu.Unlock()
 						break
-					} else {
-						newArm.mu.Lock()
-						newArm.isConnected = false
-						newArm.mu.Unlock()
 					}
+
+					newArm.mu.Lock()
+					newArm.isConnected = false
+					newArm.mu.Unlock()
+
 					if !goutils.SelectContextOrWait(cancelCtx, 1*time.Second) {
 						return
 					}
 				}
 			} else if err != nil {
-				logger.Errorw("dashboard reader failed", "error", err)
+				logger.CErrorw(ctx, "dashboard reader failed", "error", err)
 				newArm.mu.Lock()
 				newArm.isConnected = false
 				newArm.mu.Unlock()
@@ -254,12 +257,13 @@ func URArmConnect(ctx context.Context, conf resource.Config, logger golog.Logger
 					close(onData)
 				})
 			})
-			if err != nil && (errors.Is(err, syscall.ECONNRESET) || errors.Is(err, io.ErrClosedPipe) || os.IsTimeout(err)) {
+			if err != nil &&
+				(errors.Is(err, syscall.ECONNRESET) || errors.Is(err, io.ErrClosedPipe) || os.IsTimeout(err) || errors.Is(err, io.EOF)) {
 				for {
 					if err := cancelCtx.Err(); err != nil {
 						return
 					}
-					logger.Debug("attempting to reconnect to ur arm 30011")
+					logger.CDebug(ctx, "attempting to reconnect to ur arm 30011")
 					connReadRobotState, err = d.DialContext(cancelCtx, "tcp", newArm.host+":30011")
 					if err == nil {
 						newArm.mu.Lock()
@@ -272,7 +276,7 @@ func URArmConnect(ctx context.Context, conf resource.Config, logger golog.Logger
 					}
 				}
 			} else if err != nil {
-				logger.Errorw("reader failed", "error", err)
+				logger.CErrorw(ctx, "reader failed", "error", err)
 				return
 			}
 		}
@@ -292,17 +296,17 @@ func URArmConnect(ctx context.Context, conf resource.Config, logger golog.Logger
 }
 
 // ModelFrame returns all the information necessary for including the arm in a FrameSystem.
-func (ua *URArm) ModelFrame() referenceframe.Model {
+func (ua *urArm) ModelFrame() referenceframe.Model {
 	return ua.model
 }
 
-func (ua *URArm) setRuntimeError(re error) {
+func (ua *urArm) setRuntimeError(re error) {
 	ua.mu.Lock()
 	ua.runtimeError = re
 	ua.mu.Unlock()
 }
 
-func (ua *URArm) getAndResetRuntimeError() error {
+func (ua *urArm) getAndResetRuntimeError() error {
 	ua.mu.Lock()
 	defer ua.mu.Unlock()
 	re := ua.runtimeError
@@ -310,14 +314,13 @@ func (ua *URArm) getAndResetRuntimeError() error {
 	return re
 }
 
-func (ua *URArm) setState(state RobotState) {
+func (ua *urArm) setState(state robotState) {
 	ua.mu.Lock()
 	ua.state = state
 	ua.mu.Unlock()
 }
 
-// State TODO.
-func (ua *URArm) State() (RobotState, error) {
+func (ua *urArm) getState() (robotState, error) {
 	ua.mu.Lock()
 	defer ua.mu.Unlock()
 	age := time.Since(ua.state.creationTime)
@@ -327,32 +330,32 @@ func (ua *URArm) State() (RobotState, error) {
 	return ua.state, nil
 }
 
-// JointPositions TODO.
-func (ua *URArm) JointPositions(ctx context.Context, extra map[string]interface{}) (*pb.JointPositions, error) {
+// JointPositions gets the current joint positions of the UR arm.
+func (ua *urArm) JointPositions(ctx context.Context, extra map[string]interface{}) ([]referenceframe.Input, error) {
 	radians := []float64{}
-	state, err := ua.State()
+	state, err := ua.getState()
 	if err != nil {
 		return nil, err
 	}
 	for _, j := range state.Joints {
 		radians = append(radians, j.Qactual)
 	}
-	return referenceframe.JointPositionsFromRadians(radians), nil
+	return referenceframe.FloatsToInputs(radians), nil
 }
 
 // EndPosition computes and returns the current cartesian position.
-func (ua *URArm) EndPosition(ctx context.Context, extra map[string]interface{}) (spatialmath.Pose, error) {
-	joints, err := ua.JointPositions(ctx, extra)
+func (ua *urArm) EndPosition(ctx context.Context, extra map[string]interface{}) (spatialmath.Pose, error) {
+	joints, err := ua.CurrentInputs(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return motionplan.ComputeOOBPosition(ua.model, joints)
+	return referenceframe.ComputeOOBPosition(ua.model, joints)
 }
 
 // MoveToPosition moves the arm to the specified cartesian position.
 // If the UR arm was configured with "arm_hosted_kinematics = 'true'" or extra["arm_hosted_kinematics"] = true is specified at runtime
 // this command will use the kinematics hosted by the Universal Robots arm.
-func (ua *URArm) MoveToPosition(ctx context.Context, pos spatialmath.Pose, extra map[string]interface{}) error {
+func (ua *urArm) MoveToPosition(ctx context.Context, pos spatialmath.Pose, extra map[string]interface{}) error {
 	if !ua.inRemoteMode {
 		return errors.New("UR5 is in local mode; use the polyscope to switch it to remote control mode")
 	}
@@ -368,38 +371,56 @@ func (ua *URArm) MoveToPosition(ctx context.Context, pos spatialmath.Pose, extra
 	if usingHostedKinematics {
 		return ua.moveWithURHostedKinematics(ctx, pos)
 	}
-	return arm.Move(ctx, ua.logger, ua, pos)
+	return motion.MoveArm(ctx, ua.logger, ua, pos)
 }
 
-// MoveToJointPositions TODO.
-func (ua *URArm) MoveToJointPositions(ctx context.Context, joints *pb.JointPositions, extra map[string]interface{}) error {
+// MoveToJointPositions moves the UR arm to the specified joint positions.
+func (ua *urArm) MoveToJointPositions(ctx context.Context, joints []referenceframe.Input, extra map[string]interface{}) error {
 	// check that joint positions are not out of bounds
 	if err := arm.CheckDesiredJointPositions(ctx, ua, joints); err != nil {
 		return err
 	}
-	return ua.MoveToJointPositionRadians(ctx, referenceframe.JointPositionsToRadians(joints))
+	return ua.moveToJointPositionRadians(ctx, referenceframe.InputsToFloats(joints))
+}
+
+func (ua *urArm) MoveThroughJointPositions(
+	ctx context.Context,
+	positions [][]referenceframe.Input,
+	_ *arm.MoveOptions,
+	_ map[string]interface{},
+) error {
+	for _, goal := range positions {
+		// check that joint positions are not out of bounds
+		if err := arm.CheckDesiredJointPositions(ctx, ua, goal); err != nil {
+			return err
+		}
+		err := ua.MoveToJointPositions(ctx, goal, nil)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Stop stops the arm with some deceleration.
-func (ua *URArm) Stop(ctx context.Context, extra map[string]interface{}) error {
+func (ua *urArm) Stop(ctx context.Context, extra map[string]interface{}) error {
 	if !ua.inRemoteMode {
 		return errors.New("UR5 is in local mode; use the polyscope to switch it to remote control mode")
 	}
 	_, done := ua.opMgr.New(ctx)
 	defer done()
-	cmd := fmt.Sprintf("stopj(a=%1.2f)\r\n", 5.0*ua.speed)
+	cmd := fmt.Sprintf("stopj(a=%1.2f)\r\n", 5.0*ua.speedRadPerSec)
 
 	_, err := ua.connControl.Write([]byte(cmd))
 	return err
 }
 
 // IsMoving returns whether the arm is moving.
-func (ua *URArm) IsMoving(ctx context.Context) (bool, error) {
+func (ua *urArm) IsMoving(ctx context.Context) (bool, error) {
 	return ua.opMgr.OpRunning(), nil
 }
 
-// MoveToJointPositionRadians TODO.
-func (ua *URArm) MoveToJointPositionRadians(ctx context.Context, radians []float64) error {
+func (ua *urArm) moveToJointPositionRadians(ctx context.Context, radians []float64) error {
 	if !ua.inRemoteMode {
 		return errors.New("UR5 is in local mode; use the polyscope to switch it to remote control mode")
 	}
@@ -413,6 +434,11 @@ func (ua *URArm) MoveToJointPositionRadians(ctx context.Context, radians []float
 		return errors.New("need 6 joints")
 	}
 
+	state, err := ua.getState()
+	if err != nil {
+		return err
+	}
+
 	cmd := fmt.Sprintf("movej([%f,%f,%f,%f,%f,%f], a=%1.2f, v=%1.2f, r=0)\r\n",
 		radians[0],
 		radians[1],
@@ -420,29 +446,42 @@ func (ua *URArm) MoveToJointPositionRadians(ctx context.Context, radians []float
 		radians[3],
 		radians[4],
 		radians[5],
-		5.0*ua.speed,
-		4.0*ua.speed,
+		0.8*ua.speedRadPerSec,
+		ua.speedRadPerSec,
 	)
 
-	_, err := ua.connControl.Write([]byte(cmd))
-	if err != nil {
+	// calculate a timeout that corresponds to how fast the arm will move
+	maxAngle := 0.
+	for i := 0; i < 6; i++ {
+		if diff := math.Abs(state.Joints[i].Qactual - radians[i]); diff > maxAngle {
+			maxAngle = diff
+		}
+	}
+
+	// make the timeout the max between the default and time calculated by slapping a 20% factor on the estimated time to complete
+	timeout := defaultTimeout
+	if estTime := time.Duration(1.2*maxAngle/ua.speedRadPerSec) * time.Second; estTime > timeout {
+		timeout = estTime
+	}
+
+	if _, err := ua.connControl.Write([]byte(cmd)); err != nil {
 		return err
 	}
 
-	retried := false
-	slept := 0
+	now := time.Now()
 	for {
-		good := true
-		state, err := ua.State()
+		state, err := ua.getState()
 		if err != nil {
 			return err
 		}
+
+		// check if we have reached the desired positions
+		good := true
 		for idx, r := range radians {
-			if math.Round(r*100) != math.Round(state.Joints[idx].Qactual*100) {
+			if !rdkutils.Float64AlmostEqual(r, state.Joints[idx].Qactual, 1e-2) {
 				good = false
 			}
 		}
-
 		if good {
 			return nil
 		}
@@ -452,15 +491,7 @@ func (ua *URArm) MoveToJointPositionRadians(ctx context.Context, radians []float
 			return err
 		}
 
-		if slept > 5000 && !retried {
-			_, err := ua.connControl.Write([]byte(cmd))
-			if err != nil {
-				return err
-			}
-			retried = true
-		}
-
-		if slept > 10000 {
+		if time.Since(now) > timeout {
 			return errors.Errorf("can't reach joint position.\n want: %f %f %f %f %f %f\n   at: %f %f %f %f %f %f",
 				radians[0], radians[1], radians[2], radians[3], radians[4], radians[5],
 				state.Joints[0].Qactual,
@@ -472,36 +503,25 @@ func (ua *URArm) MoveToJointPositionRadians(ctx context.Context, radians []float
 			)
 		}
 
-		// TODO(erh): make responsive on new message
-		if !goutils.SelectContextOrWait(ctx, 10*time.Millisecond) {
+		if !goutils.SelectContextOrWait(ctx, errorPollDuration) {
 			return ctx.Err()
 		}
-		slept += 10
 	}
 }
 
-// CurrentInputs TODO.
-func (ua *URArm) CurrentInputs(ctx context.Context) ([]referenceframe.Input, error) {
-	res, err := ua.JointPositions(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	return ua.model.InputFromProtobuf(res), nil
+// CurrentInputs returns the current Inputs of the UR arm.
+func (ua *urArm) CurrentInputs(ctx context.Context) ([]referenceframe.Input, error) {
+	return ua.JointPositions(ctx, nil)
 }
 
-// GoToInputs TODO.
-func (ua *URArm) GoToInputs(ctx context.Context, goal []referenceframe.Input) error {
-	// check that joint positions are not out of bounds
-	positionDegs := ua.model.ProtobufFromInput(goal)
-	if err := arm.CheckDesiredJointPositions(ctx, ua, positionDegs); err != nil {
-		return err
-	}
-	return ua.MoveToJointPositions(ctx, positionDegs, nil)
+// GoToInputs moves the UR arm to the Inputs specified.
+func (ua *urArm) GoToInputs(ctx context.Context, inputSteps ...[]referenceframe.Input) error {
+	return ua.MoveThroughJointPositions(ctx, inputSteps, nil, nil)
 }
 
 // Geometries returns the list of geometries associated with the resource, in any order. The poses of the geometries reflect their
 // current location relative to the frame of the resource.
-func (ua *URArm) Geometries(ctx context.Context, extra map[string]interface{}) ([]spatialmath.Geometry, error) {
+func (ua *urArm) Geometries(ctx context.Context, extra map[string]interface{}) ([]spatialmath.Geometry, error) {
 	// TODO (pl): RSDK-3316 abstract this to general arm function
 	inputs, err := ua.CurrentInputs(ctx)
 	if err != nil {
@@ -514,18 +534,7 @@ func (ua *URArm) Geometries(ctx context.Context, extra map[string]interface{}) (
 	return gif.Geometries(), nil
 }
 
-// AddToLog TODO.
-func (ua *URArm) AddToLog(msg string) error {
-	if !ua.inRemoteMode {
-		return errors.New("UR5 is in local mode; use the polyscope to switch it to remote control mode")
-	}
-	// TODO(erh): check for " in msg
-	cmd := fmt.Sprintf("textmsg(\"%s\")\r\n", msg)
-	_, err := ua.connControl.Write([]byte(cmd))
-	return err
-}
-
-func dashboardReader(ctx context.Context, conn bufio.ReadWriter, ua *URArm) error {
+func dashboardReader(ctx context.Context, conn bufio.ReadWriter, ua *urArm) error {
 	// Discard first line which is hello from dashboard
 	if err := ua.dashboardConnection.SetDeadline(time.Now().Add(1 * time.Second)); err != nil {
 		return err
@@ -589,7 +598,7 @@ func dashboardReader(ctx context.Context, conn bufio.ReadWriter, ua *URArm) erro
 	}
 }
 
-func reader(ctx context.Context, conn net.Conn, ua *URArm, onHaveData func()) error {
+func reader(ctx context.Context, conn net.Conn, ua *urArm, onHaveData func()) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -615,60 +624,60 @@ func reader(ctx context.Context, conn net.Conn, ua *URArm, onHaveData func()) er
 
 		switch buf[0] {
 		case 16:
-			state, err := readRobotStateMessage(buf[1:], ua.logger)
+			state, err := readRobotStateMessage(ctx, buf[1:], ua.logger)
 			if err != nil {
 				return err
 			}
 			ua.setState(state)
 			onHaveData()
 			if ua.debug {
-				ua.logger.Debugf("isOn: %v stopped: %v joints: %f %f %f %f %f %f cartesian: %f %f %f %f %f %f\n",
-					state.RobotModeData.IsRobotPowerOn,
-					state.RobotModeData.IsEmergencyStopped || state.RobotModeData.IsProtectiveStopped,
-					state.Joints[0].AngleValues(),
-					state.Joints[1].AngleValues(),
-					state.Joints[2].AngleValues(),
-					state.Joints[3].AngleValues(),
-					state.Joints[4].AngleValues(),
-					state.Joints[5].AngleValues(),
-					state.CartesianInfo.X,
-					state.CartesianInfo.Y,
-					state.CartesianInfo.Z,
-					state.CartesianInfo.Rx,
-					state.CartesianInfo.Ry,
-					state.CartesianInfo.Rz)
+				ua.logger.CDebugf(ctx, "isOn: %v stopped: %v joints: %f %f %f %f %f %f cartesian: %f %f %f %f %f %f\n",
+					state.robotModeData.IsRobotPowerOn,
+					state.robotModeData.IsEmergencyStopped || state.robotModeData.IsProtectiveStopped,
+					state.Joints[0].degrees(),
+					state.Joints[1].degrees(),
+					state.Joints[2].degrees(),
+					state.Joints[3].degrees(),
+					state.Joints[4].degrees(),
+					state.Joints[5].degrees(),
+					state.cartesianInfo.X,
+					state.cartesianInfo.Y,
+					state.cartesianInfo.Z,
+					state.cartesianInfo.Rx,
+					state.cartesianInfo.Ry,
+					state.cartesianInfo.Rz)
 			}
 		case 20:
-			userErr := readURRobotMessage(buf, ua.logger)
+			userErr := readURRobotMessage(ctx, buf, ua.logger)
 			if userErr != nil {
 				ua.setRuntimeError(userErr)
 			}
 		case 5: // MODBUS_INFO_MESSAGE
 			data := binary.BigEndian.Uint32(buf[1:])
 			if data != 0 {
-				ua.logger.Debugf("got unexpected MODBUS_INFO_MESSAGE %d\n", data)
+				ua.logger.CDebugf(ctx, "got unexpected MODBUS_INFO_MESSAGE %d\n", data)
 			}
 		case 23: // SAFETY_SETUP_BROADCAST_MESSAGE
 		case 24: // SAFETY_COMPLIANCE_TOLERANCES_MESSAGE
 		case 25: // PROGRAM_STATE_MESSAGE
 			if len(buf) != 12 {
-				ua.logger.Debug("got bad PROGRAM_STATE_MESSAGE ??")
+				ua.logger.CDebug(ctx, "got bad PROGRAM_STATE_MESSAGE ??")
 			} else {
 				a := binary.BigEndian.Uint32(buf[1:])
 				b := buf[9]
 				c := buf[10]
 				d := buf[11]
 				if a != 4294967295 || b != 1 || c != 0 || d != 0 {
-					ua.logger.Debugf("got unknown PROGRAM_STATE_MESSAGE %v %v %v %v\n", a, b, c, d)
+					ua.logger.CDebugf(ctx, "got unknown PROGRAM_STATE_MESSAGE %v %v %v %v\n", a, b, c, d)
 				}
 			}
 		default:
-			ua.logger.Debugf("ur: unknown messageType: %v size: %d %v\n", buf[0], len(buf), buf)
+			ua.logger.CDebugf(ctx, "ur: unknown messageType: %v size: %d %v\n", buf[0], len(buf), buf)
 		}
 	}
 }
 
-func (ua *URArm) moveWithURHostedKinematics(ctx context.Context, pose spatialmath.Pose) error {
+func (ua *urArm) moveWithURHostedKinematics(ctx context.Context, pose spatialmath.Pose) error {
 	// UR5 arm takes R3 angle axis as input
 	pt := pose.Point()
 	aa := pose.Orientation().AxisAngles().ToR3()
@@ -687,15 +696,14 @@ func (ua *URArm) moveWithURHostedKinematics(ctx context.Context, pose spatialmat
 		return err
 	}
 
-	retried := false
-	slept := 0
+	now := time.Now()
 	for {
 		cur, err := ua.EndPosition(ctx, nil)
 		if err != nil {
 			return err
 		}
 		delta := spatialmath.PoseDelta(pose, cur)
-		if delta.Point().Norm() <= 1.5 && delta.Orientation().AxisAngles().ToR3().Norm() <= 1.0 {
+		if delta.Point().Norm() <= 5 && delta.Orientation().AxisAngles().ToR3().Norm() <= 1.0 {
 			return nil
 		}
 
@@ -704,23 +712,13 @@ func (ua *URArm) moveWithURHostedKinematics(ctx context.Context, pose spatialmat
 			return err
 		}
 
-		slept += 10
-
-		if slept > 5000 && !retried {
-			_, err := ua.connControl.Write([]byte(cmd))
-			if err != nil {
-				return err
-			}
-			retried = true
-		}
-
-		if slept > 10000 {
+		if time.Since(now) > defaultTimeout {
 			delta = spatialmath.PoseDelta(pose, cur)
 			return errors.Errorf("can't reach position.\n want: %v\n\tat: %v\n diffs: %f %f",
 				pose, cur, delta.Point().Norm(), delta.Orientation().AxisAngles().ToR3().Norm(),
 			)
 		}
-		if !goutils.SelectContextOrWait(ctx, 10*time.Millisecond) {
+		if !goutils.SelectContextOrWait(ctx, errorPollDuration) {
 			return ctx.Err()
 		}
 	}

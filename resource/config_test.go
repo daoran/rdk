@@ -11,15 +11,29 @@ import (
 	"go.viam.com/rdk/components/sensor"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/services/motion"
-	"go.viam.com/rdk/testutils"
 )
 
+// FakeConvertedAttributes is a helper for testing if validation works.
+type FakeConvertedAttributes struct {
+	Thing string
+}
+
+// Validate validates that the single fake attribute Thing exists properly
+// in the struct, meant to implement the validator interface in component.go.
+func (convAttr *FakeConvertedAttributes) Validate(path string) ([]string, error) {
+	if convAttr.Thing == "" {
+		return nil, resource.NewConfigValidationFieldRequiredError(path, "Thing")
+	}
+	return nil, nil
+}
+
 var (
-	acmeAPINamespace = resource.APINamespace("acme")
-	fakeModel        = resource.DefaultModelFamily.WithModel("fake")
-	extModel         = resource.ModelNamespace("acme").WithFamily("test").WithModel("model")
-	extAPI           = acmeAPINamespace.WithComponentType("gizmo")
-	extServiceAPI    = acmeAPINamespace.WithServiceType("gadget")
+	acmeAPINamespace  = resource.APINamespace("acme")
+	fakeModel         = resource.DefaultModelFamily.WithModel("fake")
+	extModel          = resource.ModelNamespace("acme").WithFamily("test").WithModel("model")
+	extAPI            = acmeAPINamespace.WithComponentType("gizmo")
+	extServiceAPI     = acmeAPINamespace.WithServiceType("gadget")
+	invalidNameString = "must start with a letter or number and must only contain letters, numbers, dashes, and underscores"
 )
 
 func TestComponentValidate(t *testing.T) {
@@ -28,7 +42,7 @@ func TestComponentValidate(t *testing.T) {
 		deps, err := emptyConf.Validate("path", resource.APITypeComponentName)
 		test.That(t, deps, test.ShouldBeNil)
 		test.That(t, err, test.ShouldNotBeNil)
-		test.That(t, err.Error(), test.ShouldContainSubstring, `"name" is required`)
+		test.That(t, resource.GetFieldFromFieldRequiredError(err), test.ShouldEqual, "name")
 	})
 
 	t.Run("config invalid name", func(t *testing.T) {
@@ -44,7 +58,7 @@ func TestComponentValidate(t *testing.T) {
 			t,
 			err.Error(),
 			test.ShouldContainSubstring,
-			"must start with a letter and must only contain letters, numbers, dashes, and underscores",
+			invalidNameString,
 		)
 		validConf.Name = "foo.arm"
 		deps, err = validConf.Validate("path", resource.APITypeComponentName)
@@ -54,7 +68,7 @@ func TestComponentValidate(t *testing.T) {
 			t,
 			err.Error(),
 			test.ShouldContainSubstring,
-			"must start with a letter and must only contain letters, numbers, dashes, and underscores",
+			invalidNameString,
 		)
 		validConf.Name = "9"
 		deps, err = validConf.Validate("path", resource.APITypeComponentName)
@@ -64,7 +78,7 @@ func TestComponentValidate(t *testing.T) {
 			t,
 			err.Error(),
 			test.ShouldContainSubstring,
-			"must start with a letter and must only contain letters, numbers, dashes, and underscores",
+			invalidNameString,
 		)
 	})
 	t.Run("config valid", func(t *testing.T) {
@@ -88,12 +102,12 @@ func TestComponentValidate(t *testing.T) {
 				Name:                "foo",
 				API:                 base.API,
 				Model:               fakeModel,
-				ConvertedAttributes: &testutils.FakeConvertedAttributes{Thing: ""},
+				ConvertedAttributes: &FakeConvertedAttributes{Thing: ""},
 			}
 			deps, err := invalidConf.Validate("path", resource.APITypeComponentName)
 			test.That(t, deps, test.ShouldBeNil)
 			test.That(t, err, test.ShouldNotBeNil)
-			test.That(t, err.Error(), test.ShouldContainSubstring, `"Thing" is required`)
+			test.That(t, resource.GetFieldFromFieldRequiredError(err), test.ShouldEqual, "Thing")
 		})
 
 		t.Run("config valid", func(t *testing.T) {
@@ -101,7 +115,7 @@ func TestComponentValidate(t *testing.T) {
 				Name:  "foo",
 				API:   arm.API,
 				Model: fakeModel,
-				ConvertedAttributes: &testutils.FakeConvertedAttributes{
+				ConvertedAttributes: &FakeConvertedAttributes{
 					Thing: "i am a thing!",
 				},
 			}
@@ -146,7 +160,7 @@ func TestComponentValidate(t *testing.T) {
 			t,
 			err.Error(),
 			test.ShouldContainSubstring,
-			"must start with a letter and must only contain letters, numbers, dashes, and underscores",
+			invalidNameString,
 		)
 	})
 
@@ -289,7 +303,7 @@ func TestComponentResourceName(t *testing.T) {
 				},
 				Name: "foo",
 			},
-			"name field for model missing",
+			"name",
 		},
 		{
 			"sensor with no subtype",
@@ -308,7 +322,7 @@ func TestComponentResourceName(t *testing.T) {
 				},
 				Name: "foo",
 			},
-			"name field for model missing",
+			"name",
 		},
 		{
 			"sensor with subtype",
@@ -327,7 +341,7 @@ func TestComponentResourceName(t *testing.T) {
 				},
 				Name: "foo",
 			},
-			"name field for model missing",
+			"name",
 		},
 		{
 			"sensor missing name",
@@ -346,7 +360,7 @@ func TestComponentResourceName(t *testing.T) {
 				},
 				Name: "",
 			},
-			`"name" is required`,
+			"name",
 		},
 		{
 			"all fields included with external type",
@@ -370,7 +384,7 @@ func TestComponentResourceName(t *testing.T) {
 				return
 			}
 			test.That(t, err, test.ShouldNotBeNil)
-			test.That(t, err.Error(), test.ShouldContainSubstring, tc.ExpectedError)
+			test.That(t, resource.GetFieldFromFieldRequiredError(err), test.ShouldEqual, tc.ExpectedError)
 		})
 	}
 }
@@ -409,7 +423,7 @@ func TestServiceValidate(t *testing.T) {
 			t,
 			err.Error(),
 			test.ShouldContainSubstring,
-			"must start with a letter and must only contain letters, numbers, dashes, and underscores",
+			invalidNameString,
 		)
 		validConf.Name = "frame.1"
 		test.That(t, deps, test.ShouldBeNil)
@@ -418,7 +432,7 @@ func TestServiceValidate(t *testing.T) {
 			t,
 			err.Error(),
 			test.ShouldContainSubstring,
-			"must start with a letter and must only contain letters, numbers, dashes, and underscores",
+			invalidNameString,
 		)
 		validConf.Name = "3"
 		test.That(t, deps, test.ShouldBeNil)
@@ -427,7 +441,7 @@ func TestServiceValidate(t *testing.T) {
 			t,
 			err.Error(),
 			test.ShouldContainSubstring,
-			"must start with a letter and must only contain letters, numbers, dashes, and underscores",
+			invalidNameString,
 		)
 	})
 
@@ -436,19 +450,19 @@ func TestServiceValidate(t *testing.T) {
 			invalidConf := resource.Config{
 				Name:                "frame1",
 				API:                 resource.APINamespaceRDK.WithServiceType("frame_system"),
-				ConvertedAttributes: &testutils.FakeConvertedAttributes{Thing: ""},
+				ConvertedAttributes: &FakeConvertedAttributes{Thing: ""},
 			}
 			deps, err := invalidConf.Validate("path", resource.APITypeServiceName)
 			test.That(t, deps, test.ShouldBeNil)
 			test.That(t, err, test.ShouldNotBeNil)
-			test.That(t, err.Error(), test.ShouldContainSubstring, `"Thing" is required`)
+			test.That(t, err.Error(), test.ShouldContainSubstring, `Field: "Thing"`)
 		})
 
 		t.Run("config valid", func(t *testing.T) {
 			invalidConf := resource.Config{
 				Name: "frame1",
 				API:  resource.APINamespaceRDK.WithServiceType("frame_system"),
-				ConvertedAttributes: &testutils.FakeConvertedAttributes{
+				ConvertedAttributes: &FakeConvertedAttributes{
 					Thing: "i am a thing!",
 				},
 			}
@@ -500,7 +514,7 @@ func TestServiceValidate(t *testing.T) {
 			t,
 			err.Error(),
 			test.ShouldContainSubstring,
-			"must start with a letter and must only contain letters, numbers, dashes, and underscores",
+			invalidNameString,
 		)
 	})
 
@@ -602,4 +616,50 @@ func TestServiceResourceName(t *testing.T) {
 			test.That(t, rName, test.ShouldResemble, tc.ExpectedName)
 		})
 	}
+}
+
+func TestEqual(t *testing.T) {
+	t.Run("test associated config equality", func(t *testing.T) {
+		assocConfA := &mockAssociatedConfig{Field1: "foo", capName: arm.Named("foo")}
+		assocConfB := &mockAssociatedConfig{Field1: "bar", capName: arm.Named("bar")}
+		t.Run("success when equal", func(t *testing.T) {
+			confA := resource.Config{AssociatedAttributes: map[resource.Name]resource.AssociatedConfig{
+				arm.Named("foo"): assocConfA,
+				arm.Named("bar"): assocConfB,
+			}}
+			//nolint: gocritic
+			test.That(t, confA.Equals(confA), test.ShouldBeTrue)
+		})
+		t.Run("fail when different lengths", func(t *testing.T) {
+			confA := resource.Config{AssociatedAttributes: map[resource.Name]resource.AssociatedConfig{
+				arm.Named("foo"): assocConfA,
+				arm.Named("bar"): assocConfB,
+			}}
+			confB := resource.Config{AssociatedAttributes: map[resource.Name]resource.AssociatedConfig{
+				arm.Named("foo"): assocConfA,
+			}}
+			test.That(t, confA.Equals(confB), test.ShouldBeFalse)
+		})
+		t.Run("fail when different data", func(t *testing.T) {
+			confA := resource.Config{AssociatedAttributes: map[resource.Name]resource.AssociatedConfig{
+				arm.Named("foo"): assocConfA,
+				arm.Named("bar"): assocConfB,
+			}}
+			confB := resource.Config{AssociatedAttributes: map[resource.Name]resource.AssociatedConfig{
+				arm.Named("foo"): assocConfA,
+				arm.Named("bar"): assocConfA,
+			}}
+			test.That(t, confA.Equals(confB), test.ShouldBeFalse)
+		})
+	})
+	t.Run("test equality of other fields", func(t *testing.T) {
+		confA := resource.Config{API: arm.API}
+		t.Run("success when equal", func(t *testing.T) {
+			//nolint: gocritic
+			test.That(t, confA.Equals(confA), test.ShouldBeTrue)
+		})
+		t.Run("success when unequal", func(t *testing.T) {
+			test.That(t, confA.Equals(resource.Config{API: base.API}), test.ShouldBeFalse)
+		})
+	})
 }

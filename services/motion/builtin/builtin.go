@@ -2,33 +2,32 @@
 package builtin
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"math"
 	"sync"
+	"time"
 
-	"github.com/edaniels/golog"
+	"github.com/go-viper/mapstructure/v2"
 	"github.com/golang/geo/r3"
-	geo "github.com/kellydunn/golang-geo"
+	"github.com/google/uuid"
 	"github.com/pkg/errors"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
-	servicepb "go.viam.com/api/service/motion/v1"
+	pb "go.viam.com/api/service/motion/v1"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/structpb"
 
-	"go.viam.com/rdk/components/base"
-	"go.viam.com/rdk/components/base/kinematicbase"
 	"go.viam.com/rdk/components/movementsensor"
-	"go.viam.com/rdk/internal"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/motionplan"
 	"go.viam.com/rdk/operation"
-	"go.viam.com/rdk/pointcloud"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/robot/framesystem"
 	"go.viam.com/rdk/services/motion"
+	"go.viam.com/rdk/services/motion/builtin/state"
 	"go.viam.com/rdk/services/slam"
+	"go.viam.com/rdk/services/vision"
 	"go.viam.com/rdk/spatialmath"
+	"go.viam.com/rdk/utils"
 )
 
 func init() {
@@ -37,16 +36,40 @@ func init() {
 		resource.DefaultServiceModel,
 		resource.Registration[motion.Service, *Config]{
 			Constructor: NewBuiltIn,
-			WeakDependencies: []internal.ResourceMatcher{
-				internal.SLAMDependencyWildcardMatcher,
-				internal.ComponentDependencyWildcardMatcher,
+			WeakDependencies: []resource.Matcher{
+				resource.TypeMatcher{Type: resource.APITypeComponentName},
+				resource.SubtypeMatcher{Subtype: slam.SubtypeName},
+				resource.SubtypeMatcher{Subtype: vision.SubtypeName},
 			},
-		})
+		},
+	)
 }
 
+// export keys to be used with DoCommand so they can be referenced by clients.
 const (
-	builtinOpLabel      = "motion-service"
-	maxTravelDistanceMM = 5e6 // this is equivalent to 5km
+	DoPlan    = "plan"
+	DoExecute = "execute"
+)
+
+const (
+	builtinOpLabel                     = "motion-service"
+	maxTravelDistanceMM                = 5e6 // this is equivalent to 5km
+	lookAheadDistanceMM        float64 = 5e6
+	defaultSmoothIter                  = 30
+	defaultAngularDegsPerSec           = 60.
+	defaultLinearMPerSec               = 0.3
+	defaultSlamPlanDeviationM          = 1.
+	defaultGlobePlanDeviationM         = 2.6
+)
+
+var (
+	defaultPositionPollingHz = 1.
+	defaultObstaclePollingHz = 1.
+)
+
+var (
+	stateTTL              = time.Hour * 24
+	stateTTLCheckInterval = time.Minute
 )
 
 // inputEnabledActuator is an actuator that interacts with the frame system.
@@ -54,11 +77,8 @@ const (
 // move it. Input units are always in meters or radians.
 type inputEnabledActuator interface {
 	resource.Actuator
-	referenceframe.InputEnabled
+	framesystem.InputEnabled
 }
-
-// ErrNotImplemented is thrown when an unreleased function is called.
-var ErrNotImplemented = errors.New("function coming soon but not yet implemented")
 
 // Config describes how to configure the service; currently only used for specifying dependency on framesystem service.
 type Config struct {
@@ -71,7 +91,9 @@ func (c *Config) Validate(path string) ([]string, error) {
 }
 
 // NewBuiltIn returns a new move and grab service for the given robot.
-func NewBuiltIn(ctx context.Context, deps resource.Dependencies, conf resource.Config, logger golog.Logger) (motion.Service, error) {
+func NewBuiltIn(
+	ctx context.Context, deps resource.Dependencies, conf resource.Config, logger logging.Logger,
+) (motion.Service, error) {
 	ms := &builtIn{
 		Named:  conf.ResourceName().AsNamed(),
 		logger: logger,
@@ -83,52 +105,29 @@ func NewBuiltIn(ctx context.Context, deps resource.Dependencies, conf resource.C
 	return ms, nil
 }
 
-func newFilePathLoggerConfig(filepath string) zap.Config {
-	return zap.Config{
-		Level:    zap.NewAtomicLevelAt(zap.DebugLevel),
-		Encoding: "console",
-		EncoderConfig: zapcore.EncoderConfig{
-			TimeKey:        "ts",
-			LevelKey:       "level",
-			NameKey:        "logger",
-			CallerKey:      "caller",
-			FunctionKey:    zapcore.OmitKey,
-			MessageKey:     "msg",
-			StacktraceKey:  "stacktrace",
-			LineEnding:     zapcore.DefaultLineEnding,
-			EncodeLevel:    zapcore.CapitalColorLevelEncoder,
-			EncodeTime:     zapcore.ISO8601TimeEncoder,
-			EncodeDuration: zapcore.StringDurationEncoder,
-			EncodeCaller:   zapcore.ShortCallerEncoder,
-		},
-		DisableStacktrace: true,
-		OutputPaths:       []string{filepath, "stdout"},
-		ErrorOutputPaths:  []string{filepath, "stderr"},
-	}
-}
-
 // Reconfigure updates the motion service when the config has changed.
 func (ms *builtIn) Reconfigure(
 	ctx context.Context,
 	deps resource.Dependencies,
 	conf resource.Config,
-) (err error) {
-	ms.lock.Lock()
-	defer ms.lock.Unlock()
+) error {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
 
 	config, err := resource.NativeConfig[*Config](conf)
 	if err != nil {
 		return err
 	}
 	if config.LogFilePath != "" {
-		logger, err := newFilePathLoggerConfig(config.LogFilePath).Build()
+		logger, err := utils.NewFilePathDebugLogger(config.LogFilePath, "motion")
 		if err != nil {
 			return err
 		}
-		ms.logger = logger.Sugar().Named("motion")
+		ms.logger = logger
 	}
 	movementSensors := make(map[resource.Name]movementsensor.MovementSensor)
 	slamServices := make(map[resource.Name]slam.Service)
+	visionServices := make(map[resource.Name]vision.Service)
 	components := make(map[resource.Name]resource.Resource)
 	for name, dep := range deps {
 		switch dep := dep.(type) {
@@ -138,210 +137,144 @@ func (ms *builtIn) Reconfigure(
 			movementSensors[name] = dep
 		case slam.Service:
 			slamServices[name] = dep
+		case vision.Service:
+			visionServices[name] = dep
 		default:
 			components[name] = dep
 		}
 	}
 	ms.movementSensors = movementSensors
 	ms.slamServices = slamServices
+	ms.visionServices = visionServices
 	ms.components = components
+	if ms.state != nil {
+		ms.state.Stop()
+	}
+
+	state, err := state.NewState(stateTTL, stateTTLCheckInterval, ms.logger)
+	if err != nil {
+		return err
+	}
+	ms.state = state
 	return nil
 }
 
 type builtIn struct {
 	resource.Named
-	resource.TriviallyCloseable
+	mu              sync.RWMutex
 	fsService       framesystem.Service
 	movementSensors map[resource.Name]movementsensor.MovementSensor
 	slamServices    map[resource.Name]slam.Service
+	visionServices  map[resource.Name]vision.Service
 	components      map[resource.Name]resource.Resource
-	logger          golog.Logger
-	lock            sync.Mutex
+	logger          logging.Logger
+	state           *state.State
 }
 
-// Move takes a goal location and will plan and execute a movement to move a component specified by its name to that destination.
-func (ms *builtIn) Move(
-	ctx context.Context,
-	componentName resource.Name,
-	destination *referenceframe.PoseInFrame,
-	worldState *referenceframe.WorldState,
-	constraints *servicepb.Constraints,
-	extra map[string]interface{},
-) (bool, error) {
-	operation.CancelOtherWithLabel(ctx, builtinOpLabel)
-
-	// get goal frame
-	goalFrameName := destination.Parent()
-	ms.logger.Debugf("goal given in frame of %q", goalFrameName)
-
-	frameSys, err := ms.fsService.FrameSystem(ctx, worldState.Transforms())
-	if err != nil {
-		return false, err
+func (ms *builtIn) Close(ctx context.Context) error {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if ms.state != nil {
+		ms.state.Stop()
 	}
-
-	// build maps of relevant components and inputs from initial inputs
-	fsInputs, resources, err := ms.fsService.CurrentInputs(ctx)
-	if err != nil {
-		return false, err
-	}
-
-	movingFrame := frameSys.Frame(componentName.ShortName())
-
-	ms.logger.Debugf("frame system inputs: %v", fsInputs)
-	if movingFrame == nil {
-		return false, fmt.Errorf("component named %s not found in robot frame system", componentName.ShortName())
-	}
-
-	// re-evaluate goalPose to be in the frame of World
-	solvingFrame := referenceframe.World // TODO(erh): this should really be the parent of rootName
-	tf, err := frameSys.Transform(fsInputs, destination, solvingFrame)
-	if err != nil {
-		return false, err
-	}
-	goalPose, _ := tf.(*referenceframe.PoseInFrame)
-
-	// the goal is to move the component to goalPose which is specified in coordinates of goalFrameName
-	steps, err := motionplan.PlanMotion(ctx, &motionplan.PlanRequest{
-		Logger:             ms.logger,
-		Goal:               goalPose,
-		Frame:              movingFrame,
-		StartConfiguration: fsInputs,
-		FrameSystem:        frameSys,
-		WorldState:         worldState,
-		ConstraintSpecs:    constraints,
-		Options:            extra,
-	})
-	if err != nil {
-		return false, err
-	}
-
-	// move all the components
-	for _, step := range steps {
-		// TODO(erh): what order? parallel?
-		for name, inputs := range step {
-			if len(inputs) == 0 {
-				continue
-			}
-			r := resources[name]
-			if err := r.GoToInputs(ctx, inputs); err != nil {
-				// If there is an error on GoToInputs, stop the component if possible before returning the error
-				if actuator, ok := r.(inputEnabledActuator); ok {
-					if stopErr := actuator.Stop(ctx, nil); stopErr != nil {
-						return false, errors.Wrap(err, stopErr.Error())
-					}
-				}
-				return false, err
-			}
-		}
-	}
-	return true, nil
+	return nil
 }
 
-// MoveOnMap will move the given component to the given destination on the slam map generated from a slam service specified by slamName.
-// Bases are the only component that supports this.
-func (ms *builtIn) MoveOnMap(
-	ctx context.Context,
-	componentName resource.Name,
-	destination spatialmath.Pose,
-	slamName resource.Name,
-	extra map[string]interface{},
-) (bool, error) {
-	operation.CancelOtherWithLabel(ctx, builtinOpLabel)
-	kinematicsOptions := kinematicbase.NewKinematicBaseOptions()
-
-	// make call to motionplan
-	plan, kb, err := ms.planMoveOnMap(ctx, componentName, destination, slamName, kinematicsOptions, extra)
-	if err != nil {
-		return false, fmt.Errorf("error making plan for MoveOnMap: %w", err)
-	}
-
-	// execute the plan
-	for i := 1; i < len(plan); i++ {
-		if inputEnabledKb, ok := kb.(inputEnabledActuator); ok {
-			if err := inputEnabledKb.GoToInputs(ctx, plan[i]); err != nil {
-				// If there is an error on GoToInputs, stop the component if possible before returning the error
-				if stopErr := kb.Stop(ctx, nil); stopErr != nil {
-					return false, errors.Wrap(err, stopErr.Error())
-				}
-				return false, err
-			}
-		}
-	}
-	return true, nil
-}
-
-// MoveOnGlobe will move the given component to the given destination on the globe.
-// Bases are the only component that supports this.
-func (ms *builtIn) MoveOnGlobe(
-	ctx context.Context,
-	componentName resource.Name,
-	destination *geo.Point,
-	heading float64,
-	movementSensorName resource.Name,
-	obstacles []*spatialmath.GeoObstacle,
-	motionCfg *motion.MotionConfiguration,
-	extra map[string]interface{},
-) (bool, error) {
+func (ms *builtIn) Move(ctx context.Context, req motion.MoveReq) (bool, error) {
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
 	operation.CancelOtherWithLabel(ctx, builtinOpLabel)
 
-	// ensure arguments are well behaved
-	if motionCfg == nil {
-		motionCfg = &motion.MotionConfiguration{}
-	}
-	if obstacles == nil {
-		obstacles = []*spatialmath.GeoObstacle{}
-	}
-	if destination == nil {
-		return false, errors.New("destination cannot be nil")
-	}
-
-	moveRequest, err := ms.newMoveOnGlobeRequest(ctx, componentName, destination, movementSensorName, obstacles, motionCfg, extra)
+	plan, err := ms.plan(ctx, req)
 	if err != nil {
 		return false, err
 	}
+	err = ms.execute(ctx, plan.Trajectory())
+	return err == nil, err
+}
 
-	// start a loop that plans every iteration and exits when something is read from the success channel
-	for {
-		ma := newMoveAttempt(ctx, moveRequest)
-		if err := ma.start(); err != nil {
-			return false, err
-		}
+func (ms *builtIn) MoveOnMap(ctx context.Context, req motion.MoveOnMapReq) (motion.ExecutionID, error) {
+	if err := ctx.Err(); err != nil {
+		return uuid.Nil, err
+	}
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+	ms.logger.CDebugf(ctx, "MoveOnMap called with %s", req)
 
-		// this ensures that if the context is cancelled we always return early at the top of the loop
-		if err := ctx.Err(); err != nil {
-			ma.cancel()
-			return false, err
-		}
+	// TODO: Deprecated: remove once no motion apis use the opid system
+	operation.CancelOtherWithLabel(ctx, builtinOpLabel)
 
-		select {
-		// if context was cancelled by the calling function, error out
-		case <-ctx.Done():
-			ma.cancel()
-			return false, ctx.Err()
+	id, err := state.StartExecution(ctx, ms.state, req.ComponentName, req, ms.newMoveOnMapRequest)
+	if err != nil {
+		return uuid.Nil, err
+	}
 
-		// once execution responds: return the result to the caller
-		case resp := <-ma.responseChan:
-			ms.logger.Debugf("execution complete: %#v", resp)
-			ma.cancel()
-			return resp.success, resp.err
+	return id, nil
+}
 
-		// if the position poller hit an error return it, otherwise replan
-		case resp := <-moveRequest.position.responseChan:
-			ms.logger.Debugf("position response: %#v", resp)
-			ma.cancel()
-			if resp.err != nil {
-				return false, resp.err
-			}
+type validatedExtra struct {
+	maxReplans       int
+	replanCostFactor float64
+	motionProfile    string
+	extra            map[string]interface{}
+}
 
-		// if the obstacle poller hit an error return it, otherwise replan
-		case resp := <-moveRequest.obstacle.responseChan:
-			ms.logger.Debugf("obstacle response: %#v", resp)
-			ma.cancel()
-			if resp.err != nil {
-				return false, resp.err
-			}
+func newValidatedExtra(extra map[string]interface{}) (validatedExtra, error) {
+	maxReplans := -1
+	replanCostFactor := defaultReplanCostFactor
+	motionProfile := ""
+	v := validatedExtra{}
+	if extra == nil {
+		v.extra = map[string]interface{}{"smooth_iter": defaultSmoothIter}
+		return v, nil
+	}
+	if replansRaw, ok := extra["max_replans"]; ok {
+		if replans, ok := replansRaw.(int); ok {
+			maxReplans = replans
 		}
 	}
+	if profile, ok := extra["motion_profile"]; ok {
+		motionProfile, ok = profile.(string)
+		if !ok {
+			return v, errors.New("could not interpret motion_profile field as string")
+		}
+	}
+	if costFactorRaw, ok := extra["replan_cost_factor"]; ok {
+		costFactor, ok := costFactorRaw.(float64)
+		if !ok {
+			return validatedExtra{}, errors.New("could not interpret replan_cost_factor field as float")
+		}
+		replanCostFactor = costFactor
+	}
+
+	if _, ok := extra["smooth_iter"]; !ok {
+		extra["smooth_iter"] = defaultSmoothIter
+	}
+
+	return validatedExtra{
+		maxReplans:       maxReplans,
+		motionProfile:    motionProfile,
+		replanCostFactor: replanCostFactor,
+		extra:            extra,
+	}, nil
+}
+
+func (ms *builtIn) MoveOnGlobe(ctx context.Context, req motion.MoveOnGlobeReq) (motion.ExecutionID, error) {
+	if err := ctx.Err(); err != nil {
+		return uuid.Nil, err
+	}
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+	ms.logger.CDebugf(ctx, "MoveOnGlobe called with %s", req)
+	// TODO: Deprecated: remove once no motion apis use the opid system
+	operation.CancelOtherWithLabel(ctx, builtinOpLabel)
+
+	id, err := state.StartExecution(ctx, ms.state, req.ComponentName, req, ms.newMoveOnGlobeRequest)
+	if err != nil {
+		return uuid.Nil, err
+	}
+
+	return id, nil
 }
 
 func (ms *builtIn) GetPose(
@@ -351,6 +284,8 @@ func (ms *builtIn) GetPose(
 	supplementalTransforms []*referenceframe.LinkInFrame,
 	extra map[string]interface{},
 ) (*referenceframe.PoseInFrame, error) {
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
 	if destinationFrame == "" {
 		destinationFrame = referenceframe.World
 	}
@@ -365,105 +300,309 @@ func (ms *builtIn) GetPose(
 	)
 }
 
-// PlanMoveOnMap returns the plan for MoveOnMap to execute.
-func (ms *builtIn) planMoveOnMap(
+func (ms *builtIn) StopPlan(
 	ctx context.Context,
-	componentName resource.Name,
-	destination spatialmath.Pose,
-	slamName resource.Name,
-	kinematicsOptions kinematicbase.Options,
-	extra map[string]interface{},
-) ([][]referenceframe.Input, kinematicbase.KinematicBase, error) {
-	// get the SLAM Service from the slamName
-	slamSvc, ok := ms.slamServices[slamName]
-	if !ok {
-		return nil, nil, resource.DependencyNotFoundError(slamName)
+	req motion.StopPlanReq,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+	return ms.state.StopExecutionByResource(req.ComponentName)
+}
 
-	// gets the extents of the SLAM map
-	limits, err := slam.Limits(ctx, slamSvc)
-	if err != nil {
-		return nil, nil, err
+func (ms *builtIn) ListPlanStatuses(
+	ctx context.Context,
+	req motion.ListPlanStatusesReq,
+) ([]motion.PlanStatusWithID, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	limits = append(limits, referenceframe.Limit{Min: -2 * math.Pi, Max: 2 * math.Pi})
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+	return ms.state.ListPlanStatuses(req)
+}
 
-	// create a KinematicBase from the componentName
-	component, ok := ms.components[componentName]
-	if !ok {
-		return nil, nil, resource.DependencyNotFoundError(componentName)
+func (ms *builtIn) PlanHistory(
+	ctx context.Context,
+	req motion.PlanHistoryReq,
+) ([]motion.PlanWithStatus, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	b, ok := component.(base.Base)
-	if !ok {
-		return nil, nil, fmt.Errorf("cannot move component of type %T because it is not a Base", component)
-	}
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+	return ms.state.PlanHistory(req)
+}
 
-	if extra != nil {
-		if profile, ok := extra["motion_profile"]; ok {
-			motionProfile, ok := profile.(string)
-			if !ok {
-				return nil, nil, errors.New("could not interpret motion_profile field as string")
+// DoCommand supports two commands which are specified through the command map
+//   - DoPlan generates and returns a Trajectory for a given motionpb.MoveRequest without executing it
+//     required key: DoPlan
+//     input value: a motionpb.MoveRequest which will be used to create a Trajectory
+//     output value: a motionplan.Trajectory specified as a map (the mapstructure.Decode function is useful for decoding this)
+//   - DoExecute takes a Trajectory and executes it
+//     required key: DoExecute
+//     input value: a motionplan.Trajectory
+//     output value: a bool
+func (ms *builtIn) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+	operation.CancelOtherWithLabel(ctx, builtinOpLabel)
+
+	resp := make(map[string]interface{}, 0)
+	if req, ok := cmd[DoPlan]; ok {
+		s, err := utils.AssertType[string](req)
+		if err != nil {
+			return nil, err
+		}
+		var moveReqProto pb.MoveRequest
+		err = protojson.Unmarshal([]byte(s), &moveReqProto)
+		if err != nil {
+			return nil, err
+		}
+		fields := moveReqProto.Extra.AsMap()
+		if extra, err := utils.AssertType[map[string]interface{}](fields["fields"]); err == nil {
+			v, err := structpb.NewStruct(extra)
+			if err != nil {
+				return nil, err
 			}
-			kinematicsOptions.PositionOnlyMode = motionProfile == motionplan.PositionOnlyMotionProfile
+			moveReqProto.Extra = v
+		}
+		moveReq, err := motion.MoveReqFromProto(&moveReqProto)
+		if err != nil {
+			return nil, err
+		}
+		plan, err := ms.plan(ctx, moveReq)
+		if err != nil {
+			return nil, err
+		}
+		resp[DoPlan] = plan.Trajectory()
+	}
+	if req, ok := cmd[DoExecute]; ok {
+		var trajectory motionplan.Trajectory
+		if err := mapstructure.Decode(req, &trajectory); err != nil {
+			return nil, err
+		}
+		if err := ms.execute(ctx, trajectory); err != nil {
+			return nil, err
+		}
+		resp[DoExecute] = true
+	}
+	return resp, nil
+}
+
+func (ms *builtIn) plan(ctx context.Context, req motion.MoveReq) (motionplan.Plan, error) {
+	frameSys, err := ms.fsService.FrameSystem(ctx, req.WorldState.Transforms())
+	if err != nil {
+		return nil, err
+	}
+
+	// build maps of relevant components and inputs from initial inputs
+	fsInputs, _, err := ms.fsService.CurrentInputs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ms.logger.CDebugf(ctx, "frame system inputs: %v", fsInputs)
+
+	movingFrame := frameSys.Frame(req.ComponentName.ShortName())
+	if movingFrame == nil {
+		return nil, fmt.Errorf("component named %s not found in robot frame system", req.ComponentName.ShortName())
+	}
+
+	startState, waypoints, err := waypointsFromRequest(req, fsInputs)
+	if err != nil {
+		return nil, err
+	}
+	if len(waypoints) == 0 {
+		return nil, errors.New("could not find any waypoints to plan for in MoveRequest. Fill in Destination or goal_state")
+	}
+	// The contents of waypoints can be gigantic, and if so, making copies of `extra` becomes the majority of motion planning runtime.
+	// As the meaning from `waypoints` has already been extracted above into its proper data structure, there is no longer a need to
+	// keep it in `extra`.
+	if req.Extra != nil {
+		req.Extra["waypoints"] = nil
+	}
+
+	// re-evaluate goal poses to be in the frame of World
+	// TODO (RSDK-8847) : this is a workaround to help account for us not yet being able to properly synchronize simultaneous motion across
+	// multiple components. If we are moving component1, mounted on arm2, to a goal in frame of component2, which is mounted on arm2, then
+	// passing that raw poseInFrame will certainly result in a plan which moves arm1 and arm2. We cannot guarantee that this plan is
+	// collision-free until RSDK-8847 is complete. By transforming goals to world, only one arm should move for such a plan.
+	worldWaypoints := []*motionplan.PlanState{}
+	solvingFrame := referenceframe.World
+	for _, wp := range waypoints {
+		if wp.Poses() != nil {
+			step := referenceframe.FrameSystemPoses{}
+			for fName, destination := range wp.Poses() {
+				tf, err := frameSys.Transform(fsInputs, destination, solvingFrame)
+				if err != nil {
+					return nil, err
+				}
+				goalPose, _ := tf.(*referenceframe.PoseInFrame)
+				step[fName] = goalPose
+			}
+			worldWaypoints = append(worldWaypoints, motionplan.NewPlanState(step, wp.Configuration()))
+		} else {
+			worldWaypoints = append(worldWaypoints, wp)
 		}
 	}
 
-	kb, err := kinematicbase.WrapWithKinematics(ctx, b, ms.logger, motion.NewSLAMLocalizer(slamSvc), limits, kinematicsOptions)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// get point cloud data in the form of bytes from pcd
-	pointCloudData, err := slam.PointCloudMapFull(ctx, slamSvc)
-	if err != nil {
-		return nil, nil, err
-	}
-	// store slam point cloud data  in the form of a recursive octree for collision checking
-	octree, err := pointcloud.ReadPCDToBasicOctree(bytes.NewReader(pointCloudData))
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// get current position
-	inputs, err := kb.CurrentInputs(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	if kinematicsOptions.PositionOnlyMode {
-		inputs = inputs[:2]
-	}
-	ms.logger.Debugf("base position: %v", inputs)
-
-	dst := referenceframe.NewPoseInFrame(referenceframe.World, spatialmath.NewPoseFromPoint(destination.Point()))
-
-	f := kb.Kinematics()
-	fs := referenceframe.NewEmptyFrameSystem("")
-	if err := fs.AddFrame(f, fs.World()); err != nil {
-		return nil, nil, err
-	}
-
-	worldState, err := referenceframe.NewWorldState([]*referenceframe.GeometriesInFrame{
-		referenceframe.NewGeometriesInFrame(referenceframe.World, []spatialmath.Geometry{octree}),
-	}, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	seedMap := map[string][]referenceframe.Input{f.Name(): inputs}
-
-	ms.logger.Debugf("goal position: %v", dst.Pose().Point())
-	plan, err := motionplan.PlanMotion(ctx, &motionplan.PlanRequest{
-		Logger:             ms.logger,
-		Goal:               dst,
-		Frame:              f,
-		StartConfiguration: seedMap,
-		FrameSystem:        fs,
-		WorldState:         worldState,
-		ConstraintSpecs:    nil,
-		Options:            extra,
+	// the goal is to move the component to goalPose which is specified in coordinates of goalFrameName
+	return motionplan.PlanMotion(ctx, &motionplan.PlanRequest{
+		Logger:      ms.logger,
+		Goals:       worldWaypoints,
+		StartState:  startState,
+		FrameSystem: frameSys,
+		WorldState:  req.WorldState,
+		Constraints: req.Constraints,
+		Options:     req.Extra,
 	})
+}
+
+func (ms *builtIn) execute(ctx context.Context, trajectory motionplan.Trajectory) error {
+	// build maps of relevant components from initial inputs
+	_, resources, err := ms.fsService.CurrentInputs(ctx)
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
-	steps, err := plan.GetFrameSteps(f.Name())
-	return steps, kb, err
+
+	// Batch GoToInputs calls if possible; components may want to blend between inputs
+	combinedSteps := []map[string][][]referenceframe.Input{}
+	currStep := map[string][][]referenceframe.Input{}
+	for i, step := range trajectory {
+		if i == 0 {
+			for name, inputs := range step {
+				if len(inputs) == 0 {
+					continue
+				}
+				currStep[name] = append(currStep[name], inputs)
+			}
+			continue
+		}
+		changed := ""
+		if len(currStep) > 0 {
+			reset := false
+			// Check if the current step moves only the same components as the previous step
+			// If so, batch the inputs
+			for name, inputs := range step {
+				if len(inputs) == 0 {
+					continue
+				}
+				if priorInputs, ok := currStep[name]; ok {
+					for i, input := range inputs {
+						if input != priorInputs[len(priorInputs)-1][i] {
+							if changed == "" {
+								changed = name
+							}
+							if changed != "" && changed != name {
+								// If the current step moves different components than the previous step, reset the batch
+								reset = true
+								break
+							}
+						}
+					}
+				} else {
+					// Previously moved components are no longer moving
+					reset = true
+				}
+				if reset {
+					break
+				}
+			}
+			if reset {
+				combinedSteps = append(combinedSteps, currStep)
+				currStep = map[string][][]referenceframe.Input{}
+			}
+			for name, inputs := range step {
+				if len(inputs) == 0 {
+					continue
+				}
+				currStep[name] = append(currStep[name], inputs)
+			}
+		}
+	}
+	combinedSteps = append(combinedSteps, currStep)
+
+	for _, step := range combinedSteps {
+		for name, inputs := range step {
+			if len(inputs) == 0 {
+				continue
+			}
+			r, ok := resources[name]
+			if !ok {
+				return fmt.Errorf("plan had step for resource %s but no resource with that name found in framesystem", name)
+			}
+			if err := r.GoToInputs(ctx, inputs...); err != nil {
+				// If there is an error on GoToInputs, stop the component if possible before returning the error
+				if actuator, ok := r.(inputEnabledActuator); ok {
+					if stopErr := actuator.Stop(ctx, nil); stopErr != nil {
+						return errors.Wrap(err, stopErr.Error())
+					}
+				}
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func waypointsFromRequest(
+	req motion.MoveReq,
+	fsInputs referenceframe.FrameSystemInputs,
+) (*motionplan.PlanState, []*motionplan.PlanState, error) {
+	var startState *motionplan.PlanState
+	var waypoints []*motionplan.PlanState
+	var err error
+
+	if startStateIface, ok := req.Extra["start_state"]; ok {
+		if startStateMap, ok := startStateIface.(map[string]interface{}); ok {
+			startState, err = motionplan.DeserializePlanState(startStateMap)
+			if err != nil {
+				return nil, nil, err
+			}
+		} else {
+			return nil, nil, errors.New("extras start_state could not be interpreted as map[string]interface{}")
+		}
+		if startState.Configuration() == nil {
+			startState = motionplan.NewPlanState(startState.Poses(), fsInputs)
+		}
+	} else {
+		startState = motionplan.NewPlanState(nil, fsInputs)
+	}
+
+	if waypointsIface, ok := req.Extra["waypoints"]; ok {
+		if waypointsIfaceList, ok := waypointsIface.([]interface{}); ok {
+			for _, wpIface := range waypointsIfaceList {
+				if wpMap, ok := wpIface.(map[string]interface{}); ok {
+					wp, err := motionplan.DeserializePlanState(wpMap)
+					if err != nil {
+						return nil, nil, err
+					}
+					waypoints = append(waypoints, wp)
+				} else {
+					return nil, nil, errors.New("element in extras waypoints could not be interpreted as map[string]interface{}")
+				}
+			}
+		} else {
+			return nil, nil, errors.New("Invalid 'waypoints' extra type. Expected an array")
+		}
+	}
+
+	// If goal state is specified, it overrides the request goal
+	if goalStateIface, ok := req.Extra["goal_state"]; ok {
+		if goalStateMap, ok := goalStateIface.(map[string]interface{}); ok {
+			goalState, err := motionplan.DeserializePlanState(goalStateMap)
+			if err != nil {
+				return nil, nil, err
+			}
+			waypoints = append(waypoints, goalState)
+		} else {
+			return nil, nil, errors.New("extras goal_state could not be interpreted as map[string]interface{}")
+		}
+	} else if req.Destination != nil {
+		goalState := motionplan.NewPlanState(referenceframe.FrameSystemPoses{req.ComponentName.ShortName(): req.Destination}, nil)
+		waypoints = append(waypoints, goalState)
+	}
+	return startState, waypoints, nil
 }

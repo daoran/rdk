@@ -14,6 +14,13 @@ import (
 	"go.viam.com/rdk/testutils/inject"
 )
 
+const (
+	testGantryName    = "gantry1"
+	testGantryName2   = "gantry2"
+	failGantryName    = "gantry3"
+	missingGantryName = "gantry4"
+)
+
 var (
 	errPositionFailed       = errors.New("couldn't get position")
 	errHomingFailed         = errors.New("homing unsuccessful")
@@ -108,6 +115,14 @@ func TestServer(t *testing.T) {
 		_, err = gantryServer.GetPosition(context.Background(), &pb.GetPositionRequest{Name: failGantryName})
 		test.That(t, err, test.ShouldNotBeNil)
 		test.That(t, err.Error(), test.ShouldContainSubstring, errPositionFailed.Error())
+
+		// Redefine Positionfunc to test nil return
+		injectGantry.PositionFunc = func(ctx context.Context, extra map[string]interface{}) ([]float64, error) {
+			return nil, nil
+		}
+		resp, err = gantryServer.GetPosition(context.Background(), &pb.GetPositionRequest{Name: testGantryName, Extra: ext})
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, resp.PositionsMm, test.ShouldResemble, []float64{})
 	})
 
 	t.Run("move to position", func(t *testing.T) {
@@ -155,6 +170,14 @@ func TestServer(t *testing.T) {
 		_, err = gantryServer.GetLengths(context.Background(), &pb.GetLengthsRequest{Name: failGantryName})
 		test.That(t, err, test.ShouldNotBeNil)
 		test.That(t, err.Error(), test.ShouldContainSubstring, errLengthsFailed.Error())
+
+		// Redefine Lengthsfunc to test nil return
+		injectGantry.LengthsFunc = func(ctx context.Context, extra map[string]interface{}) ([]float64, error) {
+			return nil, nil
+		}
+		resp, err = gantryServer.GetLengths(context.Background(), &pb.GetLengthsRequest{Name: testGantryName, Extra: ext})
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, resp.LengthsMm, test.ShouldResemble, []float64{})
 	})
 
 	t.Run("home", func(t *testing.T) {

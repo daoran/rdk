@@ -2,17 +2,18 @@ package incremental
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
-	"github.com/edaniels/golog"
 	"go.viam.com/test"
 	"go.viam.com/utils/testutils"
 
 	"go.viam.com/rdk/components/board"
-	fakeboard "go.viam.com/rdk/components/board/fake"
 	"go.viam.com/rdk/components/encoder"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
+	"go.viam.com/rdk/testutils/inject"
 )
 
 func TestConfig(t *testing.T) {
@@ -31,7 +32,7 @@ func TestConfig(t *testing.T) {
 
 		rawcfg := resource.Config{Name: "enc1", ConvertedAttributes: &ic}
 
-		_, err := NewIncrementalEncoder(ctx, deps, rawcfg, golog.NewTestLogger(t))
+		_, err := NewIncrementalEncoder(ctx, deps, rawcfg, logging.NewTestLogger(t))
 
 		test.That(t, err, test.ShouldBeNil)
 	})
@@ -43,7 +44,7 @@ func TestConfig(t *testing.T) {
 
 		rawcfg := resource.Config{Name: "enc1", ConvertedAttributes: &ic}
 
-		_, err := NewIncrementalEncoder(ctx, deps, rawcfg, golog.NewTestLogger(t))
+		_, err := NewIncrementalEncoder(ctx, deps, rawcfg, logging.NewTestLogger(t))
 		test.That(t, err, test.ShouldNotBeNil)
 	})
 }
@@ -56,6 +57,11 @@ func TestEncoder(t *testing.T) {
 	deps := make(resource.Dependencies)
 	deps[board.Named("main")] = b
 
+	i1, err := b.DigitalInterruptByName("11")
+	test.That(t, err, test.ShouldBeNil)
+	i2, err := b.DigitalInterruptByName("13")
+	test.That(t, err, test.ShouldBeNil)
+
 	ic := Config{
 		BoardName: "main",
 		Pins:      Pins{A: "11", B: "13"},
@@ -64,14 +70,14 @@ func TestEncoder(t *testing.T) {
 	rawcfg := resource.Config{Name: "enc1", ConvertedAttributes: &ic}
 
 	t.Run("run forward", func(t *testing.T) {
-		enc, err := NewIncrementalEncoder(ctx, deps, rawcfg, golog.NewTestLogger(t))
+		enc, err := NewIncrementalEncoder(ctx, deps, rawcfg, logging.NewTestLogger(t))
 		test.That(t, err, test.ShouldBeNil)
 		enc2 := enc.(*Encoder)
 		defer enc2.Close(context.Background())
 
-		err = enc2.B.Tick(context.Background(), true, uint64(time.Now().UnixNano()))
+		err = i2.(*inject.DigitalInterrupt).Tick(context.Background(), true, uint64(time.Now().UnixNano()))
 		test.That(t, err, test.ShouldBeNil)
-		err = enc2.A.Tick(context.Background(), true, uint64(time.Now().UnixNano()))
+		err = i1.(*inject.DigitalInterrupt).Tick(context.Background(), true, uint64(time.Now().UnixNano()))
 		test.That(t, err, test.ShouldBeNil)
 
 		testutils.WaitForAssertion(t, func(tb testing.TB) {
@@ -83,14 +89,14 @@ func TestEncoder(t *testing.T) {
 	})
 
 	t.Run("run backward", func(t *testing.T) {
-		enc, err := NewIncrementalEncoder(ctx, deps, rawcfg, golog.NewTestLogger(t))
+		enc, err := NewIncrementalEncoder(ctx, deps, rawcfg, logging.NewTestLogger(t))
 		test.That(t, err, test.ShouldBeNil)
 		enc2 := enc.(*Encoder)
 		defer enc2.Close(context.Background())
 
-		err = enc2.A.Tick(context.Background(), false, uint64(time.Now().UnixNano()))
+		err = i1.(*inject.DigitalInterrupt).Tick(context.Background(), true, uint64(time.Now().UnixNano()))
 		test.That(t, err, test.ShouldBeNil)
-		err = enc2.B.Tick(context.Background(), false, uint64(time.Now().UnixNano()))
+		err = i2.(*inject.DigitalInterrupt).Tick(context.Background(), true, uint64(time.Now().UnixNano()))
 		test.That(t, err, test.ShouldBeNil)
 
 		testutils.WaitForAssertion(t, func(tb testing.TB) {
@@ -102,7 +108,7 @@ func TestEncoder(t *testing.T) {
 	})
 
 	t.Run("reset position", func(t *testing.T) {
-		enc, err := NewIncrementalEncoder(ctx, deps, rawcfg, golog.NewTestLogger(t))
+		enc, err := NewIncrementalEncoder(ctx, deps, rawcfg, logging.NewTestLogger(t))
 		test.That(t, err, test.ShouldBeNil)
 		enc2 := enc.(*Encoder)
 		defer enc2.Close(context.Background())
@@ -116,7 +122,7 @@ func TestEncoder(t *testing.T) {
 	})
 
 	t.Run("specify correct position type", func(t *testing.T) {
-		enc, err := NewIncrementalEncoder(ctx, deps, rawcfg, golog.NewTestLogger(t))
+		enc, err := NewIncrementalEncoder(ctx, deps, rawcfg, logging.NewTestLogger(t))
 		test.That(t, err, test.ShouldBeNil)
 		enc2 := enc.(*Encoder)
 		defer enc2.Close(context.Background())
@@ -130,7 +136,7 @@ func TestEncoder(t *testing.T) {
 		})
 	})
 	t.Run("specify wrong position type", func(t *testing.T) {
-		enc, err := NewIncrementalEncoder(ctx, deps, rawcfg, golog.NewTestLogger(t))
+		enc, err := NewIncrementalEncoder(ctx, deps, rawcfg, logging.NewTestLogger(t))
 		test.That(t, err, test.ShouldBeNil)
 		enc2 := enc.(*Encoder)
 		defer enc2.Close(context.Background())
@@ -145,7 +151,7 @@ func TestEncoder(t *testing.T) {
 	})
 
 	t.Run("get properties", func(t *testing.T) {
-		enc, err := NewIncrementalEncoder(ctx, deps, rawcfg, golog.NewTestLogger(t))
+		enc, err := NewIncrementalEncoder(ctx, deps, rawcfg, logging.NewTestLogger(t))
 		test.That(t, err, test.ShouldBeNil)
 		enc2 := enc.(*Encoder)
 		defer enc2.Close(context.Background())
@@ -160,28 +166,53 @@ func TestEncoder(t *testing.T) {
 	})
 }
 
-func MakeBoard(t *testing.T) *fakeboard.Board {
-	interrupt11, _ := fakeboard.NewDigitalInterruptWrapper(board.DigitalInterruptConfig{
-		Name: "11",
-		Pin:  "11",
-		Type: "basic",
-	})
-
-	interrupt13, _ := fakeboard.NewDigitalInterruptWrapper(board.DigitalInterruptConfig{
-		Name: "13",
-		Pin:  "13",
-		Type: "basic",
-	})
-
-	interrupts := map[string]*fakeboard.DigitalInterruptWrapper{
-		"11": interrupt11,
-		"13": interrupt13,
+func MakeBoard(t *testing.T) board.Board {
+	b := inject.NewBoard("test-board")
+	i1 := &inject.DigitalInterrupt{}
+	i2 := &inject.DigitalInterrupt{}
+	callbacks := make(map[board.DigitalInterrupt]chan board.Tick)
+	i1.NameFunc = func() string {
+		return "11"
+	}
+	i2.NameFunc = func() string {
+		return "13"
+	}
+	i1.TickFunc = func(ctx context.Context, high bool, nanoseconds uint64) error {
+		ch, ok := callbacks[i1]
+		test.That(t, ok, test.ShouldBeTrue)
+		ch <- board.Tick{Name: i1.Name(), High: high, TimestampNanosec: nanoseconds}
+		return nil
+	}
+	i2.TickFunc = func(ctx context.Context, high bool, nanoseconds uint64) error {
+		ch, ok := callbacks[i2]
+		test.That(t, ok, test.ShouldBeTrue)
+		ch <- board.Tick{Name: i2.Name(), High: high, TimestampNanosec: nanoseconds}
+		return nil
+	}
+	i1.ValueFunc = func(ctx context.Context, extra map[string]interface{}) (int64, error) {
+		return 0, nil
+	}
+	i2.ValueFunc = func(ctx context.Context, extra map[string]interface{}) (int64, error) {
+		return 0, nil
 	}
 
-	b := fakeboard.Board{
-		GPIOPins: map[string]*fakeboard.GPIOPin{},
-		Digitals: interrupts,
+	b.DigitalInterruptByNameFunc = func(name string) (board.DigitalInterrupt, error) {
+		if name == "11" {
+			return i1, nil
+		} else if name == "13" {
+			return i2, nil
+		}
+		return nil, fmt.Errorf("unknown digital interrupt: %s", name)
+	}
+	b.StreamTicksFunc = func(
+		ctx context.Context, interrupts []board.DigitalInterrupt, ch chan board.Tick, extra map[string]interface{},
+	) error {
+		for _, i := range interrupts {
+			callbacks[i] = ch
+		}
+
+		return nil
 	}
 
-	return &b
+	return b
 }

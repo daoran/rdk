@@ -15,13 +15,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/pkg/errors"
 	"go.uber.org/multierr"
 	"go.viam.com/test"
 	"go.viam.com/utils"
 	"go.viam.com/utils/artifact"
 
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/pointcloud"
 )
 
@@ -79,7 +79,7 @@ type MultipleImageTestDebugger struct {
 	output testOutput
 
 	pendingImages int32
-	logger        golog.Logger
+	logger        logging.Logger
 }
 
 // ProcessorContext TODO.
@@ -159,7 +159,7 @@ type MultipleImageTestDebuggerProcessor interface {
 		fn string,
 		img image.Image,
 		img2 image.Image,
-		logger golog.Logger,
+		logger logging.Logger,
 	) error
 }
 
@@ -176,7 +176,7 @@ func checkSkipDebugTest(t *testing.T) {
 func NewMultipleImageTestDebugger(t *testing.T, prefixOne, glob, prefixTwo string) *MultipleImageTestDebugger {
 	checkSkipDebugTest(t)
 	t.Helper()
-	d := MultipleImageTestDebugger{logger: golog.NewTestLogger(t)}
+	d := MultipleImageTestDebugger{logger: logging.NewTestLogger(t)}
 	d.glob = glob
 	d.inrootPrimary = artifact.MustPath(prefixOne)
 	if prefixTwo != "" {
@@ -249,7 +249,7 @@ func (d *MultipleImageTestDebugger) Process(t *testing.T, x MultipleImageTestDeb
 					pCtx.GotDebugImage(img2, "raw_second")
 				}
 
-				logger := golog.NewTestLogger(t)
+				logger := logging.NewTestLogger(t)
 				err = x.Process(t, pCtx, currentFile, img, img2, logger)
 				test.That(t, err, test.ShouldBeNil)
 			})

@@ -5,12 +5,12 @@ import (
 	"context"
 	"sync"
 
-	"github.com/edaniels/golog"
 	"github.com/pkg/errors"
 	"go.uber.org/multierr"
 	"go.viam.com/utils"
 
 	"go.viam.com/rdk/components/gantry"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/operation"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/resource"
@@ -30,7 +30,7 @@ type multiAxis struct {
 	resource.AlwaysRebuild
 	subAxes            []gantry.Gantry
 	lengthsMm          []float64
-	logger             golog.Logger
+	logger             logging.Logger
 	moveSimultaneously bool
 	model              referenceframe.Model
 	opMgr              *operation.SingleOperationManager
@@ -42,7 +42,7 @@ func (conf *Config) Validate(path string) ([]string, error) {
 	var deps []string
 
 	if len(conf.SubAxes) == 0 {
-		return nil, utils.NewConfigValidationError(path, errors.New("need at least one axis"))
+		return nil, resource.NewConfigValidationError(path, errors.New("need at least one axis"))
 	}
 
 	deps = append(deps, conf.SubAxes...)
@@ -60,7 +60,7 @@ func newMultiAxis(
 	ctx context.Context,
 	deps resource.Dependencies,
 	conf resource.Config,
-	logger golog.Logger,
+	logger logging.Logger,
 ) (gantry.Gantry, error) {
 	newConf, err := resource.NativeConfig[*Config](conf)
 	if err != nil {
@@ -161,16 +161,20 @@ func (g *multiAxis) MoveToPosition(ctx context.Context, positions, speeds []floa
 }
 
 // GoToInputs moves the gantry to a goal position in the Gantry frame.
-func (g *multiAxis) GoToInputs(ctx context.Context, goal []referenceframe.Input) error {
-	if len(g.subAxes) == 0 {
-		return errors.New("no subaxes found for inputs")
-	}
-	ctx, done := g.opMgr.New(ctx)
-	defer done()
+func (g *multiAxis) GoToInputs(ctx context.Context, inputSteps ...[]referenceframe.Input) error {
+	for _, goal := range inputSteps {
+		if len(g.subAxes) == 0 {
+			return errors.New("no subaxes found for inputs")
+		}
 
-	// MoveToPosition will use the default gantry speed when an empty float is passed in
-	speeds := []float64{}
-	return g.MoveToPosition(ctx, referenceframe.InputsToFloats(goal), speeds, nil)
+		// MoveToPosition will use the default gantry speed when an empty float is passed in
+		speeds := []float64{}
+		err := g.MoveToPosition(ctx, referenceframe.InputsToFloats(goal), speeds, nil)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Position returns the position in millimeters.
@@ -208,7 +212,7 @@ func (g *multiAxis) Stop(ctx context.Context, extra map[string]interface{}) erro
 		g.workers.Add(1)
 		utils.ManagedGo(func() {
 			if err := currG.Stop(ctx, extra); err != nil {
-				g.logger.Errorw("failed to stop subaxis", "error", err)
+				g.logger.CErrorw(ctx, "failed to stop subaxis", "error", err)
 			}
 		}, g.workers.Done)
 	}

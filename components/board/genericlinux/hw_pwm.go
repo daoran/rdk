@@ -11,9 +11,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/pkg/errors"
 	goutils "go.viam.com/utils"
+
+	"go.viam.com/rdk/logging"
 )
 
 // There are times when we need to set the period to some value, any value. It must be a positive
@@ -27,23 +28,29 @@ type pwmDevice struct {
 
 	// We have no mutable state, but the mutex is used to write to multiple pseudofiles atomically.
 	mu     sync.Mutex
-	logger golog.Logger
+	logger logging.Logger
 }
 
-func newPwmDevice(chipPath string, line int, logger golog.Logger) *pwmDevice {
+func newPwmDevice(chipPath string, line int, logger logging.Logger) *pwmDevice {
 	return &pwmDevice{chipPath: chipPath, line: line, logger: logger}
 }
 
-func writeValue(filepath string, value uint64) error {
+func writeValue(filepath string, value uint64, logger logging.Logger) error {
+	logger.Debugf("Writing %d to %s", value, filepath)
 	data := []byte(fmt.Sprintf("%d", value))
 	// The file permissions (the third argument) aren't important: if the file needs to be created,
 	// something has gone horribly wrong!
 	err := os.WriteFile(filepath, data, 0o600)
+	// Some errors (e.g., trying to unexport an already-unexported pin) should get suppressed. If
+	// we're trying to debug something in here, log the error even if it will later be ignored.
+	if err != nil {
+		logger.Debugf("Encountered error writing to sysfs: %s", err)
+	}
 	return errors.Wrap(err, filepath)
 }
 
 func (pwm *pwmDevice) writeChip(filename string, value uint64) error {
-	return writeValue(fmt.Sprintf("%s/%s", pwm.chipPath, filename), value)
+	return writeValue(fmt.Sprintf("%s/%s", pwm.chipPath, filename), value, pwm.logger)
 }
 
 func (pwm *pwmDevice) linePath() string {
@@ -51,7 +58,7 @@ func (pwm *pwmDevice) linePath() string {
 }
 
 func (pwm *pwmDevice) writeLine(filename string, value uint64) error {
-	return writeValue(fmt.Sprintf("%s/%s", pwm.linePath(), filename), value)
+	return writeValue(fmt.Sprintf("%s/%s", pwm.linePath(), filename), value, pwm.logger)
 }
 
 // Export tells the OS that this pin is in use, and enables configuration via sysfs.
@@ -92,7 +99,7 @@ func (pwm *pwmDevice) unexport() error {
 	// On boards like the Odroid C4, there is a race condition in the kernel where, if you unexport
 	// the pin too quickly after changing something else about it (e.g., disabling it), the whole
 	// PWM system gets corrupted. Sleep for a small amount of time to avoid this.
-	time.Sleep(time.Microsecond)
+	time.Sleep(10 * time.Millisecond)
 	if err := pwm.writeChip("unexport", uint64(pwm.line)); err != nil {
 		return err
 	}
@@ -115,7 +122,7 @@ func (pwm *pwmDevice) disable() error {
 // Only call this from public functions, to avoid double-wrapping the errors.
 func (pwm *pwmDevice) wrapError(err error) error {
 	// Note that if err is nil, errors.Wrap() will return nil, too.
-	return errors.Wrap(err, fmt.Sprintf("HW PWM chipPath %s, line %d", pwm.chipPath, pwm.line))
+	return errors.Wrapf(err, "HW PWM chipPath %s, line %d", pwm.chipPath, pwm.line)
 }
 
 // SetPwm configures an exported pin and enables its output signal.
@@ -175,10 +182,9 @@ func (pwm *pwmDevice) SetPwm(freqHz uint, dutyCycle float64) (err error) {
 	// values after (re-)enabling the line.
 
 	// Setting the active duration to 0 should always work: this is guaranteed to be less than the
-	// period.
-	if err := pwm.writeLine("duty_cycle", 0); err != nil {
-		return err
-	}
+	// period, unless the period in zero. In that case, just ignore the error.
+	goutils.UncheckedError(pwm.writeLine("duty_cycle", 0))
+
 	// Now that the active duration is 0, setting the period to any number should work.
 	if err := pwm.writeLine("period", safePeriodNs); err != nil {
 		return err

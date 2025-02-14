@@ -3,11 +3,15 @@ The Go client for the Viam RDK can function as an SDK to connect to a robot.
 
 # Install
 
-To install the Go SDK, run
+To install the Go SDK, run the following command from inside a Go module (use
+`go mod init` to create a module if you do not have one already).
 
 ```
 	go get go.viam.com/rdk/robot/client
 ```
+
+After adding the code below, you may have to run `go mod tidy` to add all required
+dependencies to your `go.mod` file.
 
 # Basic Usage
 
@@ -19,14 +23,14 @@ To connect to a robot as a client, you should instantiate a client.
 	import (
 		"context"
 
-		"github.com/edaniels/golog"
+		"go.viam.com/rdk/logging"
 		"go.viam.com/rdk/robot/client"
 		"go.viam.com/rdk/utils"
 		"go.viam.com/utils/rpc"
 	)
 
 	func main() {
-		logger := golog.NewDebugLogger("client")
+		logger := logging.NewDebugLogger("client")
 		// this instantiates a robot client that is connected to the robot at <address>
 		robot, err := client.New(
 			context.Background(),

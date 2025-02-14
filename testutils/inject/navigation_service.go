@@ -23,9 +23,14 @@ type NavigationService struct {
 	WaypointsFunc      func(ctx context.Context, extra map[string]interface{}) ([]navigation.Waypoint, error)
 	AddWaypointFunc    func(ctx context.Context, point *geo.Point, extra map[string]interface{}) error
 	RemoveWaypointFunc func(ctx context.Context, id primitive.ObjectID, extra map[string]interface{}) error
-	DoCommandFunc      func(ctx context.Context,
-		cmd map[string]interface{}) (map[string]interface{}, error)
-	CloseFunc func(ctx context.Context) error
+
+	ObstaclesFunc func(ctx context.Context, extra map[string]interface{}) ([]*spatialmath.GeoGeometry, error)
+	PathsFunc     func(ctx context.Context, extra map[string]interface{}) ([]*navigation.Path, error)
+
+	PropertiesFunc func(ctx context.Context) (navigation.Properties, error)
+
+	DoCommandFunc func(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error)
+	CloseFunc     func(ctx context.Context) error
 }
 
 // NewNavigationService returns a new injected navigation service.
@@ -84,6 +89,30 @@ func (ns *NavigationService) RemoveWaypoint(ctx context.Context, id primitive.Ob
 		return ns.Service.RemoveWaypoint(ctx, id, extra)
 	}
 	return ns.RemoveWaypointFunc(ctx, id, extra)
+}
+
+// Obstacles calls the injected Obstacles or the real version.
+func (ns *NavigationService) Obstacles(ctx context.Context, extra map[string]interface{}) ([]*spatialmath.GeoGeometry, error) {
+	if ns.ObstaclesFunc == nil {
+		return ns.Service.Obstacles(ctx, extra)
+	}
+	return ns.ObstaclesFunc(ctx, extra)
+}
+
+// Paths calls the injected Paths or the real version.
+func (ns *NavigationService) Paths(ctx context.Context, extra map[string]interface{}) ([]*navigation.Path, error) {
+	if ns.PathsFunc == nil {
+		return ns.Service.Paths(ctx, extra)
+	}
+	return ns.PathsFunc(ctx, extra)
+}
+
+// Properties calls the injected Properties or the real variant.
+func (ns *NavigationService) Properties(ctx context.Context) (navigation.Properties, error) {
+	if ns.PropertiesFunc == nil {
+		return ns.Service.Properties(ctx)
+	}
+	return ns.PropertiesFunc(ctx)
 }
 
 // DoCommand calls the injected DoCommand or the real variant.

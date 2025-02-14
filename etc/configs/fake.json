@@ -9,7 +9,7 @@
             "type": "arm",
             "model": "fake",
             "attributes": {
-                "arm-model": "xArm6"
+                "arm-model": "fake"
             }
         },
         {
@@ -151,7 +151,14 @@
                         },
                         "geometries": [
                             {
-                                "r": 2000
+                                "r": 2000,
+                                "label": "large sphere"
+                            },
+                            {
+                                "type": "capsule",
+                                "r": 500,
+                                "l": 5000,
+                                "label": "long capsule"
                             }
                         ]
                     },
@@ -162,7 +169,8 @@
                         },
                         "geometries": [
                             {
-                                "r": 2000000
+                                "r": 2000000,
+                                "label": "giant sphere"
                             }
                         ]
                     },
@@ -196,7 +204,8 @@
                                         "z": 1,
                                         "th": 0
                                     }
-                                }
+                                },
+                                "label": "myCamera_transientObstacle_capsule"
                             }    
                         ]
                     },
@@ -241,6 +250,11 @@
             "name": "dm",
             "type": "data_manager",
             "model": "builtin"
-        }       
+        },
+        {
+            "name": "generic1",
+            "type": "generic",
+            "model": "fake"
+        }
     ]
 }

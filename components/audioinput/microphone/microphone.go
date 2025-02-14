@@ -1,3 +1,5 @@
+//go:build !no_cgo
+
 // Package microphone implements a microphone audio input. Really the microphone
 // is any audio input device that can be found via gostream.
 package microphone
@@ -8,11 +10,11 @@ import (
 	"path/filepath"
 	"regexp"
 
-	"github.com/edaniels/golog"
 	"github.com/pion/mediadevices"
-	"github.com/viamrobotics/gostream"
 
 	"go.viam.com/rdk/components/audioinput"
+	"go.viam.com/rdk/gostream"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 )
 
@@ -27,7 +29,7 @@ func init() {
 				_ context.Context,
 				_ resource.Dependencies,
 				conf resource.Config,
-				logger golog.Logger,
+				logger logging.Logger,
 			) (audioinput.AudioInput, error) {
 				newConf, err := resource.NativeConfig[*Config](conf)
 				if err != nil {
@@ -53,13 +55,22 @@ type Config struct {
 }
 
 // newMicrophoneSource returns a new source based on a microphone discovered from the given attributes.
-func newMicrophoneSource(conf *Config, logger golog.Logger) (audioinput.AudioSource, error) {
+func newMicrophoneSource(conf *Config, logger logging.Logger) (audioinput.AudioSource, error) {
 	var err error
 
 	debug := conf.Debug
 
+	constraints := mediadevices.MediaTrackConstraints{}
+	audioConstraints := constraints.MediaConstraints.AudioConstraints
+	audioOption := func(trackConstraints *mediadevices.MediaTrackConstraints) {
+		trackConstraints.AudioConstraints = audioConstraints
+	}
+	audioStreamConstraints := mediadevices.MediaStreamConstraints{
+		Audio: audioOption,
+	}
+
 	if conf.Path != "" {
-		return tryMicrophoneOpen(conf.Path, gostream.DefaultConstraints, logger)
+		return tryMicrophoneOpen(conf.Path, audioStreamConstraints, logger)
 	}
 
 	var pattern *regexp.Regexp
@@ -89,7 +100,7 @@ func newMicrophoneSource(conf *Config, logger golog.Logger) (audioinput.AudioSou
 					}
 					continue
 				}
-				s, err := tryMicrophoneOpen(label, gostream.DefaultConstraints, logger)
+				s, err := tryMicrophoneOpen(label, audioStreamConstraints, logger)
 				if err == nil {
 					if debug {
 						logger.Debug("\t USING")
@@ -109,7 +120,7 @@ func newMicrophoneSource(conf *Config, logger golog.Logger) (audioinput.AudioSou
 func tryMicrophoneOpen(
 	path string,
 	constraints mediadevices.MediaStreamConstraints,
-	logger golog.Logger,
+	logger logging.Logger,
 ) (audioinput.AudioSource, error) {
 	source, err := gostream.GetNamedAudioSource(filepath.Base(path), constraints, logger)
 	if err != nil {

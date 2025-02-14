@@ -2,19 +2,19 @@ package universalrobots
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/pkg/errors"
 
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/utils"
 )
 
-// RobotModeData TODO.
-type RobotModeData struct {
+type robotModeData struct {
 	Timestamp                uint64
 	IsRealRobotConnected     bool
 	IsRealRobotEnabled       bool
@@ -30,8 +30,7 @@ type RobotModeData struct {
 	TargetSpeedFractionLimit float64
 }
 
-// JointData TODO.
-type JointData struct {
+type jointData struct {
 	Qactual   float64 // angle currently in radians
 	Qtarget   float64 // angle target in radians
 	QDactual  float64
@@ -42,13 +41,11 @@ type JointData struct {
 	JointMode byte
 }
 
-// AngleValues TODO.
-func (j JointData) AngleValues() float64 {
+func (j jointData) degrees() float64 {
 	return utils.RadToDeg(j.Qactual)
 }
 
-// ToolData TODO.
-type ToolData struct {
+type toolData struct {
 	AnalogInputRange0 byte
 	AnalogInputRange1 byte
 	AnalogInput0      float64
@@ -60,8 +57,7 @@ type ToolData struct {
 	ToolMode          byte
 }
 
-// MasterboardData TODO.
-type MasterboardData struct {
+type masterboardData struct {
 	DigitalInputBits                 int32
 	DigitalOutputBits                int32
 	AnalogInputRange0                byte
@@ -85,8 +81,7 @@ type MasterboardData struct {
 	NotUsed2                         byte
 }
 
-// CartesianInfo TODO.
-type CartesianInfo struct {
+type cartesianInfo struct {
 	X           float64
 	Y           float64
 	Z           float64
@@ -101,20 +96,17 @@ type CartesianInfo struct {
 	TCPOffsetRz float64
 }
 
-// SimpleString TODO.
-func (c CartesianInfo) SimpleString() string {
+func (c cartesianInfo) SimpleString() string {
 	return fmt.Sprintf("x: %f | y: %f | z: %f | Rx: %f | Ry: %f | Rz : %f",
 		c.X, c.Y, c.Z, c.Rx, c.Ry, c.Rz)
 }
 
-// NondelimitedString TODO.
-func (c CartesianInfo) NondelimitedString() string {
+func (c cartesianInfo) NondelimitedString() string {
 	return fmt.Sprintf("%f %f %f %f %f %f",
 		c.X, c.Y, c.Z, c.Rx, c.Ry, c.Rz)
 }
 
-// KinematicInfo TODO.
-type KinematicInfo struct {
+type kinematicInfo struct {
 	Cheksum int32
 	DHtheta float64
 	DHa     float64
@@ -122,8 +114,7 @@ type KinematicInfo struct {
 	Dhalpha float64
 }
 
-// ForceModeData TODO.
-type ForceModeData struct {
+type forceModeData struct {
 	Fx             float64
 	Fy             float64
 	Fz             float64
@@ -133,29 +124,28 @@ type ForceModeData struct {
 	RobotDexterity float64
 }
 
-// AdditionalInfo additional info from ur arm.
-type AdditionalInfo struct {
+// additionalInfo contains additional info from ur arm.
+type additionalInfo struct {
 	TpButtonState          byte
 	FreedriveButtonEnabled bool
 	IOEnabledFreedrive     bool
 	Reserved               byte
 }
 
-// RobotState TODO.
-type RobotState struct {
-	RobotModeData
-	Joints []JointData
-	ToolData
-	MasterboardData
-	CartesianInfo
-	Kinematics []KinematicInfo
-	ForceModeData
-	AdditionalInfo
+type robotState struct {
+	robotModeData
+	Joints []jointData
+	toolData
+	masterboardData
+	cartesianInfo
+	Kinematics []kinematicInfo
+	forceModeData
+	additionalInfo
 	creationTime time.Time
 }
 
-func readRobotStateMessage(buf []byte, logger golog.Logger) (RobotState, error) {
-	state := RobotState{
+func readRobotStateMessage(ctx context.Context, buf []byte, logger logging.Logger) (robotState, error) {
+	state := robotState{
 		creationTime: time.Now(),
 	}
 
@@ -169,12 +159,12 @@ func readRobotStateMessage(buf []byte, logger golog.Logger) (RobotState, error) 
 
 		switch packageType {
 		case 0:
-			if err := binary.Read(buffer, binary.BigEndian, &state.RobotModeData); err != nil && !errors.Is(err, io.EOF) {
+			if err := binary.Read(buffer, binary.BigEndian, &state.robotModeData); err != nil && !errors.Is(err, io.EOF) {
 				return state, err
 			}
 		case 1:
 			for {
-				d := JointData{}
+				d := jointData{}
 				err := binary.Read(buffer, binary.BigEndian, &d)
 				if err != nil {
 					if errors.Is(err, io.EOF) {
@@ -185,20 +175,20 @@ func readRobotStateMessage(buf []byte, logger golog.Logger) (RobotState, error) 
 				state.Joints = append(state.Joints, d)
 			}
 		case 2:
-			if err := binary.Read(buffer, binary.BigEndian, &state.ToolData); err != nil && !errors.Is(err, io.EOF) {
+			if err := binary.Read(buffer, binary.BigEndian, &state.toolData); err != nil && !errors.Is(err, io.EOF) {
 				return state, err
 			}
 		case 3:
-			if err := binary.Read(buffer, binary.BigEndian, &state.MasterboardData); err != nil && !errors.Is(err, io.EOF) {
+			if err := binary.Read(buffer, binary.BigEndian, &state.masterboardData); err != nil && !errors.Is(err, io.EOF) {
 				return state, err
 			}
 		case 4:
-			if err := binary.Read(buffer, binary.BigEndian, &state.CartesianInfo); err != nil && !errors.Is(err, io.EOF) {
+			if err := binary.Read(buffer, binary.BigEndian, &state.cartesianInfo); err != nil && !errors.Is(err, io.EOF) {
 				return state, err
 			}
 		case 5:
 			for buffer.Len() > 4 {
-				d := KinematicInfo{}
+				d := kinematicInfo{}
 				err := binary.Read(buffer, binary.BigEndian, &d)
 				if err != nil {
 					if errors.Is(err, io.EOF) {
@@ -211,11 +201,11 @@ func readRobotStateMessage(buf []byte, logger golog.Logger) (RobotState, error) 
 		case 6:
 			// Configuration data, skipping, don't think we need
 		case 7:
-			if err := binary.Read(buffer, binary.BigEndian, &state.ForceModeData); err != nil && !errors.Is(err, io.EOF) {
+			if err := binary.Read(buffer, binary.BigEndian, &state.forceModeData); err != nil && !errors.Is(err, io.EOF) {
 				return state, err
 			}
 		case 8:
-			if err := binary.Read(buffer, binary.BigEndian, &state.AdditionalInfo); err != nil && !errors.Is(err, io.EOF) {
+			if err := binary.Read(buffer, binary.BigEndian, &state.additionalInfo); err != nil && !errors.Is(err, io.EOF) {
 				return state, err
 			}
 		case 9:
@@ -227,7 +217,7 @@ func readRobotStateMessage(buf []byte, logger golog.Logger) (RobotState, error) 
 		case 12:
 			// Tool mode info, skipping, don't think we need
 		default:
-			logger.Debugf("unknown packageType: %d size: %d content size: %d\n", packageType, sz, len(content))
+			logger.CDebugf(ctx, "unknown packageType: %d size: %d content size: %d\n", packageType, sz, len(content))
 		}
 	}
 
@@ -235,7 +225,7 @@ func readRobotStateMessage(buf []byte, logger golog.Logger) (RobotState, error) 
 }
 
 // return userErr, error.
-func readURRobotMessage(buf []byte, logger golog.Logger) error {
+func readURRobotMessage(ctx context.Context, buf []byte, logger logging.Logger) error {
 	ts := binary.BigEndian.Uint64(buf[1:])
 	// messageSource := buf[9]
 	robotMessageType := buf[10]
@@ -244,7 +234,7 @@ func readURRobotMessage(buf []byte, logger golog.Logger) error {
 
 	switch robotMessageType {
 	case 0: // text?
-		logger.Debugf("ur log: %s\n", string(buf))
+		logger.CDebugf(ctx, "ur log: %s\n", string(buf))
 
 	case 6: // error
 		robotMessageCode := binary.BigEndian.Uint32(buf)
@@ -254,7 +244,7 @@ func readURRobotMessage(buf []byte, logger golog.Logger) error {
 		robotMessageData := binary.BigEndian.Uint32(buf[16:])
 		robotCommTextMessage := string(buf[20:])
 
-		logger.Debugf("robot error! code: C%dA%d reportLevel: %d, dataType: %d, data: %d, msg: %s\n",
+		logger.CDebugf(ctx, "robot error! code: C%dA%d reportLevel: %d, dataType: %d, data: %d, msg: %s\n",
 			robotMessageCode, robotMessageArgument, robotMessageReportLevel, robotMessageDataType, robotMessageData, robotCommTextMessage)
 
 	case 3: // Version
@@ -267,16 +257,16 @@ func readURRobotMessage(buf []byte, logger golog.Logger) error {
 		bugFixVersion := binary.BigEndian.Uint32(buf[pos+2:])
 		buildNumber := binary.BigEndian.Uint32(buf[pos+8:])
 
-		logger.Debugf("UR version %v.%v.%v.%v\n", majorVersion, minorVersion, bugFixVersion, buildNumber)
+		logger.CDebugf(ctx, "UR version %v.%v.%v.%v\n", majorVersion, minorVersion, bugFixVersion, buildNumber)
 
 	case 12: // i have no idea what this is
 		if len(buf) != 9 {
-			logger.Debugf("got a weird robot message of type 12 with bad length: %d\n", len(buf))
+			logger.CDebugf(ctx, "got a weird robot message of type 12 with bad length: %d\n", len(buf))
 		} else {
 			a := binary.BigEndian.Uint64(buf)
 			b := buf[8]
 			if a != 0 || b != 1 {
-				logger.Debugf("got a weird robot message of type 12 with bad data: %v %v\n", a, b)
+				logger.CDebugf(ctx, "got a weird robot message of type 12 with bad data: %v %v\n", a, b)
 			}
 		}
 
@@ -289,7 +279,7 @@ func readURRobotMessage(buf []byte, logger golog.Logger) error {
 
 		if false {
 			// TODO(erh): this is better than sleeping in other code, be smart!!
-			logger.Debugf("KeyMessage robotMessageCode: %d robotMessageArgument: %d robotMessageTitle: %s keyTextMessage: %s\n",
+			logger.CDebugf(ctx, "KeyMessage robotMessageCode: %d robotMessageArgument: %d robotMessageTitle: %s keyTextMessage: %s\n",
 				robotMessageCode, robotMessageArgument, robotMessageTitle, keyTextMessage)
 		}
 	case 10: // ROBOT_MESSAGE_TYPE_RUNTIME_EXCEPTION
@@ -299,7 +289,7 @@ func readURRobotMessage(buf []byte, logger golog.Logger) error {
 		runtimeErr := errors.Errorf("runtime error at line: %d col: %d msg: %s", scriptLineNumber, scriptColumnNumber, msg)
 		return runtimeErr
 	default:
-		logger.Debugf("unknown robotMessageType: %d ts: %v %v\n", robotMessageType, ts, buf)
+		logger.CDebugf(ctx, "unknown robotMessageType: %d ts: %v %v\n", robotMessageType, ts, buf)
 		return nil
 	}
 

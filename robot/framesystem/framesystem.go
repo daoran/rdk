@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/edaniels/golog"
 	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/pkg/errors"
 	"go.opencensus.io/trace"
 
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/pointcloud"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/resource"
@@ -30,17 +30,60 @@ var API = resource.APINamespaceRDKInternal.WithServiceType(SubtypeName)
 // InternalServiceName is used to refer to/depend on this service internally.
 var InternalServiceName = resource.NewName(API, "builtin")
 
+// InputEnabled is a standard interface for all things that interact with the frame system
+// This allows us to figure out where they currently are, and then move them.
+// Input units are always in meters or radians.
+type InputEnabled interface {
+	CurrentInputs(ctx context.Context) ([]referenceframe.Input, error)
+	GoToInputs(context.Context, ...[]referenceframe.Input) error
+}
+
 // A Service that returns the frame system for a robot.
+//
+// TransformPose example:
+//
+//	// Define a Pose coincident with the world reference frame
+//	firstPose := spatialmath.NewZeroPose
+//
+//	// Establish the world as the reference for firstPose
+//	firstPoseInFrame := referenceframe.NewPoseInFrame(referenceframe.World, firstPose)
+//
+//	// Calculate firstPoseInFrame from the perspective of the origin frame of myArm
+//	transformedPoseInFrame, err := machine.TransformPose(context.Background(), firstPoseInFrame, "myArm", nil)
+//
+// TransformPointCloud example:
+//
+//	// Create an empty slice to store point cloud data.
+//	pointClouds := make([]pointcloud.PointCloud, 0)
+//
+//	// Transform the first point cloud in the list from its reference frame to the frame of 'myArm'.
+//	transformed, err := fsService.TransformPointCloud(context.Background(), pointClouds[0], referenceframe.World, "myArm")
+//
+// CurrentInputs example:
+//
+//	myCurrentInputs, err := fsService.CurrentInputs(context.Background())
+//
+//	frameSystem, err := fsService.FrameSystem(context.Background(), nil)
 type Service interface {
 	resource.Resource
+
+	// TransformPose returns a transformed pose in the destination reference frame.
+	// This method converts a given source pose from one reference frame to a specified destination frame.
 	TransformPose(
 		ctx context.Context,
 		pose *referenceframe.PoseInFrame,
 		dst string,
 		additionalTransforms []*referenceframe.LinkInFrame,
 	) (*referenceframe.PoseInFrame, error)
+
+	// TransformPointCloud returns a new point cloud with points adjusted from one reference frame to a specified destination frame.
 	TransformPointCloud(ctx context.Context, srcpc pointcloud.PointCloud, srcName, dstName string) (pointcloud.PointCloud, error)
-	CurrentInputs(ctx context.Context) (map[string][]referenceframe.Input, map[string]referenceframe.InputEnabled, error)
+
+	// CurrentInputs returns a map of the current inputs for each component of a machine's frame system
+	// and a map of statuses indicating which of the machine's components may be actuated through input values.
+	CurrentInputs(ctx context.Context) (referenceframe.FrameSystemInputs, map[string]InputEnabled, error)
+
+	// FrameSystem returns the frame system of the machine and incorporates any specified additional transformations.
 	FrameSystem(ctx context.Context, additionalTransforms []*referenceframe.LinkInFrame) (referenceframe.FrameSystem, error)
 }
 
@@ -50,7 +93,7 @@ func FromDependencies(deps resource.Dependencies) (Service, error) {
 }
 
 // New returns a new frame system service for the given robot.
-func New(ctx context.Context, deps resource.Dependencies, logger golog.Logger) (Service, error) {
+func New(ctx context.Context, deps resource.Dependencies, logger logging.Logger) (Service, error) {
 	fs := &frameSystemService{
 		Named:      InternalServiceName.AsNamed(),
 		components: make(map[string]resource.Resource),
@@ -80,6 +123,9 @@ type Config struct {
 
 // String prints out a table of each frame in the system, with columns of name, parent, translation and orientation.
 func (cfg Config) String() string {
+	if len(cfg.Parts) == 0 {
+		return "empty frame system"
+	}
 	t := table.NewWriter()
 	t.AppendHeader(table.Row{"#", "Name", "Parent", "Translation", "Orientation", "Geometry"})
 	t.AppendRow([]interface{}{"0", referenceframe.World, "", "", "", ""})
@@ -89,7 +135,7 @@ func (cfg Config) String() string {
 		ori := pose.Orientation().EulerAngles()
 		geomString := ""
 		if gc := part.FrameConfig.Geometry(); gc != nil {
-			geomString = gc.String()
+			geomString = fmt.Sprint(gc)
 		}
 		t.AppendRow([]interface{}{
 			fmt.Sprintf("%d", i+1),
@@ -105,7 +151,7 @@ func (cfg Config) String() string {
 			geomString,
 		})
 	}
-	return t.Render()
+	return "\n" + t.Render()
 }
 
 // the frame system service collects all the relevant parts that make up the frame system from the robot
@@ -114,7 +160,7 @@ type frameSystemService struct {
 	resource.Named
 	resource.TriviallyCloseable
 	components map[string]resource.Resource
-	logger     golog.Logger
+	logger     logging.Logger
 
 	parts   []*referenceframe.FrameSystemPart
 	partsMu sync.RWMutex
@@ -149,7 +195,7 @@ func (svc *frameSystemService) Reconfigure(ctx context.Context, deps resource.De
 		return err
 	}
 	svc.parts = sortedParts
-	svc.logger.Debugf("updated robot frame system:\n%v", (&Config{Parts: sortedParts}).String())
+	svc.logger.Debugf("reconfigured robot frame system: %v", (&Config{Parts: sortedParts}).String())
 	return nil
 }
 
@@ -167,7 +213,7 @@ func (svc *frameSystemService) TransformPose(
 	if err != nil {
 		return nil, err
 	}
-	input := referenceframe.StartPositions(fs)
+	input := referenceframe.NewZeroInputs(fs)
 
 	svc.partsMu.RLock()
 	defer svc.partsMu.RUnlock()
@@ -184,7 +230,7 @@ func (svc *frameSystemService) TransformPose(
 		if !ok {
 			return nil, DependencyNotFoundError(name)
 		}
-		inputEnabled, ok := component.(referenceframe.InputEnabled)
+		inputEnabled, ok := component.(InputEnabled)
 		if !ok {
 			return nil, NotInputEnabledError(component)
 		}
@@ -209,15 +255,15 @@ func (svc *frameSystemService) TransformPose(
 // InputEnabled resources that those inputs came from.
 func (svc *frameSystemService) CurrentInputs(
 	ctx context.Context,
-) (map[string][]referenceframe.Input, map[string]referenceframe.InputEnabled, error) {
+) (referenceframe.FrameSystemInputs, map[string]InputEnabled, error) {
 	fs, err := svc.FrameSystem(ctx, []*referenceframe.LinkInFrame{})
 	if err != nil {
 		return nil, nil, err
 	}
-	input := referenceframe.StartPositions(fs)
+	input := referenceframe.NewZeroInputs(fs)
 
 	// build maps of relevant components and inputs from initial inputs
-	resources := map[string]referenceframe.InputEnabled{}
+	resources := map[string]InputEnabled{}
 	for name, original := range input {
 		// skip frames with no input
 		if len(original) == 0 {
@@ -229,7 +275,7 @@ func (svc *frameSystemService) CurrentInputs(
 		if !ok {
 			return nil, nil, DependencyNotFoundError(name)
 		}
-		inputEnabled, ok := component.(referenceframe.InputEnabled)
+		inputEnabled, ok := component.(InputEnabled)
 		if !ok {
 			return nil, nil, NotInputEnabledError(component)
 		}

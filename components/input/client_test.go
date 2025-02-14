@@ -6,19 +6,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/edaniels/golog"
 	"go.viam.com/test"
 	"go.viam.com/utils/rpc"
 
 	"go.viam.com/rdk/components/input"
 	viamgrpc "go.viam.com/rdk/grpc"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/testutils"
 	"go.viam.com/rdk/testutils/inject"
 )
 
 func TestClient(t *testing.T) {
-	logger := golog.NewTestLogger(t)
+	logger := logging.NewTestLogger(t)
 	listener1, err := net.Listen("tcp", "localhost:0")
 	test.That(t, err, test.ShouldBeNil)
 	rpcServer, err := rpc.NewServer(logger, rpc.WithUnauthenticated())
@@ -61,10 +61,10 @@ func TestClient(t *testing.T) {
 
 	injectInputController2 := &inject.InputController{}
 	injectInputController2.ControlsFunc = func(ctx context.Context, extra map[string]interface{}) ([]input.Control, error) {
-		return nil, errControlsFailed
+		return nil, nil
 	}
 	injectInputController2.EventsFunc = func(ctx context.Context, extra map[string]interface{}) (map[input.Control]input.Event, error) {
-		return nil, errEventsFailed
+		return nil, nil
 	}
 
 	resources := map[resource.Name]input.Controller{
@@ -96,6 +96,11 @@ func TestClient(t *testing.T) {
 		test.That(t, err, test.ShouldBeNil)
 		inputController1Client, err := input.NewClientFromConn(context.Background(), conn, "", input.Named(testInputControllerName), logger)
 		test.That(t, err, test.ShouldBeNil)
+
+		defer func() {
+			test.That(t, inputController1Client.Close(context.Background()), test.ShouldBeNil)
+			test.That(t, conn.Close(), test.ShouldBeNil)
+		}()
 
 		// DoCommand
 		resp, err := inputController1Client.DoCommand(context.Background(), testutils.TestCommand)
@@ -232,9 +237,6 @@ func TestClient(t *testing.T) {
 		test.That(t, injectedEvent, test.ShouldResemble, event1)
 		test.That(t, extraOptions, test.ShouldResemble, extra)
 		injectInputController.TriggerEventFunc = nil
-
-		test.That(t, inputController1Client.Close(context.Background()), test.ShouldBeNil)
-		test.That(t, conn.Close(), test.ShouldBeNil)
 	})
 
 	t.Run("input controller client 2", func(t *testing.T) {
@@ -243,13 +245,18 @@ func TestClient(t *testing.T) {
 		client2, err := resourceAPI.RPCClient(context.Background(), conn, "", input.Named(failInputControllerName), logger)
 		test.That(t, err, test.ShouldBeNil)
 
+		defer func() {
+			test.That(t, client2.Close(context.Background()), test.ShouldBeNil)
+			test.That(t, conn.Close(), test.ShouldBeNil)
+		}()
+
 		_, err = client2.Controls(context.Background(), map[string]interface{}{})
 		test.That(t, err, test.ShouldNotBeNil)
-		test.That(t, err.Error(), test.ShouldContainSubstring, errControlsFailed.Error())
+		test.That(t, err.Error(), test.ShouldContainSubstring, input.ErrControlsNil(failInputControllerName).Error())
 
 		_, err = client2.Events(context.Background(), map[string]interface{}{})
 		test.That(t, err, test.ShouldNotBeNil)
-		test.That(t, err.Error(), test.ShouldContainSubstring, errEventsFailed.Error())
+		test.That(t, err.Error(), test.ShouldContainSubstring, input.ErrEventsNil(failInputControllerName).Error())
 
 		event1 := input.Event{
 			Time:    time.Now().UTC(),
@@ -262,8 +269,76 @@ func TestClient(t *testing.T) {
 		err = injectable.TriggerEvent(context.Background(), event1, map[string]interface{}{})
 		test.That(t, err, test.ShouldNotBeNil)
 		test.That(t, err.Error(), test.ShouldContainSubstring, "not of type Triggerable")
-
-		test.That(t, client2.Close(context.Background()), test.ShouldBeNil)
-		test.That(t, conn.Close(), test.ShouldBeNil)
 	})
+}
+
+func TestClientRace(t *testing.T) {
+	logger := logging.NewTestLogger(t)
+	listener1, err := net.Listen("tcp", "localhost:0")
+	test.That(t, err, test.ShouldBeNil)
+	rpcServer, err := rpc.NewServer(logger, rpc.WithUnauthenticated())
+	test.That(t, err, test.ShouldBeNil)
+
+	injectInputController := &inject.TriggerableInputController{}
+	injectInputController.RegisterControlCallbackFunc = func(
+		ctx context.Context,
+		control input.Control,
+		triggers []input.EventType,
+		ctrlFunc input.ControlFunction,
+		extra map[string]interface{},
+	) error {
+		return nil
+	}
+
+	resources := map[resource.Name]input.Controller{
+		input.Named(testInputControllerName): injectInputController,
+	}
+	inputControllerSvc, err := resource.NewAPIResourceCollection(input.API, resources)
+	test.That(t, err, test.ShouldBeNil)
+	resourceAPI, ok, err := resource.LookupAPIRegistration[input.Controller](input.API)
+	test.That(t, err, test.ShouldBeNil)
+	test.That(t, ok, test.ShouldBeTrue)
+	test.That(t, resourceAPI.RegisterRPCService(context.Background(), rpcServer, inputControllerSvc), test.ShouldBeNil)
+
+	go rpcServer.Serve(listener1)
+	defer rpcServer.Stop()
+
+	conn, err := viamgrpc.Dial(context.Background(), listener1.Addr().String(), logger)
+	test.That(t, err, test.ShouldBeNil)
+	inputController1Client, err := input.NewClientFromConn(context.Background(), conn, "", input.Named(testInputControllerName), logger)
+	test.That(t, err, test.ShouldBeNil)
+
+	defer func() {
+		test.That(t, inputController1Client.Close(context.Background()), test.ShouldBeNil)
+		test.That(t, conn.Close(), test.ShouldBeNil)
+	}()
+
+	extra := map[string]interface{}{"foo": "RegisterControlCallback"}
+	ctrlFuncIn := func(ctx context.Context, event input.Event) {}
+	err = inputController1Client.RegisterControlCallback(
+		context.Background(),
+		input.ButtonStart,
+		[]input.EventType{input.ButtonRelease},
+		ctrlFuncIn,
+		extra,
+	)
+	test.That(t, err, test.ShouldBeNil)
+
+	err = inputController1Client.RegisterControlCallback(
+		context.Background(),
+		input.AbsoluteX,
+		[]input.EventType{input.PositionChangeAbs},
+		ctrlFuncIn,
+		extra,
+	)
+	test.That(t, err, test.ShouldBeNil)
+
+	err = inputController1Client.RegisterControlCallback(
+		context.Background(),
+		input.AbsoluteX,
+		[]input.EventType{input.PositionChangeAbs},
+		ctrlFuncIn,
+		extra,
+	)
+	test.That(t, err, test.ShouldBeNil)
 }

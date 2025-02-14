@@ -5,7 +5,7 @@ implementation of an API), and Name (which represents a specific instantiation o
 
 Both API and Model have a "triplet" format that begins with a namespace. API has "namespace:type:subtype" with "type" in this
 case being either "service" or "component." Model has "namespace:modelfamily:modelname" with "modelfamily" being somewhat arbitrary
-and useful mostly for organization/grouping. Note that each "tier" contains the tier to the left it. Such that ModelFamily contains
+and useful mostly for organization/grouping. Note that each "tier" contains the tier to the left of it. Such that ModelFamily contains
 Namespace, and Model itself contains ModelFamily.
 
 An example resource (say, a motor) may use the motor API and thus have the API "rdk:component:motor" and have a model such as
@@ -25,6 +25,7 @@ import (
 	"github.com/jhump/protoreflect/desc"
 	"github.com/pkg/errors"
 
+	"go.viam.com/rdk/cloud"
 	"go.viam.com/rdk/spatialmath"
 	"go.viam.com/rdk/utils"
 )
@@ -37,7 +38,7 @@ const (
 
 var (
 	reservedChars     = [...]string{":", "+"} // colons are delimiters for remote names, plus signs are used for WebRTC track names.
-	resRegexValidator = regexp.MustCompile(`^([\w-]+:[\w-]+:(?:[\w-]+))\/?([\w-]+:(?:[\w-]+:)*)?(.+)?$`)
+	resRegexValidator = regexp.MustCompile(`^([\w-]+:[\w-]+:(?:[\w-]+))\/([\w-]+:(?:[\w-]+:)*)?(.+)?$`)
 )
 
 // A Resource is the fundamental building block of a robot; it is either a component or a service
@@ -46,7 +47,28 @@ var (
 // to reconfigure themselves (or signal that they must be rebuilt).
 // Resources that fail to reconfigure or rebuild may be closed and must return
 // errors when in a closed state for all non Close methods.
+//
+// Name example:
+//
+//	// Get the Name of an arm component.
+//	myArmName := myArm.Name()
+//
+// DoCommand example:
+//
+//	// This example shows using DoCommand with an arm component.
+//	myArm, err := arm.FromRobot(machine, "my_arm")
+//
+//	command := map[string]interface{}{"cmd": "test", "data1": 500}
+//	result, err := myArm.DoCommand(context.Background(), command)
+//
+// Close example:
+//
+//	// This example shows using Close with an arm component.
+//	myArm, err := arm.FromRobot(machine, "my_arm")
+//
+//	err = myArm.Close(context.Background())
 type Resource interface {
+	// Get the Name of the resource.
 	Name() Name
 
 	// Reconfigure must reconfigure the resource atomically and in place. If this
@@ -127,16 +149,67 @@ func ContainsReservedCharacter(val string) error {
 	return nil
 }
 
+// A Sensor represents a general purpose sensor that can give arbitrary readings
+// of all readings that it is sensing.
+// For more information, see the [sensor component docs].
+//
+// Readings example:
+//
+//	// Get the readings provided by the sensor.
+//	readings, err := mySensor.Readings(context.Background(), nil)
+//
+// For more information, see the [Readings method docs].
+//
+// [sensor component docs]: https://docs.viam.com/dev/reference/apis/components/sensor/
+// [Readings method docs]: https://docs.viam.com/dev/reference/apis/components/sensor/#getreadings
+type Sensor interface {
+	// Readings return data specific to the type of sensor and can be of any type.
+	Readings(ctx context.Context, extra map[string]interface{}) (map[string]interface{}, error)
+}
+
 // Actuator is any resource that can move.
+//
+// IsMoving example:
+//
+//	// This example shows using IsMoving with an arm component.
+//	myArm, err := arm.FromRobot(machine, "my_arm")
+//
+//	// Stop all motion of the arm. It is assumed that the arm stops immediately.
+//	myArm.Stop(context.Background(), nil)
+//
+//	// Log if the arm is currently moving.
+//	is_moving, err := myArm.IsMoving(context.Background())
+//	logger.Info(is_moving)
+//
+// Stop example:
+//
+//	// This example shows using Stop with an arm component.
+//	myArm, err := arm.FromRobot(machine, "my_arm")
+//
+//	// Stop all motion of the arm. It is assumed that the arm stops immediately.
+//	err = myArm.Stop(context.Background(), nil)
 type Actuator interface {
-	// IsMoving returns whether the resource is moving or not
+	// IsMoving returns whether the resource is moving or not.
 	IsMoving(context.Context) (bool, error)
 
-	// Stop stops all movement for the resource
+	// Stop stops all movement for the resource.
 	Stop(context.Context, map[string]interface{}) error
 }
 
 // Shaped is any resource that can have geometries.
+//
+// Geometries example:
+//
+//	// This example shows using Geometries with an arm component.
+//	myArm, err := arm.FromRobot(machine, "my_arm")
+//
+//	geometries, err := myArm.Geometries(context.Background(), nil)
+//
+//	if len(geometries) > 0 {
+//	   // Get the center of the first geometry
+//	   elem := geometries[0]
+//	   fmt.Println("Pose of the first geometry's center point:", elem.Pose())
+//	}
 type Shaped interface {
 	// Geometries returns the list of geometries associated with the resource, in any order. The poses of the geometries reflect their
 	// current location relative to the frame of the resource.
@@ -157,7 +230,7 @@ func (t TriviallyReconfigurable) Reconfigure(ctx context.Context, deps Dependenc
 
 // TriviallyCloseable is to be embedded by any resource that does not care about
 // handling Closes. When is used, it is assumed that the resource does not need
-// to return errors when furture non-Close methods are called.
+// to return errors when future non-Close methods are called.
 type TriviallyCloseable struct{}
 
 // Close always returns no error.
@@ -234,4 +307,10 @@ func NewCloseOnlyResource(name Name, closeFunc func(ctx context.Context) error) 
 
 func (r *closeOnlyResource) Close(ctx context.Context) error {
 	return r.closeFunc(ctx)
+}
+
+// Status is a combination of a resources node status and the cloudMetadata associated with that resource.
+type Status struct {
+	NodeStatus
+	CloudMetadata cloud.Metadata
 }

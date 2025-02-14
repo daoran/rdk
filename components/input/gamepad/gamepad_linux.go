@@ -13,12 +13,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/pkg/errors"
 	"github.com/viamrobotics/evdev"
 	"go.viam.com/utils"
 
 	"go.viam.com/rdk/components/input"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 )
 
@@ -39,7 +39,7 @@ func init() {
 	})
 }
 
-func createController(_ context.Context, name resource.Name, logger golog.Logger, devFile string, reconnect bool) input.Controller {
+func createController(_ context.Context, name resource.Name, logger logging.Logger, devFile string, reconnect bool) input.Controller {
 	ctxWithCancel, cancel := context.WithCancel(context.Background())
 	g := gamepad{
 		Named:      name.AsNamed(),
@@ -65,10 +65,9 @@ func createController(_ context.Context, name resource.Name, logger golog.Logger
 						g.logger.Error(err)
 					}
 					continue
-				} else {
-					g.logger.Error(err)
-					return
 				}
+				g.logger.Error(err)
+				return
 			}
 			g.eventDispatcher(ctxWithCancel)
 		}
@@ -77,7 +76,9 @@ func createController(_ context.Context, name resource.Name, logger golog.Logger
 }
 
 // NewController creates a new gamepad.
-func NewController(ctx context.Context, _ resource.Dependencies, conf resource.Config, logger golog.Logger) (input.Controller, error) {
+func NewController(
+	ctx context.Context, _ resource.Dependencies, conf resource.Config, logger logging.Logger,
+) (input.Controller, error) {
 	return createController(
 		ctx,
 		conf.ResourceName(),
@@ -96,7 +97,7 @@ type gamepad struct {
 	Mapping                 Mapping
 	controls                []input.Control
 	lastEvents              map[input.Control]input.Event
-	logger                  golog.Logger
+	logger                  logging.Logger
 	mu                      sync.RWMutex
 	activeBackgroundWorkers sync.WaitGroup
 	cancelFunc              func()
@@ -127,7 +128,7 @@ func (g *gamepad) eventDispatcher(ctx context.Context) {
 		case <-ctx.Done():
 			err := g.dev.Close()
 			if err != nil {
-				g.logger.Error(err)
+				g.logger.CError(ctx, err)
 			}
 			return
 		case eventIn := <-evChan:
@@ -147,12 +148,12 @@ func (g *gamepad) eventDispatcher(ctx context.Context) {
 					g.sendConnectionStatus(ctx, false)
 					err := g.dev.Close()
 					if err != nil {
-						g.logger.Error(err)
+						g.logger.CError(ctx, err)
 					}
 					g.dev = nil
 					return
 				}
-				g.logger.Debugf("unhandled event: %+v", eventIn)
+				g.logger.CDebugf(ctx, "unhandled event: %+v", eventIn)
 
 			case evdev.EventAbsolute:
 				thisAxis, ok := g.Mapping.Axes[eventIn.Type.(evdev.AbsoluteType)]
@@ -217,7 +218,7 @@ func (g *gamepad) eventDispatcher(ctx context.Context) {
 				evdev.EventSwitch:
 				fallthrough
 			default:
-				g.logger.Debugf("unhandled event: %+v", eventIn)
+				g.logger.CDebugf(ctx, "unhandled event: %+v", eventIn)
 			}
 
 			g.makeCallbacks(ctx, eventOut)
@@ -303,15 +304,14 @@ func (g *gamepad) connectDev(ctx context.Context) error {
 		name = strings.TrimSpace(name)
 		mapping, ok := MappingForModel(name)
 		if ok {
-			g.logger.Infof("found known gamepad: '%s' at %s", name, n)
+			g.logger.CInfof(ctx, "found known gamepad: '%s' at %s", name, n)
 			g.dev = dev
 			g.Model = g.dev.Name()
 			g.Mapping = mapping
 			break
-		} else {
-			if err := dev.Close(); err != nil {
-				return err
-			}
+		}
+		if err := dev.Close(); err != nil {
+			return err
 		}
 	}
 
@@ -324,16 +324,15 @@ func (g *gamepad) connectDev(ctx context.Context) error {
 			}
 			if isGamepad(dev) {
 				name := dev.Name()
-				g.logger.Infof("found gamepad: '%s' at %s", name, n)
-				g.logger.Infof("no button mapping for '%s', using default: '%s'", name, defaultMapping)
+				g.logger.CInfof(ctx, "found gamepad: '%s' at %s", name, n)
+				g.logger.CInfof(ctx, "no button mapping for '%s', using default: '%s'", name, defaultMapping)
 				g.dev = dev
 				g.Model = g.dev.Name()
 				g.Mapping, _ = MappingForModel(defaultMapping)
 				break
-			} else {
-				if err := dev.Close(); err != nil {
-					return err
-				}
+			}
+			if err := dev.Close(); err != nil {
+				return err
 			}
 		}
 	}
@@ -362,7 +361,7 @@ func (g *gamepad) Close(ctx context.Context) error {
 	g.activeBackgroundWorkers.Wait()
 	if g.dev != nil {
 		if err := g.dev.Close(); err != nil {
-			g.logger.Error(err)
+			g.logger.CError(ctx, err)
 		}
 	}
 	return nil

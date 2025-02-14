@@ -6,23 +6,26 @@ package server
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
+	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/pkg/errors"
+	"go.uber.org/zap/zapcore"
 	commonpb "go.viam.com/api/common/v1"
 	pb "go.viam.com/api/robot/v1"
 	"go.viam.com/utils"
 	vprotoutils "go.viam.com/utils/protoutils"
 	"go.viam.com/utils/rpc"
-	"google.golang.org/grpc/codes"
-	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/operation"
 	"go.viam.com/rdk/pointcloud"
 	"go.viam.com/rdk/protoutils"
@@ -30,39 +33,89 @@ import (
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/robot"
 	"go.viam.com/rdk/session"
+	"go.viam.com/rdk/tunnel"
+)
+
+// logTSKey is the key used in conjunction with the timestamp of logs received
+// by the RDK.
+const (
+	logTSKey = "log_ts"
 )
 
 // Server implements the contract from robot.proto that ultimately satisfies
 // a robot.Robot as a gRPC server.
 type Server struct {
 	pb.UnimplementedRobotServiceServer
-	r                       robot.Robot
-	activeBackgroundWorkers sync.WaitGroup
-	cancelCtx               context.Context
-	cancel                  func()
+	robot robot.Robot
 }
 
 // New constructs a gRPC service server for a Robot.
-func New(r robot.Robot) pb.RobotServiceServer {
-	cancelCtx, cancel := context.WithCancel(context.Background())
+func New(robot robot.Robot) pb.RobotServiceServer {
 	return &Server{
-		r:         r,
-		cancelCtx: cancelCtx,
-		cancel:    cancel,
+		robot: robot,
 	}
 }
 
 // Close cleanly shuts down the server.
 func (s *Server) Close() {
-	s.cancel()
-	s.activeBackgroundWorkers.Wait()
+}
+
+// Tunnel tunnels traffic to/from the client from/to a specified port on the server.
+func (s *Server) Tunnel(srv pb.RobotService_TunnelServer) error {
+	req, err := srv.Recv()
+	if err != nil {
+		return fmt.Errorf("failed to receive first message from stream: %w", err)
+	}
+
+	dest := strconv.Itoa(int(req.DestinationPort))
+	s.robot.Logger().CDebugw(srv.Context(), "dialing to destination port", "port", dest)
+
+	dialTimeout := 10 * time.Second
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", dest), dialTimeout)
+	if err != nil {
+		return fmt.Errorf("failed to dial to destination port %v: %w", dest, err)
+	}
+	s.robot.Logger().CInfow(srv.Context(), "successfully dialed to destination port, creating tunnel", "port", dest)
+
+	var (
+		wg              sync.WaitGroup
+		readerSenderErr error
+	)
+	connClosed := make(chan struct{})
+	rsDone := make(chan struct{})
+	wg.Add(1)
+	utils.PanicCapturingGo(func() {
+		defer func() {
+			close(rsDone)
+			wg.Done()
+		}()
+		// a max of 32kb will be sent per message (based on io.Copy's default buffer size)
+		sendFunc := func(data []byte) error { return srv.Send(&pb.TunnelResponse{Data: data}) }
+		readerSenderErr = tunnel.ReaderSenderLoop(srv.Context(), conn, sendFunc, connClosed, s.robot.Logger().WithFields("loop", "reader/sender"))
+	})
+	recvFunc := func() ([]byte, error) {
+		req, err := srv.Recv()
+		if err != nil {
+			return nil, err
+		}
+		return req.Data, nil
+	}
+	recvWriterErr := tunnel.RecvWriterLoop(srv.Context(), recvFunc, conn, rsDone, s.robot.Logger().WithFields("loop", "recv/writer"))
+	// close the connection to unblock the read
+	// close the channel first so that network errors can be filtered
+	// and prevented in the ReaderSenderLoop.
+	close(connClosed)
+	err = conn.Close()
+	wg.Wait()
+	s.robot.Logger().CInfow(srv.Context(), "tunnel to client closed", "port", dest)
+	return errors.Join(err, readerSenderErr, recvWriterErr)
 }
 
 // GetOperations lists all running operations.
 func (s *Server) GetOperations(ctx context.Context, req *pb.GetOperationsRequest) (*pb.GetOperationsResponse, error) {
 	me := operation.Get(ctx)
 
-	all := s.r.OperationManager().All()
+	all := s.robot.OperationManager().All()
 
 	res := &pb.GetOperationsResponse{}
 	for _, o := range all {
@@ -100,7 +153,7 @@ func convertInterfaceToStruct(i interface{}) (*structpb.Struct, error) {
 
 // CancelOperation kills an operations.
 func (s *Server) CancelOperation(ctx context.Context, req *pb.CancelOperationRequest) (*pb.CancelOperationResponse, error) {
-	op := s.r.OperationManager().FindString(req.Id)
+	op := s.robot.OperationManager().FindString(req.Id)
 	if op != nil {
 		op.Cancel()
 	}
@@ -110,7 +163,7 @@ func (s *Server) CancelOperation(ctx context.Context, req *pb.CancelOperationReq
 // BlockForOperation blocks for an operation to finish.
 func (s *Server) BlockForOperation(ctx context.Context, req *pb.BlockForOperationRequest) (*pb.BlockForOperationResponse, error) {
 	for {
-		op := s.r.OperationManager().FindString(req.Id)
+		op := s.robot.OperationManager().FindString(req.Id)
 		if op == nil {
 			return &pb.BlockForOperationResponse{}, nil
 		}
@@ -123,7 +176,7 @@ func (s *Server) BlockForOperation(ctx context.Context, req *pb.BlockForOperatio
 
 // GetSessions lists all active sessions.
 func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*pb.GetSessionsResponse, error) {
-	allSessions := s.r.SessionManager().All()
+	allSessions := s.robot.SessionManager().All()
 
 	resp := &pb.GetSessionsResponse{}
 	for _, sess := range allSessions {
@@ -138,7 +191,7 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 
 // ResourceNames returns the list of resources.
 func (s *Server) ResourceNames(ctx context.Context, _ *pb.ResourceNamesRequest) (*pb.ResourceNamesResponse, error) {
-	all := s.r.ResourceNames()
+	all := s.robot.ResourceNames()
 	rNames := make([]*commonpb.ResourceName, 0, len(all))
 	for _, m := range all {
 		rNames = append(
@@ -152,7 +205,7 @@ func (s *Server) ResourceNames(ctx context.Context, _ *pb.ResourceNamesRequest) 
 // ResourceRPCSubtypes returns the list of resource RPC APIs.
 // Subtypes is an older name but preserved in proto.
 func (s *Server) ResourceRPCSubtypes(ctx context.Context, _ *pb.ResourceRPCSubtypesRequest) (*pb.ResourceRPCSubtypesResponse, error) {
-	resAPIs := s.r.ResourceRPCAPIs()
+	resAPIs := s.robot.ResourceRPCAPIs()
 	protoTypes := make([]*pb.ResourceRPCSubtype, 0, len(resAPIs))
 	for _, rt := range resAPIs {
 		protoTypes = append(protoTypes, &pb.ResourceRPCSubtype{
@@ -166,9 +219,14 @@ func (s *Server) ResourceRPCSubtypes(ctx context.Context, _ *pb.ResourceRPCSubty
 	return &pb.ResourceRPCSubtypesResponse{ResourceRpcSubtypes: protoTypes}, nil
 }
 
+// DiscoverComponents is DEPRECATED!!! Please use the Discovery Service instead.
 // DiscoverComponents takes a list of discovery queries and returns corresponding
 // component configurations.
+//
+//nolint:deprecated,staticcheck
 func (s *Server) DiscoverComponents(ctx context.Context, req *pb.DiscoverComponentsRequest) (*pb.DiscoverComponentsResponse, error) {
+	s.robot.Logger().CWarn(ctx,
+		"DiscoverComponents is deprecated and will be removed on March 10th 2025. Please use the Discovery Service instead.")
 	// nonTriplet indicates older syntax for type and model E.g. "camera" instead of "rdk:component:camera"
 	// TODO(PRODUCT-344): remove triplet checking here after complete
 	var nonTriplet bool
@@ -186,10 +244,10 @@ func (s *Server) DiscoverComponents(ctx context.Context, req *pb.DiscoverCompone
 		if err != nil {
 			return nil, err
 		}
-		queries = append(queries, resource.DiscoveryQuery{API: s, Model: m})
+		queries = append(queries, resource.DiscoveryQuery{API: s, Model: m, Extra: q.Extra.AsMap()})
 	}
 
-	discoveries, err := s.r.DiscoverComponents(ctx, queries)
+	discoveries, err := s.robot.DiscoverComponents(ctx, queries)
 	if err != nil {
 		return nil, err
 	}
@@ -198,9 +256,17 @@ func (s *Server) DiscoverComponents(ctx context.Context, req *pb.DiscoverCompone
 	for _, discovery := range discoveries {
 		pbResults, err := vprotoutils.StructToStructPb(discovery.Results)
 		if err != nil {
-			return nil, errors.Wrapf(err, "unable to construct a structpb.Struct from discovery for %q", discovery.Query)
+			return nil, fmt.Errorf("unable to construct a structpb.Struct from discovery for %q: %w", discovery.Query, err)
 		}
-		pbQuery := &pb.DiscoveryQuery{Subtype: discovery.Query.API.String(), Model: discovery.Query.Model.String()}
+		extra, err := structpb.NewStruct(discovery.Query.Extra)
+		if err != nil {
+			return nil, err
+		}
+		pbQuery := &pb.DiscoveryQuery{
+			Subtype: discovery.Query.API.String(),
+			Model:   discovery.Query.Model.String(),
+			Extra:   extra,
+		}
 		if nonTriplet {
 			pbQuery.Subtype = discovery.Query.API.SubtypeName
 			pbQuery.Model = discovery.Query.Model.Name
@@ -217,9 +283,22 @@ func (s *Server) DiscoverComponents(ctx context.Context, req *pb.DiscoverCompone
 	return &pb.DiscoverComponentsResponse{Discovery: pbDiscoveries}, nil
 }
 
+// GetModelsFromModules returns all models from the currently managed modules.
+func (s *Server) GetModelsFromModules(ctx context.Context, req *pb.GetModelsFromModulesRequest) (*pb.GetModelsFromModulesResponse, error) {
+	models, err := s.robot.GetModelsFromModules(ctx)
+	if err != nil {
+		return nil, err
+	}
+	resp := pb.GetModelsFromModulesResponse{}
+	for _, mm := range models {
+		resp.Models = append(resp.Models, mm.ToProto())
+	}
+	return &resp, nil
+}
+
 // FrameSystemConfig returns the info of each individual part that makes up the frame system.
 func (s *Server) FrameSystemConfig(ctx context.Context, req *pb.FrameSystemConfigRequest) (*pb.FrameSystemConfigResponse, error) {
-	fsCfg, err := s.r.FrameSystemConfig(ctx)
+	fsCfg, err := s.robot.FrameSystemConfig(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -244,8 +323,11 @@ func (s *Server) TransformPose(ctx context.Context, req *pb.TransformPoseRequest
 	if err != nil {
 		return nil, err
 	}
-	transformedPose, err := s.r.TransformPose(ctx, referenceframe.ProtobufToPoseInFrame(req.Source), req.Destination, transforms)
-	return &pb.TransformPoseResponse{Pose: referenceframe.PoseInFrameToProtobuf(transformedPose)}, err
+	transformedPose, err := s.robot.TransformPose(ctx, referenceframe.ProtobufToPoseInFrame(req.Source), req.Destination, transforms)
+	if err != nil {
+		return nil, err
+	}
+	return &pb.TransformPoseResponse{Pose: referenceframe.PoseInFrameToProtobuf(transformedPose)}, nil
 }
 
 // TransformPCD will transform the pointcloud to the desired frame in the robot's frame system.
@@ -262,78 +344,16 @@ func (s *Server) TransformPCD(ctx context.Context, req *pb.TransformPCDRequest) 
 		return nil, err
 	}
 	// transform
-	final, err := s.r.TransformPointCloud(ctx, pc, req.Source, req.Destination)
+	final, err := s.robot.TransformPointCloud(ctx, pc, req.Source, req.Destination)
 	if err != nil {
 		return nil, err
 	}
 	// transform pointcloud back to PCD bytes
-	var buf bytes.Buffer
-	buf.Grow(200 + (final.Size() * 4 * 4)) // 4 numbers per point, each 4 bytes
-	err = pointcloud.ToPCD(final, &buf, pointcloud.PCDBinary)
+	bytes, err := pointcloud.ToBytes(final)
 	if err != nil {
 		return nil, err
 	}
-	return &pb.TransformPCDResponse{PointCloudPcd: buf.Bytes()}, err
-}
-
-// GetStatus takes a list of resource names and returns their corresponding statuses. If no names are passed in, return all statuses.
-func (s *Server) GetStatus(ctx context.Context, req *pb.GetStatusRequest) (*pb.GetStatusResponse, error) {
-	resourceNames := make([]resource.Name, 0, len(req.ResourceNames))
-	for _, name := range req.ResourceNames {
-		resourceNames = append(resourceNames, protoutils.ResourceNameFromProto(name))
-	}
-
-	statuses, err := s.r.Status(ctx, resourceNames)
-	if err != nil {
-		return nil, err
-	}
-
-	statusesP := make([]*pb.Status, 0, len(statuses))
-	for _, status := range statuses {
-		statusP, err := vprotoutils.StructToStructPb(status.Status)
-		if err != nil {
-			return nil, err
-		}
-		statusesP = append(
-			statusesP,
-			&pb.Status{
-				Name:   protoutils.ResourceNameToProto(status.Name),
-				Status: statusP,
-			},
-		)
-	}
-
-	return &pb.GetStatusResponse{Status: statusesP}, nil
-}
-
-const defaultStreamInterval = 1 * time.Second
-
-// StreamStatus periodically sends the status of all statuses requested. An empty request signifies all resources.
-func (s *Server) StreamStatus(req *pb.StreamStatusRequest, streamServer pb.RobotService_StreamStatusServer) error {
-	every := defaultStreamInterval
-	if reqEvery := req.Every.AsDuration(); reqEvery != time.Duration(0) {
-		every = reqEvery
-	}
-	ticker := time.NewTicker(every)
-	defer ticker.Stop()
-	for {
-		if !utils.SelectContextOrWaitChan(streamServer.Context(), ticker.C) {
-			return streamServer.Context().Err()
-		}
-
-		status, err := s.GetStatus(streamServer.Context(), &pb.GetStatusRequest{ResourceNames: req.ResourceNames})
-		switch {
-		case err == nil:
-		case grpcstatus.Code(err) == codes.Unimplemented:
-			return nil
-		default:
-			return err
-		}
-
-		if err := streamServer.Send(&pb.StreamStatusResponse{Status: status.Status}); err != nil {
-			return err
-		}
-	}
+	return &pb.TransformPCDResponse{PointCloudPcd: bytes}, err
 }
 
 // StopAll will stop all current and outstanding operations for the robot and stops all actuators and movement.
@@ -342,7 +362,7 @@ func (s *Server) StopAll(ctx context.Context, req *pb.StopAllRequest) (*pb.StopA
 	for _, e := range req.Extra {
 		extra[protoutils.ResourceNameFromProto(e.Name)] = e.Params.AsMap()
 	}
-	if err := s.r.StopAll(ctx, extra); err != nil {
+	if err := s.robot.StopAll(ctx, extra); err != nil {
 		return nil, err
 	}
 	return &pb.StopAllResponse{}, nil
@@ -364,7 +384,7 @@ func (s *Server) StartSession(ctx context.Context, req *pb.StartSessionRequest) 
 		if err != nil {
 			return nil, err
 		}
-		if sess, err := s.r.SessionManager().FindByID(ctx, resumeWith, authUID); err != nil {
+		if sess, err := s.robot.SessionManager().FindByID(ctx, resumeWith, authUID); err != nil {
 			if !errors.Is(err, session.ErrNoSession) {
 				return nil, err
 			}
@@ -375,7 +395,7 @@ func (s *Server) StartSession(ctx context.Context, req *pb.StartSessionRequest) 
 			}, nil
 		}
 	}
-	sess, err := s.r.SessionManager().Start(
+	sess, err := s.robot.SessionManager().Start(
 		ctx,
 		authUID,
 	)
@@ -398,8 +418,160 @@ func (s *Server) SendSessionHeartbeat(ctx context.Context, req *pb.SendSessionHe
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.r.SessionManager().FindByID(ctx, sessID, authUID); err != nil {
+	if _, err := s.robot.SessionManager().FindByID(ctx, sessID, authUID); err != nil {
 		return nil, err
 	}
 	return &pb.SendSessionHeartbeatResponse{}, nil
+}
+
+// Log receives logs to be logged by this robot.
+func (s *Server) Log(ctx context.Context, req *pb.LogRequest) (*pb.LogResponse, error) {
+	if req.Logs == nil {
+		return nil, errors.New("LogRequest received with no associated logs")
+	}
+	if len(req.Logs) > 1 {
+		return nil, errors.New("LogRequest received with multiple logs; batching not yet supported")
+	}
+	log := req.Logs[0]
+
+	level, err := logging.LevelFromString(log.Level)
+	if err != nil {
+		return nil, fmt.Errorf("LogRequest received with invalid level %q", log.Level)
+	}
+
+	// Create a custom log entry and write entry unconditionally to logger. We
+	// trust module libraries to handle their own levels and only send us logs
+	// over gRPC that we should be outputting.
+	zEntry := zapcore.Entry{
+		Level:      level.AsZap(),
+		Time:       time.Now(),
+		LoggerName: log.LoggerName,
+		Message:    log.Message,
+		// `Caller` is already encoded in `Message` above
+		// `Stack` is not included
+	}
+	fields := make([]zapcore.Field, 0, len(log.Fields)*2)
+	for _, fieldP := range log.Fields {
+		field, err := logging.FieldFromProto(fieldP)
+		if err != nil {
+			return nil, fmt.Errorf("error converting LogRequest log field from proto: %w", err)
+		}
+		fields = append(fields, field)
+	}
+	// Insert field of `{"log_ts": log.Time}` to encode the timestamp of this
+	// log.
+	tsField := zapcore.Field{
+		Key:    logTSKey,
+		Type:   zapcore.StringType,
+		String: log.Time.AsTime().Format(logging.DefaultTimeFormatStr),
+	}
+	fields = append(fields, tsField)
+	entry := logging.LogEntry{
+		Entry:  zEntry,
+		Fields: fields,
+	}
+
+	s.robot.Logger().Write(&entry)
+	return &pb.LogResponse{}, nil
+}
+
+// GetCloudMetadata returns app-related information about the robot.
+func (s *Server) GetCloudMetadata(ctx context.Context, _ *pb.GetCloudMetadataRequest) (*pb.GetCloudMetadataResponse, error) {
+	md, err := s.robot.CloudMetadata(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return protoutils.MetadataToProto(md), nil
+}
+
+// RestartModule restarts a module by name or ID.
+func (s *Server) RestartModule(ctx context.Context, req *pb.RestartModuleRequest) (*pb.RestartModuleResponse, error) {
+	goReq := robot.RestartModuleRequest{
+		ModuleID:   req.GetModuleId(),
+		ModuleName: req.GetModuleName(),
+	}
+	err := s.robot.RestartModule(ctx, goReq)
+	if err != nil {
+		return nil, err
+	}
+	return &pb.RestartModuleResponse{}, nil
+}
+
+// Shutdown shuts down the robot.
+func (s *Server) Shutdown(ctx context.Context, _ *pb.ShutdownRequest) (*pb.ShutdownResponse, error) {
+	err := s.robot.Shutdown(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &pb.ShutdownResponse{}, nil
+}
+
+// GetMachineStatus returns the current status of the robot.
+func (s *Server) GetMachineStatus(ctx context.Context, _ *pb.GetMachineStatusRequest) (*pb.GetMachineStatusResponse, error) {
+	var result pb.GetMachineStatusResponse
+
+	mStatus, err := s.robot.MachineStatus(ctx)
+	if err != nil {
+		return nil, err
+	}
+	result.Config = &pb.ConfigStatus{
+		Revision:    mStatus.Config.Revision,
+		LastUpdated: timestamppb.New(mStatus.Config.LastUpdated),
+	}
+	result.Resources = make([]*pb.ResourceStatus, 0, len(mStatus.Resources))
+	for _, resStatus := range mStatus.Resources {
+		pbResStatus := &pb.ResourceStatus{
+			Name:          protoutils.ResourceNameToProto(resStatus.Name),
+			LastUpdated:   timestamppb.New(resStatus.LastUpdated),
+			Revision:      resStatus.Revision,
+			CloudMetadata: protoutils.MetadataToProto(resStatus.CloudMetadata),
+		}
+
+		switch resStatus.State {
+		case resource.NodeStateUnknown:
+			s.robot.Logger().CErrorw(ctx, "resource in an unknown state", "resource", resStatus.Name.String())
+			pbResStatus.State = pb.ResourceStatus_STATE_UNSPECIFIED
+		case resource.NodeStateUnconfigured:
+			pbResStatus.State = pb.ResourceStatus_STATE_UNCONFIGURED
+		case resource.NodeStateConfiguring:
+			pbResStatus.State = pb.ResourceStatus_STATE_CONFIGURING
+		case resource.NodeStateReady:
+			pbResStatus.State = pb.ResourceStatus_STATE_READY
+		case resource.NodeStateRemoving:
+			pbResStatus.State = pb.ResourceStatus_STATE_REMOVING
+		case resource.NodeStateUnhealthy:
+			pbResStatus.State = pb.ResourceStatus_STATE_UNHEALTHY
+			if resStatus.Error != nil {
+				pbResStatus.Error = resStatus.Error.Error()
+			}
+		}
+
+		result.Resources = append(result.Resources, pbResStatus)
+	}
+
+	switch mStatus.State {
+	case robot.StateUnknown:
+		s.robot.Logger().CError(ctx, "machine in an unknown state")
+		result.State = pb.GetMachineStatusResponse_STATE_UNSPECIFIED
+	case robot.StateInitializing:
+		result.State = pb.GetMachineStatusResponse_STATE_INITIALIZING
+	case robot.StateRunning:
+		result.State = pb.GetMachineStatusResponse_STATE_RUNNING
+	}
+
+	return &result, nil
+}
+
+// GetVersion returns version information about the robot.
+func (s *Server) GetVersion(ctx context.Context, _ *pb.GetVersionRequest) (*pb.GetVersionResponse, error) {
+	result, err := robot.Version()
+	if err != nil {
+		return nil, err
+	}
+
+	return &pb.GetVersionResponse{
+		Platform:   result.Platform,
+		Version:    result.Version,
+		ApiVersion: result.APIVersion,
+	}, nil
 }
